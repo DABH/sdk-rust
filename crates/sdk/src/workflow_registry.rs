@@ -13,6 +13,7 @@ use temporalio_common::{
 };
 use temporalio_workflow::{
     BaseWorkflowContext,
+    interceptors::WorkflowInterceptor,
     runtime::{
         entry::WorkflowImplementation,
         guest::WorkflowInstance,
@@ -30,6 +31,8 @@ pub(crate) struct WorkflowExecutionInput {
     pub init_workflow_job: InitializeWorkflow,
     pub data_converter: DataConverter,
     pub host: Rc<dyn WorkflowHost>,
+    pub workflow_interceptors: Arc<Vec<Arc<dyn WorkflowInterceptor>>>,
+    pub initial_is_replaying: bool,
 }
 
 /// Creates workflow execution instances from activation input payloads and context.
@@ -125,9 +128,7 @@ impl WorkflowDefinitions {
 
             let workflow = user_factory();
             Ok(Box::new(GuestWorkflowInstance::<W>::new_with_workflow(
-                workflow,
-                base_ctx,
-                Some(input),
+                workflow, base_ctx, input,
             )) as Box<dyn WorkflowInstance>)
         });
 
@@ -181,16 +182,20 @@ fn workflow_input_parts(
         init_workflow_job,
         data_converter,
         host,
+        workflow_interceptors,
+        initial_is_replaying,
     } = input;
     let payloads = init_workflow_job.arguments.clone();
     let payload_converter = data_converter.payload_converter().clone();
-    let base_ctx = BaseWorkflowContext::new(
+    let base_ctx = BaseWorkflowContext::new_with_interceptors(
         namespace,
         task_queue,
         run_id,
         init_workflow_job,
         data_converter,
         host,
+        workflow_interceptors.as_ref(),
+        initial_is_replaying,
     );
     (payloads, payload_converter, base_ctx)
 }

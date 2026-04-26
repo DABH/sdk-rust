@@ -2,6 +2,7 @@
 
 use crate::{
     BaseWorkflowContext, WorkflowContext,
+    interceptors::{ExecuteInput, HandleQueryInput, HandleSignalInput, WorkflowValue},
     runtime::{
         entry::{WorkflowError, WorkflowImplementation},
         guest::WorkflowInstance,
@@ -94,26 +95,86 @@ where
             converter: &converter,
         };
         let input = converter.from_payloads(&ser_ctx, payloads)?;
-        let (init_input, run_input) = if W::INIT_TAKES_INPUT {
-            (Some(input), None)
+        Ok(Box::new(Self::new(base_ctx, W::INIT_TAKES_INPUT, input)))
+    }
+
+    pub fn new(
+        base_ctx: BaseWorkflowContext,
+        init_takes_input: bool,
+        chain_input: <W::Run as WorkflowDefinition>::Input,
+    ) -> Self {
+        if init_takes_input {
+            let base_ctx_for_terminal = base_ctx.clone();
+            Self::with_interceptors(base_ctx, chain_input, move |typed| {
+                let workflow = W::init(base_ctx_for_terminal.view(), Some(typed));
+                let ctx = WorkflowContext::from_base(
+                    base_ctx_for_terminal,
+                    Rc::new(RefCell::new(workflow)),
+                );
+                let run_future = W::run(ctx.clone(), None);
+                (ctx, run_future)
+            })
         } else {
-            (None, Some(input))
-        };
-        Ok(Box::new({
-            let view = base_ctx.view();
-            let workflow = W::init(view, init_input);
-            Self::new_with_workflow(workflow, base_ctx, run_input)
-        }))
+            let workflow = W::init(base_ctx.view(), None);
+            Self::new_with_workflow(workflow, base_ctx, chain_input)
+        }
     }
 
     pub fn new_with_workflow(
         workflow: W,
         base_ctx: BaseWorkflowContext,
-        run_input: Option<<W::Run as WorkflowDefinition>::Input>,
+        run_input: <W::Run as WorkflowDefinition>::Input,
     ) -> Self {
-        let workflow = Rc::new(RefCell::new(workflow));
-        let ctx = WorkflowContext::from_base(base_ctx.clone(), workflow);
-        let run_future = W::run(ctx.clone(), run_input).fuse();
+        let ctx = WorkflowContext::from_base(base_ctx.clone(), Rc::new(RefCell::new(workflow)));
+        let ctx_for_terminal = ctx.clone();
+        Self::with_interceptors(base_ctx, run_input, move |typed| {
+            let run_future = W::run(ctx_for_terminal.clone(), Some(typed));
+            (ctx_for_terminal, run_future)
+        })
+    }
+
+    fn with_interceptors(
+        base_ctx: BaseWorkflowContext,
+        input: <W::Run as WorkflowDefinition>::Input,
+        build_terminal: impl FnOnce(
+            <W::Run as WorkflowDefinition>::Input,
+        ) -> (
+            WorkflowContext<W>,
+            LocalBoxFuture<'static, Result<Payload, WorkflowTermination>>,
+        ) + 'static,
+    ) -> Self {
+        let input = ExecuteInput::new(
+            W::name().to_string(),
+            WorkflowValue::new(input),
+            base_ctx.initial_headers(),
+            base_ctx.workflow_interceptor_context(base_ctx.is_replaying()),
+        );
+
+        let ctx_slot: Rc<RefCell<Option<WorkflowContext<W>>>> = Rc::new(RefCell::new(None));
+        let ctx_slot_inner = ctx_slot.clone();
+
+        let run_future = base_ctx
+            .workflow_interceptors()
+            .execute(input, move |input| {
+                let typed = input
+                    .into_args()
+                    .into_typed::<<W::Run as WorkflowDefinition>::Input>()
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "execute interceptor must preserve workflow input type {}",
+                            std::any::type_name::<<W::Run as WorkflowDefinition>::Input>()
+                        )
+                    });
+                let (ctx, run_future) = build_terminal(typed);
+                *ctx_slot_inner.borrow_mut() = Some(ctx);
+                run_future
+            })
+            .fuse();
+
+        let ctx = ctx_slot
+            .borrow_mut()
+            .take()
+            .expect("execute interceptor must call next.run() exactly once");
         Self {
             base_ctx,
             ctx,
@@ -187,19 +248,30 @@ where
     }
 
     fn start_signal_routine(&mut self, signal: SignalWorkflow) -> ActivationJobResult {
-        let name = signal.signal_name;
-        let payloads = Payloads {
-            payloads: signal.input,
-        };
+        let name = signal.signal_name.clone();
         let converter = self.ctx.payload_converter();
-        let future = match W::decode_signal_input(&name, payloads, converter) {
-            Ok(Some(input)) => {
-                let ctx = self.ctx.with_headers(signal.headers);
-                W::dispatch_signal(ctx, &name, input)
-            }
-            Err(err) => ready(Err(err)).boxed_local(),
-            Ok(None) => return ActivationJobResult::None,
-        };
+        let ctx = self.ctx.clone();
+        let input = HandleSignalInput::new(
+            signal.signal_name,
+            signal.input,
+            signal.headers,
+            self.base_ctx
+                .workflow_interceptor_context(self.base_ctx.is_replaying()),
+        );
+        let future = self
+            .base_ctx
+            .workflow_interceptors()
+            .handle_signal(input, |input| {
+                let (name, payloads, headers) = input.into_parts();
+                match W::decode_signal_input(&name, payloads, converter) {
+                    Ok(Some(decoded_input)) => {
+                        let ctx = ctx.with_headers(headers);
+                        W::dispatch_signal(ctx, &name, decoded_input)
+                    }
+                    Err(err) => ready(Err(err)).boxed_local(),
+                    Ok(None) => ready(Ok(())).boxed_local(),
+                }
+            });
         let routine_id = self.next_routine_id();
         self.routines
             .insert(routine_id, GuestRoutine::Signal { future });
@@ -294,31 +366,33 @@ where
             return self.query_metadata();
         }
 
-        let payloads = Payloads {
-            payloads: query.arguments,
-        };
         let converter = self.ctx.payload_converter();
-        let view = self.ctx.view();
-        let decoded_input = match W::decode_query_input(&query.query_type, &payloads, converter) {
-            Ok(Some(input)) => input,
-            Err(err) => {
-                return QueryResponse {
-                    result: Err(self.workflow_error_to_failure(err)),
-                };
-            }
-            Ok(None) => {
-                return QueryResponse {
-                    result: Err(self.message_to_failure(format!(
-                        "No query handler for '{}'",
-                        query.query_type
-                    ))),
-                };
-            }
-        };
+        let input = HandleQueryInput::new(
+            query.query_type.clone(),
+            query.arguments,
+            query.headers,
+            self.base_ctx.workflow_interceptor_context(false),
+        );
+        let ctx = &self.ctx;
         QueryResponse {
             result: self
-                .ctx
-                .state(|wf| wf.dispatch_query(view, &query.query_type, decoded_input, converter))
+                .base_ctx
+                .workflow_interceptors()
+                .handle_query(input, |input| {
+                    let (query_type, payloads, headers) = input.into_parts();
+                    let view = ctx.with_headers(headers).view();
+                    match W::decode_query_input(&query_type, &payloads, converter) {
+                        Ok(Some(decoded_input)) => {
+                            ctx.state(|wf| {
+                                wf.dispatch_query(view, &query_type, decoded_input, converter)
+                            })
+                        }
+                        Err(err) => Err(err),
+                        Ok(None) => Err(WorkflowError::Execution(Box::new(
+                            ApplicationFailure::new(format!("No query handler for '{query_type}'")),
+                        ))),
+                    }
+                })
                 .map_err(|err| self.workflow_error_to_failure(err)),
         }
     }

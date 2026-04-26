@@ -436,18 +436,20 @@ interceptor APIs.
 Sketch:
 
 ```rust
-pub type WorkflowInterceptorFuture<'a, T> =
-    Pin<Box<dyn Future<Output = T> + 'a>>;
+pub type WorkflowExecuteOutput = LocalBoxFuture<'static, WorkflowResult<Payload>>;
+pub type WorkflowSignalOutput = LocalBoxFuture<'static, Result<(), WorkflowError>>;
+pub type WorkflowQueryOutput = Result<Payload, WorkflowError>;
+pub type SleepOutput = BoxedCancellableFuture<TimerResult>;
 
 #[must_use = "workflow interceptor continuations must be run to continue the call chain"]
 pub struct Next<'a, I, O> {
     // private SDK-owned continuation
-    inner: Box<dyn FnOnce(I) -> WorkflowInterceptorFuture<'a, O> + 'a>,
+    inner: Box<dyn FnOnce(I) -> O + 'a>,
 }
 
 impl<'a, I, O> Next<'a, I, O> {
-    #[must_use = "the returned workflow interceptor future must be awaited or returned"]
-    pub fn run(self, input: I) -> WorkflowInterceptorFuture<'a, O> {
+    #[must_use = "the returned workflow interceptor output must be used"]
+    pub fn run(self, input: I) -> O {
         (self.inner)(input)
     }
 }
@@ -465,24 +467,24 @@ pub trait WorkflowInboundInterceptor: Send + Sync + 'static {
     fn execute<'a>(
         &'a self,
         input: ExecuteInput,
-        next: Next<'a, ExecuteInput, WorkflowExecuteResult>,
-    ) -> WorkflowInterceptorFuture<'a, WorkflowExecuteResult> {
+        next: Next<'a, ExecuteInput, WorkflowExecuteOutput>,
+    ) -> WorkflowExecuteOutput {
         next.run(input)
     }
 
     fn handle_signal<'a>(
         &'a self,
         input: HandleSignalInput,
-        next: Next<'a, HandleSignalInput, WorkflowSignalResult>,
-    ) -> WorkflowInterceptorFuture<'a, WorkflowSignalResult> {
+        next: Next<'a, HandleSignalInput, WorkflowSignalOutput>,
+    ) -> WorkflowSignalOutput {
         next.run(input)
     }
 
     fn handle_query<'a>(
         &'a self,
         input: HandleQueryInput,
-        next: Next<'a, HandleQueryInput, WorkflowQueryResult>,
-    ) -> WorkflowInterceptorFuture<'a, WorkflowQueryResult> {
+        next: Next<'a, HandleQueryInput, WorkflowQueryOutput>,
+    ) -> WorkflowQueryOutput {
         next.run(input)
     }
 
@@ -496,7 +498,7 @@ pub trait WorkflowOutboundInterceptor: Send + Sync + 'static {
         &'a self,
         input: SleepInput,
         next: Next<'a, SleepInput, SleepOutput>,
-    ) -> WorkflowInterceptorFuture<'a, SleepOutput> {
+    ) -> SleepOutput {
         next.run(input)
     }
 
@@ -516,6 +518,9 @@ pub trait WorkflowOutboundInterceptor: Send + Sync + 'static {
 
 - `Next<'a, I, O>` borrows SDK chain/dispatch state for `'a`
 - it is single-use because `run` consumes `self`
+- `run` returns the operation output directly; operations that are async use boxed local futures as
+  their output types, while synchronous operations such as queries and timer creation can remain
+  synchronous
 - v1 history-producing outbound hooks must call `next` exactly once; `run` consuming `self`
   enforces at-most-once, and `#[must_use]` should catch accidental failure to continue, but the
   exact-once rule remains a documented user contract rather than a heavy runtime mechanism

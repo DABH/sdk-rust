@@ -7,13 +7,19 @@ pub use options::{
 };
 pub use temporalio_common_wasm::protos::coresdk::child_workflow::StartChildWorkflowExecutionFailedCause;
 
-use crate::runtime::{
-    SdkGuardedFuture, SdkWakeGuard,
-    entry::WorkflowImplementation,
-    host::WorkflowHost,
-    model::{
-        CancelExternalWfResult, CancellableID, NexusStartResult, SignalExternalWfResult,
-        TimerResult, UnblockEvent, Unblockable, WorkflowTermination,
+use crate::{
+    interceptors::{
+        BoxedCancellableFuture, SleepInput, SleepOutput, WorkflowInterceptor,
+        WorkflowInterceptorContext, WorkflowInterceptorInstance, WorkflowOperationContext,
+    },
+    runtime::{
+        SdkGuardedFuture, SdkWakeGuard,
+        entry::WorkflowImplementation,
+        host::WorkflowHost,
+        model::{
+            CancelExternalWfResult, CancellableID, NexusStartResult, SignalExternalWfResult,
+            TimerResult, UnblockEvent, Unblockable, WorkflowTermination,
+        },
     },
 };
 use futures_channel::oneshot;
@@ -30,7 +36,10 @@ use std::{
     ops::Deref,
     pin::Pin,
     rc::Rc,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Poll, Waker},
     time::{Duration, SystemTime},
 };
@@ -220,6 +229,7 @@ struct WorkflowContextInner {
     seq_nums: RefCell<WfCtxProtectedDat>,
     data_converter: DataConverter,
     state_mutated: Cell<bool>,
+    workflow_interceptors: RefCell<WorkflowInterceptorInstance>,
 }
 
 /// Context provided to synchronous signal and update handlers.
@@ -411,12 +421,41 @@ impl BaseWorkflowContext {
         data_converter: DataConverter,
         host: Rc<dyn WorkflowHost>,
     ) -> Self {
-        Self {
+        Self::new_with_interceptors(
+            namespace,
+            task_queue,
+            run_id,
+            init_workflow_job,
+            data_converter,
+            host,
+            &[],
+            false,
+        )
+    }
+
+    /// Create a new base context with workflow interceptors installed.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_interceptors(
+        namespace: String,
+        task_queue: String,
+        run_id: String,
+        init_workflow_job: InitializeWorkflow,
+        data_converter: DataConverter,
+        host: Rc<dyn WorkflowHost>,
+        workflow_interceptors: &[Arc<dyn WorkflowInterceptor>],
+        initial_is_replaying: bool,
+    ) -> Self {
+        let base = Self {
             inner: Rc::new(WorkflowContextInner {
                 namespace,
                 task_queue,
                 run_id,
                 shared: RefCell::new(WorkflowContextSharedData {
+                    activation: CoreWorkflowActivation {
+                        is_replaying: initial_is_replaying,
+                        ..Default::default()
+                    },
                     random_seed: init_workflow_job.randomness_seed,
                     search_attributes: init_workflow_job
                         .search_attributes
@@ -438,8 +477,40 @@ impl BaseWorkflowContext {
                 }),
                 data_converter,
                 state_mutated: Cell::new(false),
+                workflow_interceptors: RefCell::new(WorkflowInterceptorInstance::default()),
             }),
+        };
+        let interceptor_ctx = base.workflow_interceptor_context(initial_is_replaying);
+        base.inner
+            .workflow_interceptors
+            .replace(WorkflowInterceptorInstance::new(
+                workflow_interceptors,
+                interceptor_ctx,
+            ));
+        base
+    }
+
+    pub(crate) fn workflow_interceptors(&self) -> WorkflowInterceptorInstance {
+        self.inner.workflow_interceptors.borrow().clone()
+    }
+
+    pub(crate) fn workflow_interceptor_context(
+        &self,
+        is_replaying_history_events: bool,
+    ) -> WorkflowInterceptorContext {
+        let is_replaying = self.inner.shared.borrow().activation.is_replaying;
+        WorkflowInterceptorContext {
+            workflow: self.view(),
+            operation: WorkflowOperationContext::new(is_replaying, is_replaying_history_events),
         }
+    }
+
+    pub(crate) fn is_replaying(&self) -> bool {
+        self.inner.shared.borrow().activation.is_replaying
+    }
+
+    pub(crate) fn initial_headers(&self) -> HashMap<String, Payload> {
+        self.inner.inital_information.headers.clone()
     }
 
     /// Check and clear the state_mutated flag. Returns `true` if `state_mut`
@@ -538,11 +609,15 @@ impl BaseWorkflowContext {
     }
 
     /// Request to create a timer
-    pub fn timer<T: Into<TimerOptions>>(
-        &self,
-        opts: T,
-    ) -> impl CancellableFuture<TimerResult> + use<T> {
+    pub fn timer<T: Into<TimerOptions>>(&self, opts: T) -> SleepOutput {
         let opts: TimerOptions = opts.into();
+        let input = SleepInput::new(opts, self.workflow_interceptor_context(self.is_replaying()));
+        let base = self.clone();
+        self.workflow_interceptors()
+            .sleep(input, move |input| base.start_timer(input.into_options()))
+    }
+
+    fn start_timer(&self, opts: TimerOptions) -> SleepOutput {
         let seq = self.inner.seq_nums.borrow_mut().next_timer_seq();
         let (cmd, unblocker) =
             CancellableWFCommandFut::new(CancellableID::Timer(seq), self.clone());
@@ -550,7 +625,7 @@ impl BaseWorkflowContext {
             .runtime
             .register_unblocker(PendingCommandId::Timer(seq), unblocker);
         self.inner.runtime.host.push_command(opts.into_command(seq));
-        cmd
+        BoxedCancellableFuture::new(cmd)
     }
 
     /// Request to run an activity

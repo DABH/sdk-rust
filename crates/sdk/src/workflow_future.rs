@@ -6,6 +6,7 @@ use std::{
     panic::AssertUnwindSafe,
     pin::Pin,
     rc::Rc,
+    sync::Arc,
     task::{Context, Poll},
 };
 use temporalio_common::{
@@ -32,14 +33,17 @@ use temporalio_common::{
         },
     },
 };
-use temporalio_workflow::runtime::{
-    guest::WorkflowInstance,
-    host::WorkflowHost,
-    model::{WorkflowResult, WorkflowTermination},
-    types::{
-        ActivationJobResult, ActivationResult, MainRoutineCompletion, RoutineCompletion, RoutineId,
-        RoutineKind, RoutinePollResult, TerminalOutcome, UpdateRoutineCompletion,
-        WorkflowActivation,
+use temporalio_workflow::{
+    interceptors::WorkflowInterceptor,
+    runtime::{
+        guest::WorkflowInstance,
+        host::WorkflowHost,
+        model::{WorkflowResult, WorkflowTermination},
+        types::{
+            ActivationJobResult, ActivationResult, MainRoutineCompletion, RoutineCompletion,
+            RoutineId, RoutineKind, RoutinePollResult, TerminalOutcome, UpdateRoutineCompletion,
+            WorkflowActivation,
+        },
     },
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -62,6 +66,8 @@ pub(crate) fn start_workflow(
     outgoing_completions: UnboundedSender<WorkflowActivationCompletion>,
     data_converter: DataConverter,
     detect_nondeterministic: bool,
+    workflow_interceptors: Arc<Vec<Arc<dyn WorkflowInterceptor>>>,
+    initial_is_replaying: bool,
 ) -> Result<
     (
         impl Future<Output = WorkflowResult<Payload>> + use<>,
@@ -84,6 +90,8 @@ pub(crate) fn start_workflow(
         init_workflow_job,
         data_converter: data_converter.clone(),
         host: host.clone(),
+        workflow_interceptors,
+        initial_is_replaying,
     })
     .context("Failed to create workflow execution")?;
 

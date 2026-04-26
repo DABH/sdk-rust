@@ -16,6 +16,7 @@ pub mod __private {
 
 #[doc(hidden)]
 pub mod component;
+pub mod interceptors;
 #[doc(hidden)]
 pub mod runtime;
 mod workflow_context;

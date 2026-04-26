@@ -23,6 +23,12 @@ use temporalio_common::{
         temporal::api::common::v1::Payload,
     },
 };
+pub use temporalio_workflow::interceptors::{
+    BoxedCancellableFuture, ExecuteInput, HandleQueryInput, HandleSignalInput, Next, SleepInput,
+    SleepOutput, WorkflowExecuteOutput, WorkflowInboundInterceptor, WorkflowInterceptor,
+    WorkflowInterceptorContext, WorkflowInterceptors, WorkflowOutboundInterceptor,
+    WorkflowQueryOutput, WorkflowSignalOutput, WorkflowValue,
+};
 
 mod activity_execution_value {
     use super::*;
@@ -64,24 +70,6 @@ pub trait WorkerInterceptor {
         _activation: &WorkflowActivation,
     ) -> Result<(), anyhow::Error> {
         Ok(())
-    }
-}
-
-/// Continuation for an interceptor operation.
-///
-/// Interceptor implementations call [`Next::run`] to invoke the next step of the chain.
-pub struct Next<'a, I, O> {
-    inner: Box<dyn FnOnce(I) -> O + Send + 'a>,
-}
-
-impl<'a, I, O> Next<'a, I, O> {
-    pub(crate) fn new(f: impl FnOnce(I) -> O + Send + 'a) -> Self {
-        Self { inner: Box::new(f) }
-    }
-
-    /// Continue the call chain with the provided input.
-    pub fn run(self, input: I) -> O {
-        (self.inner)(input)
     }
 }
 
