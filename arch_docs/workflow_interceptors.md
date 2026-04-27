@@ -1,8 +1,15 @@
 # Workflow Interceptors - Rust SDK
 
-**Status:** Draft, corrected scope, replay behavior explicit
-**Goal:** Add workflow interceptors for actions that enter or exit workflow context, with an
-explicit replay-aware side-effect boundary.
+**Status:** Draft, middleware semantics explicit
+**Goal:** Add workflow interceptors for actions that enter or exit workflow context, with
+deterministic command mutation and an explicit replay-aware side-effect boundary.
+
+**Shape:** synchronous continuation middleware with async-capable outputs. Interceptor trait
+methods are synchronous functions (`fn`, not `async fn`). They must call `next.run(input)`
+synchronously before returning. Async operations return futures as their output type, so an
+interceptor can still wrap or observe the operation's *completion* by composing on the returned
+future. What it cannot do is `.await` before forwarding to `next`. See section 5.6 for the
+rationale.
 
 This is intentionally different from client interceptors. It should not cover calls like fetching
 workflow history, describing a workflow from a client, or listing workflows. It should cover
@@ -10,22 +17,25 @@ workflow code boundaries: executing workflow code, handling queries/signals/upda
 workflow commands such as timers, activities, child workflows, external workflow signals/cancels,
 continue-as-new, and Nexus operations.
 
-These interceptors are instrumentation and policy hooks around workflow execution. They need to
-support OpenTelemetry, but the SDK should not conflate command-affecting interception with
-side-effect export. Interceptor code that transforms inputs used for workflow commands must remain
-deterministic and replay-compatible; user-defined telemetry/log/metric side effects must be gated
-by replay state. The first implementation should provide the interceptor traits and dispatch
-machinery only, not SDK-provided OpenTelemetry interceptors or telemetry helpers.
+These interceptors are workflow middleware. They are allowed to inspect, replace, or transform the
+input forwarded to `next`, and that forwarded input is the input the SDK uses to invoke handlers,
+return results, or produce workflow commands. They need to support OpenTelemetry, but the SDK should
+not conflate command-affecting middleware with side-effect export. Interceptor code that transforms
+inputs used for workflow commands must remain deterministic and replay-compatible; user-defined
+telemetry/log/metric side effects must be gated by replay state. The first implementation should
+provide the interceptor traits and dispatch machinery only, not SDK-provided OpenTelemetry
+interceptors or telemetry helpers.
 
-For v1, outbound workflow interceptors should align with other SDK behavior: an interceptor may
-pass the original input or a modified input to `next`, and that forwarded input is what the SDK uses
-to produce commands. For history-producing outbound hooks, successful short-circuiting should not be
-supported in v1; user-defined interceptors must continue the call chain exactly once.
+For v1, workflow interceptors should align with other SDK behavior: an interceptor may pass the
+original input or a modified input to `next`, and that forwarded input is what the SDK uses. For
+history-producing outbound hooks, successful short-circuiting should not be supported in v1;
+user-defined interceptors must continue the call chain exactly once, and they must do so
+synchronously — without awaiting any future before calling `next`.
 
 Workflow interceptor side effects must not be emitted while replaying history events. During replay,
-the SDK still executes workflow code and emits commands through the normal deterministic path; if an
-interceptor participates in deterministic input transformation, that transformation must remain
-replay-compatible while telemetry/log/metric export is suppressed.
+the SDK still executes workflow code and reconstructs commands through the normal deterministic
+path; if an interceptor participates in deterministic input transformation, that transformation
+must run during replay while telemetry/log/metric export is suppressed.
 
 ---
 
@@ -47,7 +57,8 @@ intercept the same conceptual operations exposed by other Temporal SDKs:
   and starting Nexus operations
 
 These interceptors are workflow-runtime boundary interceptors. They observe and wrap workflow entry
-and exit points, but they should not be modeled as client operations, raw Core RPC hooks, or a
+and exit points, and they can behave as middleware over the values forwarded through those
+boundaries. They should not be modeled as client operations, raw Core RPC hooks, or a
 general-purpose way to run arbitrary nondeterministic workflow code.
 
 ---
@@ -101,8 +112,8 @@ interceptors and not client interceptors.
 
 Python also documents two details that should influence Rust:
 
-- interceptors form a chain and can inspect or modify input and result data before forwarding to the
-  next interceptor
+- interceptors form a chain and can inspect or modify input and result data before forwarding to
+  the next interceptor; forwarded modifications are semantically part of the intercepted operation
 - workflow inbound and outbound interceptors run in the Workflow sandbox and may execute during
   replay
 
@@ -152,10 +163,45 @@ emission, the SDK needs explicit raw and computed replay state on interceptor in
 interceptors can suppress telemetry/log/metric emission without skipping deterministic input
 transformations needed for command generation.
 
-TypeScript, Ruby, and Java workflow outbound interceptors can affect command data when they forward
-modified inputs. Rust v1 should copy this behavior for SDK parity, with one additional Rust-specific
-constraint: history-producing outbound hooks must continue the call chain exactly once so command
-generation remains owned by the SDK.
+TypeScript, Ruby, and Java workflow interceptors can affect operation data when they forward
+modified inputs. Rust v1 should copy this middleware behavior for SDK parity, with one additional
+Rust-specific constraint: history-producing outbound hooks must continue the call chain exactly
+once so command generation remains owned by the SDK.
+
+#### 2.2.1 Async Workflow Interceptors Are A Footgun TypeScript Already Tripped Over
+
+TypeScript advertises async workflow interceptor methods (`async scheduleActivity(...): Promise<unknown>`,
+`async handleSignal(...)`, etc.). Awaiting before forwarding to `next` inside a workflow
+interceptor inserts a yield point into the workflow coroutine. That yield point is part of the
+workflow's deterministic schedule: if the interceptor changes — or if it was added/removed
+between SDK versions — the yield count for the same logical history changes, and replay raises an
+NDE.
+
+This is not theoretical. The TypeScript SDK ships permanent replay-compatibility flags whose sole
+job is to paper over yield-point drift introduced by `await` calls in OTEL workflow interceptors.
+Examples in the local TypeScript checkout:
+
+- `packages/interceptors-opentelemetry/src/workflow/index.ts:75,94,174,196,234,253,273` —
+  `if (!getActivator().hasFlag(SdkFlags.OpenTelemetryInterceporsAvoidsExtraYields)) await Promise.resolve();`
+  is injected to reproduce yields that older versions of the OTEL interceptor introduced.
+- `packages/workflow/src/flags.ts:48–88` — three flags
+  (`OpenTelemetryInterceptorsTracesInboundSignals`, `OpenTelemetryInterceptorsTracesLocalActivities`,
+  `OpenTelemetryInterceporsAvoidsExtraYields`) document specific incidents where an interceptor
+  yield was added in 1.11.5, removed in 1.13.2, etc., and a flag was needed to keep historical
+  workflows replayable.
+
+The accidental nature of those yields is also evidence that pre-`next` `await` is *not* a
+necessary capability: a survey of every official Temporal workflow interceptor (TS/Python/Go/Java
+OTEL, Python LangSmith, openai-agents tracing, OpenTracing, Datadog) and every documented sample
+found zero workflow interceptors that perform semantic async I/O before forwarding to `next`. Real
+interceptors do synchronous header/span work and then forward. Forum threads asking how to do
+async work in workflow interceptors are consistently redirected to activities (e.g.,
+[community.temporal.io thread 5390](https://community.temporal.io/t/interceptor-determinism-workflow-replay-with-interceptors-is-executing-same-interceptor-code-again/5390)).
+
+The lesson for Rust: do not adopt TypeScript's async interceptor shape. Make interceptor methods
+synchronous so the coroutine cannot yield mid-chain, and let async-capable outputs (returned
+futures) carry post-`next` async behavior. This eliminates an entire category of replay-flag
+scaffolding without blocking any documented user pattern.
 
 ---
 
@@ -239,7 +285,9 @@ Recommended second slice:
 - outbound `execute_local_activity`
 - outbound `start_child_workflow`
 
-These prove typed input serialization and typed result futures on outbound calls.
+These prove the typed/erased middleware boundary: outbound calls should carry SDK-owned erased
+typed arguments through the interceptor chain and serialize them only after the final `next`
+continuation reaches SDK command construction.
 
 Recommended third slice:
 
@@ -296,13 +344,17 @@ Allowed interceptor behavior:
 - read wall-clock time for instrumentation
 - enqueue or hand off network I/O for observability or policy systems only when guarded by replay
   state, and only if the result cannot affect workflow commands or handler results
-- inspect workflow metadata, replay state, headers, payloads, and outbound command inputs
+- inspect workflow metadata, replay state, headers, typed/erased values, payloads, and outbound
+  command inputs
 
 Required constraints:
 
 - interceptor side effects must not affect deterministic workflow behavior unless the resulting
   command/result is derived only from deterministic workflow inputs
 - history-producing outbound hooks must call `next` exactly once
+- interceptor methods must call `next.run(input)` synchronously; awaiting any future before
+  forwarding to `next` is forbidden because that inserts a yield point into the workflow
+  coroutine and breaks replay determinism (see section 2.2.1)
 - any input changes forwarded to `next` must be deterministic and replay-safe
 - interceptor inputs must expose only read-only workflow context; do not pass command-capable
   `WorkflowContext<W>` or `SyncWorkflowContext<W>` to interceptors
@@ -357,13 +409,16 @@ Side effects in the same interceptor must be guarded by replay state.
 ### 5.3 Continuation And Mutation Semantics
 
 Rust v1 should model other SDK APIs where `next(input)` consumes the input forwarded by the
-interceptor. This means input mutation is represented by passing a modified input value to `next`,
-not by mutating shared SDK state in place.
+interceptor. This is middleware semantics: the value passed to `next` is the operation value the
+SDK continues with. Input mutation is represented by passing a modified input value to `next`, not
+by mutating shared SDK state in place.
 
 Rust v1 should use these semantics:
 
 - input structs describe SDK operations and may be transformed before forwarding
 - `Next` accepts the input value to continue with
+- forwarded input modifications affect handler invocation, operation results, or emitted commands
+  according to the operation being intercepted
 - history-producing outbound hooks must call `next` exactly once
 - successful short-circuiting of history-producing outbound hooks is not supported in v1
 - nested collections should avoid shared mutable aliasing; use owned values or copy-on-write
@@ -371,20 +426,77 @@ Rust v1 should use these semantics:
 - input transformations that affect commands must be deterministic and must not depend on
   non-replayable side effects
 
-### 5.4 Typed vs. Serialized Inputs
+### 5.4 Typed, Erased Values vs. Serialized Payloads
 
 Inbound handlers already operate at points where the SDK dispatch layer has access to handler names,
 payloads, headers, and a workflow context. Outbound workflow calls often start with typed Rust
 inputs and serialize them inside `WorkflowContext` methods.
 
-For a first implementation, prefer serialized payloads at interceptor boundaries:
+The base interceptor traits should remain object-safe, but that does not require eagerly converting
+typed Rust values to `Payload`. For operations that start with typed Rust values and later emit
+history commands or responses, the SDK should carry an SDK-owned erased value through the
+interceptor chain and perform payload serialization only at the final SDK boundary.
 
-- inbound inputs contain handler name, payloads, headers, and context/view
-- outbound inputs contain operation name/type, serialized payloads, options, and command metadata
+Proposed wrapper:
 
-This keeps the interceptor traits object-safe and avoids generic methods over activity/workflow
-definitions. If a later design requires typed visibility, it should be a separate generic/static
-extension, not the base interceptor API.
+```rust
+pub struct WorkflowValue {
+    type_id: TypeId,
+    inner: Box<dyn TemporalSerializable>,
+}
+
+impl WorkflowValue {
+    pub fn downcast_ref<T>(&self) -> Option<&T>
+    where
+        T: TemporalSerializable + 'static
+    {
+        // ...
+    }
+
+    pub fn downcast_mut<T>(&mut self) -> Option<&mut T>
+    where
+        T: TemporalSerializable + 'static
+    {
+        // ...
+    }
+
+    pub fn replace<T>(&mut self, value: T)
+    where
+        T: TemporalSerializable + 'static
+    {
+        // ...
+    }
+}
+```
+
+The exact name is open, but the wrapper should be owned by the SDK rather than exposing
+`Box<dyn TemporalSerializable>` directly. The wrapper can capture `TypeId::of::<T>()` at
+construction time and use that stored `TypeId` to implement downcast helpers without requiring
+`TemporalSerializable: Any`. This mirrors the shape of `std::error::Error` downcasting: the public
+downcast bound is the domain trait plus `'static`, while the implementation compares `TypeId`s and
+uses an unsafe cast guarded by that check. To keep this sound, all constructors and replacement APIs
+must set the stored `TypeId` from the same concrete value placed in `inner`; users should not be
+able to construct an arbitrary `(TypeId, dyn TemporalSerializable)` pair.
+
+Argument lists should be represented as one erased value, usually the same tuple or `RawValue`
+already accepted by the typed SDK API. This mirrors TypeScript's `unknown[]` in spirit: most
+interceptors will treat the value opaquely, while domain-specific interceptors can downcast to a
+known input type or tuple and replace it deterministically.
+
+For operations that originate as payloads from history or clients, the SDK has two viable choices:
+
+- expose the payloads as `RawValue` through the same wrapper when no typed value has been
+  constructed yet
+- deserialize to the registered handler input type before the interceptor chain and pass that typed
+  erased value to `next`
+
+The first implementation can choose the simpler path per hook, but the target API should not make
+early payload serialization the only extensibility point for history-producing outbound calls.
+Outbound activity, local activity, child workflow, external signal, continue-as-new, workflow
+completion, query result, and update result hooks should all serialize after the last interceptor
+that can modify the value.
+
+This should be implemented in a submodule of the interceptors with stringent testing around the `unsafe` behavior.
 
 ### 5.5 Input Struct Stability
 
@@ -405,21 +517,39 @@ Implementation guidance:
 - avoid shared mutable aliasing for args, headers, options, and other history-producing data
 - provide output constructors only when successful short-circuiting is supported and replay-safe
 
-### 5.6 Async And `Send`
+### 5.6 Synchronous Methods, Async-Capable Outputs
 
-Do not couple command-side interceptor futures to OTEL exporter futures. If the chain is invoked
-while the SDK is interacting with workflow-local `Rc`/`RefCell` state, the command-side public
-future may need to be non-`Send`. Future side-effect/export helpers can still hand work to normal
-worker-runtime tasks and `Send` futures without changing the command-side trait shape.
+The interceptor trait methods are synchronous functions, not `async fn`. The output type of each
+method is the same as the output type of the SDK operation being intercepted: synchronous
+operations return values directly, asynchronous operations return futures (typically
+`LocalBoxFuture<'static, _>` or a domain-specific cancellable future).
 
-The first implementation should decide this based on where the chain is invoked:
+This shape preserves async-capable middleware while making pre-`next` yield points
+*expressible-in-Rust impossible*:
 
-- If hooks run while borrowing workflow-local internals, use non-`Send` command-side futures.
-- If hooks can be invoked on the normal worker runtime without borrowing workflow-local internals,
-  `Send` futures may be acceptable, but this should be proven by the implementation hook points.
+- An interceptor cannot `.await` before calling `next.run(input)` because the method is not
+  async.
+- `Next<'a, I, O>` borrows SDK chain state for `'a`, and `run` consumes `self`. The `Next`
+  cannot be moved into a `'static` future, stored, or deferred — it must be consumed before the
+  method returns, which means `next.run(input)` must be called synchronously inside the method
+  body.
+- For async operations, the value returned by `next.run(input)` is the operation future. The
+  interceptor can wrap that future (e.g., `Box::pin(async move { let r = fut.await; record(r) })`)
+  to observe completion or transform the result. That wrapping is post-`next` and does not insert
+  a coroutine yield before SDK command generation, so it is replay-safe.
 
-Default assumption: do not require `Send` for command-side workflow interceptor futures until the
-hook points prove that requirement is sound.
+This is the same conclusion every official Temporal workflow-interceptor implementation reaches
+in practice (see section 2.2.1): synchronous header/span/log work, then forward, then optionally
+wrap the result. Rust enforces it at the type level rather than relying on convention.
+
+`Send` requirements on the returned future:
+
+- If hooks run while the SDK is interacting with workflow-local `Rc`/`RefCell` state, the
+  returned future should be non-`Send` (e.g., `LocalBoxFuture<'static, _>`).
+- Side-effect/export helpers can still hand work off to normal worker-runtime tasks and `Send`
+  futures without changing the command-side trait shape; this is a separate dispatch concern.
+- Default assumption: do not require `Send` on workflow interceptor output futures until the
+  hook points prove that requirement is sound.
 
 ---
 
@@ -429,16 +559,24 @@ Use separate inbound and outbound traits. A workflow interceptor factory wires t
 workflow instance. Individual operations should use an explicit `Next` value so ordering and
 lifetime constraints are clear.
 
+Trait methods are **synchronous** (`fn`, not `async fn`). The output type of each method matches
+the SDK operation being intercepted: synchronous operations (e.g., query handling, timer
+creation) return values directly; asynchronous operations (e.g., workflow execution, signal
+handling, activity completion) return futures. Interceptors observe operation completion by
+wrapping the returned future, not by awaiting before forwarding to `next`. See section 5.6.
+
 `Next` should be public enough to appear in interceptor method signatures, but opaque enough that
 users cannot construct it themselves. `Next` accepts the input to continue with, matching other SDK
-interceptor APIs.
+interceptor APIs. `Next<'a, I, O>` is borrowed for `'a` and consumed by `run`, which structurally
+prevents an interceptor method from awaiting before calling `next.run(input)` — the method body
+must call `run` synchronously and return either the result or a future composed from it.
 
 Sketch:
 
 ```rust
-pub type WorkflowExecuteOutput = LocalBoxFuture<'static, WorkflowResult<Payload>>;
+pub type WorkflowExecuteOutput = LocalBoxFuture<'static, WorkflowResult<WorkflowValue>>;
 pub type WorkflowSignalOutput = LocalBoxFuture<'static, Result<(), WorkflowError>>;
-pub type WorkflowQueryOutput = Result<Payload, WorkflowError>;
+pub type WorkflowQueryOutput = Result<WorkflowValue, WorkflowError>;
 pub type SleepOutput = BoxedCancellableFuture<TimerResult>;
 
 #[must_use = "workflow interceptor continuations must be run to continue the call chain"]
@@ -521,6 +659,11 @@ pub trait WorkflowOutboundInterceptor: Send + Sync + 'static {
 - `run` returns the operation output directly; operations that are async use boxed local futures as
   their output types, while synchronous operations such as queries and timer creation can remain
   synchronous
+- because the enclosing interceptor method is `fn`, not `async fn`, `run` must be invoked
+  synchronously in the method body before the method returns — there is no way to `.await`
+  before calling `run`; this is the structural enforcement of the "no pre-`next` yield" rule
+- for operations that produce payloads or commands, final serialization happens only after the
+  last interceptor has forwarded to SDK-owned dispatch/command construction
 - v1 history-producing outbound hooks must call `next` exactly once; `run` consuming `self`
   enforces at-most-once, and `#[must_use]` should catch accidental failure to continue, but the
   exact-once rule remains a documented user contract rather than a heavy runtime mechanism
@@ -577,7 +720,7 @@ First slice:
 #[non_exhaustive]
 pub struct ExecuteInput {
     workflow_type: String,
-    args: Vec<Payload>,
+    args: WorkflowValue,
     headers: HashMap<String, Payload>,
     context: WorkflowInterceptorContext,
 }
@@ -585,7 +728,7 @@ pub struct ExecuteInput {
 #[non_exhaustive]
 pub struct HandleSignalInput {
     signal_name: String,
-    args: Vec<Payload>,
+    args: WorkflowValue,
     headers: HashMap<String, Payload>,
     context: WorkflowInterceptorContext,
 }
@@ -593,7 +736,7 @@ pub struct HandleSignalInput {
 #[non_exhaustive]
 pub struct HandleQueryInput {
     query_name: String,
-    args: Vec<Payload>,
+    args: WorkflowValue,
     headers: HashMap<String, Payload>,
     context: WorkflowInterceptorContext,
 }
@@ -612,7 +755,7 @@ Second slice examples:
 #[non_exhaustive]
 pub struct ExecuteActivityInput {
     activity_type: String,
-    args: Vec<Payload>,
+    args: WorkflowValue,
     options: ActivityOptions,
 }
 
@@ -620,7 +763,7 @@ pub struct ExecuteActivityInput {
 pub struct StartChildWorkflowInput {
     workflow_type: String,
     workflow_id: String,
-    args: Vec<Payload>,
+    args: WorkflowValue,
     options: ChildWorkflowOptions,
 }
 ```
@@ -655,7 +798,8 @@ Outbound hook points:
 - `SyncWorkflowContext::start_nexus_operation`
 
 The first implementation should not hook directly into core state machines. Hook at the SDK context
-and dispatch layers where the operation still has SDK-level names, headers, payloads, and options.
+and dispatch layers where the operation still has SDK-level names, headers, typed values or
+payloads, and options.
 
 ---
 
@@ -667,22 +811,31 @@ and dispatch layers where the operation still has SDK-level names, headers, payl
    scaffolding under `crates/sdk/src/interceptors.rs` or a new `crates/sdk/src/interceptors/`
    module.
 3. Define public opaque `Next<'a, I, O>` and its lifetime/single-use/input-forwarding semantics.
-4. Thread workflow interceptor configuration through `WorkerOptions`, not `ClientOptions`.
-5. Build inbound and outbound chains when a workflow instance is created.
-6. For each workflow instance, create/wrap an outbound interceptor chain and store it in worker/SDK
+4. Define an SDK-owned `WorkflowValue`/erased-serializable wrapper for typed middleware values,
+   including captured `TypeId`, downcast, replacement, and crate-private final serialization.
+5. Thread workflow interceptor configuration through `WorkerOptions`, not `ClientOptions`.
+6. Build inbound and outbound chains when a workflow instance is created.
+7. For each workflow instance, create/wrap an outbound interceptor chain and store it in worker/SDK
    state associated with that instance. Do not expose this as user workflow context state.
-7. Add `WorkflowInterceptorContext` to interceptor inputs with both raw `is_replaying` and
+8. Add `WorkflowInterceptorContext` to interceptor inputs with both raw `is_replaying` and
    computed `is_replaying_history_events`. Do not skip history-producing interceptor chains during
-   replay if they can transform command inputs.
-8. Implement first-slice hooks: `execute`, `handle_signal`, `handle_query`, and `sleep`.
-9. Add workflow/unit or integration tests:
+   replay as they can transform command inputs.
+9. Implement first-slice hooks: `execute`, `handle_signal`, `handle_query`, and `sleep`.
+10. Add workflow/unit or integration tests:
    - interceptor ordering
    - default forwarding
    - `Next` is single-use and marked `#[must_use]`
+   - interceptor trait methods are synchronous (`fn`, not `async fn`); the trait shape
+     structurally rejects `.await` before `next.run(input)`
+   - async-output operations can be wrapped post-`next` (interceptor returns a composed future
+     that observes completion of the operation future returned by `next.run(input)`)
    - error behavior where supported
    - signal/query headers visible in inbound inputs
    - timer interception observes the logical sleep operation
-   - modified input forwarded to `next` affects emitted workflow commands
+   - typed values can be downcast and replaced before forwarding to `next`
+   - final payload serialization happens after the last interceptor
+   - modified input forwarded to `next` affects handler invocation, operation results, or emitted
+     workflow commands as appropriate for the hook
    - raw `is_replaying` is exposed on relevant operations
    - computed `is_replaying_history_events` is true for history replay and false for live
      read-only operations after replay catch-up
@@ -691,8 +844,10 @@ and dispatch layers where the operation still has SDK-level names, headers, payl
    - live query/update-validator work after replay catch-up can still invoke inbound interceptors
    - interceptor errors/panics are surfaced as failures of the intercepted operation, not worker
      crashes
-10. Add activity and child-workflow outbound hooks after the first slice is stable.
-11. Add updates and external workflow hooks after activity/child workflow hooks are stable.
+11. Add activity and child-workflow outbound hooks after the first slice is stable. These are the
+    first hooks that should prove typed/erased outbound argument mutation before command
+    serialization.
+12. Add updates and external workflow hooks after activity/child workflow hooks are stable.
 
 Integration tests must be run with `cargo integ-test <test_name>`.
 
@@ -705,15 +860,23 @@ Integration tests must be run with `cargo integ-test <test_name>`.
   queries cannot be replayed as history events.
 - Interceptor methods should return the same operation result types as the wrapped SDK operation.
   Do not introduce a separate interceptor error channel in v1.
+- Do not expose `Box<dyn TemporalSerializable>` directly. Use an SDK wrapper so the SDK can pair
+  the trait object with a trustworthy `TypeId`, add downcasting/replacement, and control final
+  serialization without committing to trait-object construction details.
+- The payload converter path may need `?Sized` or wrapper-specific entry points so crate-private
+  final serialization can serialize a `dyn TemporalSerializable` value.
 - If an interceptor returns an error where the operation result type supports errors, treat it as
   if the intercepted call returned that error.
 - Panics from interceptor code should be caught and converted through the same user-code failure
   mapping as a panic in the intercepted call. They should not crash the worker process; for
   application-level operation failures, this should become an application failure, analogous to
   activity panic handling.
-- Awaiting external I/O inline in command-side hooks is not a supported v1 contract. Side-effecting
+- Interceptor methods are synchronous functions; awaiting external I/O before calling `next` is
+  not expressible at the type level (no `async fn`, `Next` is borrowed and must be consumed
+  synchronously) and is not a supported v1 contract for any future variant. Side-effecting
   interceptors should hand work off, for example to a span processor, without waiting for the
-  result to continue workflow execution.
+  result to continue workflow execution. Async observation of operation completion is supported
+  by wrapping the future returned from `next.run(input)`.
 
 ## 11. Deferred Work
 
@@ -735,10 +898,17 @@ Integration tests must be run with `cargo integ-test <test_name>`.
   history-producing chains that can transform input; suppress side effects separately.
 - **Accidental command mutation:** if input structs expose shared mutable nested data, interceptors
   can accidentally affect commands. Prefer owned values or explicit `with_*` replacement APIs.
+- **Typed erasure footguns:** downcasting only works when the interceptor knows the exact concrete
+  type, often the generated tuple input type. Documentation should make clear that this is an
+  advanced middleware capability, not a general reflection system.
+- **TypeId soundness:** downcasting without an `Any` supertrait is sound only if the SDK controls
+  wrapper construction and always keeps the stored `TypeId` aligned with the concrete value in the
+  trait object.
 - **Wrong abstraction level:** hooking core activations directly would expose too much internal
   machinery. Hook SDK dispatch/context methods instead.
 - **Generic explosion:** typed outbound hooks for every activity/workflow type would not be
-  object-safe. Prefer serialized payloads for the base trait.
+  object-safe. Prefer SDK-owned erased typed values for the base trait, with downcasting for
+  interceptors that know the concrete type.
 - **Over-broad first slice:** implementing every Ruby-equivalent method at once will obscure
   whether inbound/outbound chaining works.
 - **Replay semantics:** logging, metrics, and spans can double-count under replay unless
@@ -748,3 +918,8 @@ Integration tests must be run with `cargo integ-test <test_name>`.
   participate in the replay-sensitive path, but they route/suppress side effects separately.
   Rust documentation must be explicit about which part is replay-sensitive and which part is
   side-effect-capable.
+- **Async-interceptor expectation from TypeScript users:** users coming from TypeScript may expect
+  `async fn` workflow interceptor methods. Rust deliberately rejects that shape (section 2.2.1,
+  section 5.6). Documentation should explain the `fn`-with-future-output shape up front and point
+  to the TS replay-flag history as concrete justification, so users do not file this as a
+  missing-feature issue.
