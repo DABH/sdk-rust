@@ -583,7 +583,9 @@ impl WorkflowMachines {
             .take_next_wft_sequence(last_handled_wft_started_id)
         {
             NextWFT::ReplayOver => (vec![], true),
-            NextWFT::WFT(mut evts, has_final_event) => {
+            NextWFT::WFT(lwft) => {
+                let has_final_event = lwft.is_terminal();
+                let mut evts = lwft.into_events();
                 // Do not re-process events we have already processed
                 evts.retain(|e| e.event_id > self.last_processed_event);
                 (evts, has_final_event)

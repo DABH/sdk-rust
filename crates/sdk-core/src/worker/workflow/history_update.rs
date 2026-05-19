@@ -83,10 +83,43 @@ impl HistoryUpdate {
     }
 }
 
+/// A complete logical workflow task (LWFT): the events that the workflow machines
+/// should apply as a single, atomic processing unit. May correspond to one
+/// server-side Workflow Task, or to multiple consecutive WFTs that have been
+/// collapsed (e.g. WFT heartbeats followed by a real WFT).
+///
+/// See `arch_docs/workflow_task_chunking.md` for the conceptual model.
+#[derive(Debug)]
+pub(crate) struct LogicalWorkflowTask {
+    events: Vec<HistoryEvent>,
+    /// True if this LWFT is the terminal one in the workflow's history.
+    is_terminal: bool,
+}
+
+impl LogicalWorkflowTask {
+    /// Borrowed access to the events composing this LWFT, in history order.
+    // Only consumed from test code today; will be used by production consumers
+    // in a follow-up phase once the buffer/LWFT API is fully fleshed out.
+    #[allow(dead_code)]
+    pub(crate) fn events(&self) -> &[HistoryEvent] {
+        &self.events
+    }
+
+    /// Whether this is the final LWFT for the workflow.
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.is_terminal
+    }
+
+    /// Consume this LWFT and return its events.
+    pub(crate) fn into_events(self) -> Vec<HistoryEvent> {
+        self.events
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum NextWFT {
     ReplayOver,
-    WFT(Vec<HistoryEvent>, bool),
+    WFT(LogicalWorkflowTask),
     NeedFetch,
 }
 
@@ -687,10 +720,12 @@ impl HistoryUpdate {
     }
 
     fn build_next_wft(&mut self, drain_this_much: usize) -> NextWFT {
-        NextWFT::WFT(
-            self.events.drain(0..=drain_this_much).collect(),
-            self.events.is_empty() && self.has_last_wft,
-        )
+        let events: Vec<HistoryEvent> = self.events.drain(0..=drain_this_much).collect();
+        let is_terminal = self.events.is_empty() && self.has_last_wft;
+        NextWFT::WFT(LogicalWorkflowTask {
+            events,
+            is_terminal,
+        })
     }
 
     /// Lets the caller peek ahead at the next WFT sequence that will be returned by
@@ -1294,16 +1329,13 @@ mod tests {
     impl NextWFT {
         fn unwrap_events(self) -> Vec<HistoryEvent> {
             match self {
-                NextWFT::WFT(e, _) => e,
+                NextWFT::WFT(lwft) => lwft.into_events(),
                 o => panic!("Must be complete WFT: {o:?}"),
             }
         }
 
         fn is_complete(&self) -> bool {
-            match self {
-                NextWFT::WFT(_, true) => true,
-                _ => false,
-            }
+            matches!(self, NextWFT::WFT(lwft) if lwft.is_terminal())
         }
     }
 
@@ -1574,7 +1606,7 @@ mod tests {
         loop {
             let seq = loop {
                 match update.take_next_wft_sequence(last_id) {
-                    NextWFT::WFT(seq, _) => break seq,
+                    NextWFT::WFT(lwft) => break lwft.into_events(),
                     NextWFT::NeedFetch => {
                         update = paginator.extract_next_update().await.unwrap();
                     }
@@ -1688,8 +1720,8 @@ mod tests {
         loop {
             let seq = update.take_next_wft_sequence(last_id);
             match seq {
-                NextWFT::WFT(seq, _) => {
-                    last_id = seq.last().unwrap().event_id;
+                NextWFT::WFT(lwft) => {
+                    last_id = lwft.events().last().unwrap().event_id;
                 }
                 NextWFT::NeedFetch => {
                     update = paginator.extract_next_update().await.unwrap();
