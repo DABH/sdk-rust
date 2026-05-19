@@ -50,8 +50,8 @@ pub use temporalio_macros::activities;
 use crate::{
     OutgoingActivityError, OutgoingError,
     interceptors::{
-        ActivityExecutionValue, ActivityInboundInterceptor, ActivityInboundInterceptorNext,
-        ExecuteActivityInput, ExecuteActivityOutput,
+        ActivityExecutionValue, ActivityInboundInterceptor, ExecuteActivityInput,
+        ExecuteActivityOutput, Next, call_execute_activity,
     },
     panic_formatter,
 };
@@ -360,8 +360,8 @@ pub(crate) type ActivityInvocation = Arc<
             Vec<Payload>,
             DataConverter,
             ActivityContext,
-            Option<Arc<dyn ActivityInboundInterceptor>>,
-        ) -> BoxFuture<'static, ExecuteActivityOutput>
+            Vec<Arc<dyn ActivityInboundInterceptor>>,
+        ) -> ExecuteActivityOutput<'static>
         + Send
         + Sync,
 >;
@@ -406,7 +406,7 @@ impl ActivityDefinitions {
     {
         self.activities.insert(
             AD::name(),
-            Arc::new(move |payloads, dc, c, activity_inbound_interceptor| {
+            Arc::new(move |payloads, dc, c, activity_inbound_interceptors| {
                 let instance = instance.clone();
                 async move {
                     // Codec application happens at the SDK/Core boundary, so activity
@@ -418,13 +418,12 @@ impl ActivityDefinitions {
                     };
                     let input: AD::Input = pc.from_payloads(&ctx, payloads)?;
                     let input = ExecuteActivityInput::new(c, Box::new(input));
-                    let next = activity_inbound_interceptor_next::<AD>(instance);
-                    let activity_execution = match activity_inbound_interceptor {
-                        Some(interceptor) => {
-                            async move { interceptor.execute_activity(input, next).await }.boxed()
-                        }
-                        None => next.run(input),
-                    };
+                    let leaf = activity_inbound_base::<AD>(instance);
+                    let activity_execution = call_execute_activity(
+                        Arc::from(activity_inbound_interceptors),
+                        input,
+                        leaf,
+                    );
                     match AssertUnwindSafe(activity_execution).catch_unwind().await {
                         Ok(output) => output,
                         Err(panic) => Err(ApplicationFailure::new(anyhow::anyhow!(
@@ -449,15 +448,15 @@ impl ActivityDefinitions {
     }
 }
 
-fn activity_inbound_interceptor_next<AD>(
+fn activity_inbound_base<AD>(
     instance: Arc<AD::Implementer>,
-) -> ActivityInboundInterceptorNext<'static>
+) -> Next<'static, ExecuteActivityInput, ExecuteActivityOutput<'static>>
 where
     AD: ActivityDefinition + ExecutableActivity,
     AD::Input: Send + Sync,
     AD::Output: Send + Sync,
 {
-    ActivityInboundInterceptorNext::new(move |input| {
+    Next::new(move |input: ExecuteActivityInput| {
         let (activity_context, args) = input.into_parts();
         let args = match args.downcast::<AD::Input>() {
             Ok(args) => args,
