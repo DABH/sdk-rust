@@ -1,0 +1,11 @@
+error: lifetime may not live long enough
+  --> tests/interceptors_trybuild/pre_next_await_fail.rs:17:9
+   |
+ 8 |       fn execute<'a>(
+   |                  -- lifetime `'a` defined here
+...
+17 | /         Box::pin(async move {
+18 | |             futures::future::ready(()).await;
+19 | |             next.run(input).await
+20 | |         })
+   | |__________^ returning this value requires that `'a` must outlive `'static`

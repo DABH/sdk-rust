@@ -446,6 +446,13 @@ pub struct WorkflowValue {
 }
 
 impl WorkflowValue {
+    pub(crate) fn new<T>(value: T) -> Self
+    where
+        T: TemporalSerializable + 'static
+    {
+        // ...
+    }
+
     pub fn downcast_ref<T>(&self) -> Option<&T>
     where
         T: TemporalSerializable + 'static
@@ -459,39 +466,73 @@ impl WorkflowValue {
     {
         // ...
     }
-
-    pub fn replace<T>(&mut self, value: T)
-    where
-        T: TemporalSerializable + 'static
-    {
-        // ...
-    }
 }
 ```
 
 The exact name is open, but the wrapper should be owned by the SDK rather than exposing
-`Box<dyn TemporalSerializable>` directly. The wrapper can capture `TypeId::of::<T>()` at
-construction time and use that stored `TypeId` to implement downcast helpers without requiring
+`Box<dyn TemporalSerializable>` directly. The wrapper captures `TypeId::of::<T>()` at construction
+time and uses that stored `TypeId` to implement downcast helpers without requiring
 `TemporalSerializable: Any`. This mirrors the shape of `std::error::Error` downcasting: the public
 downcast bound is the domain trait plus `'static`, while the implementation compares `TypeId`s and
-uses an unsafe cast guarded by that check. To keep this sound, all constructors and replacement APIs
-must set the stored `TypeId` from the same concrete value placed in `inner`; users should not be
-able to construct an arbitrary `(TypeId, dyn TemporalSerializable)` pair.
+uses an unsafe cast guarded by that check. To keep this sound, the public constructor must set
+the stored `TypeId` from the same concrete value placed in `inner`, and users must not be able to
+construct an arbitrary `(TypeId, dyn TemporalSerializable)` pair.
+
+The wrapper deliberately does **not** expose a `replace<T>` API or any other way to swap the
+concrete type after construction. The SDK puts a `WorkflowValue<T>` into the chain expecting a
+`WorkflowValue<T>` to come back out (e.g. so it can downcast back to the workflow's input type
+before invoking `W::run`). Allowing interceptors to substitute a different concrete type would
+turn that expectation into a runtime panic for no real-world benefit — every legitimate "I want
+to change the args" case is covered by mutating in place through `downcast_mut`.
+
+To make this guarantee airtight, three things must hold together:
+
+- the public constructor is **crate-private** (`pub(crate) fn new<T>`), so user code cannot
+  construct a foreign-typed `WorkflowValue` to swap in;
+- input structs that carry a `WorkflowValue` do not expose builder methods that accept a fresh
+  `WorkflowValue` (no `with_args(WorkflowValue)`); only an in-place mutable accessor
+  (`args_mut() -> &mut WorkflowValue`);
+- there is no `replace<T>` on `WorkflowValue` itself.
+
+If any one of these were missing, a user could combine `std::mem::swap` with a hand-built
+`WorkflowValue` of a different concrete type to defeat the type-preservation contract.
 
 Argument lists should be represented as one erased value, usually the same tuple or `RawValue`
 already accepted by the typed SDK API. This mirrors TypeScript's `unknown[]` in spirit: most
 interceptors will treat the value opaquely, while domain-specific interceptors can downcast to a
-known input type or tuple and replace it deterministically.
+known input type or tuple and mutate it deterministically.
 
-For operations that originate as payloads from history or clients, the SDK has two viable choices:
+For operations that originate as payloads from history or clients, prefer to deserialize to the
+registered handler input type before the chain runs and pass that typed value through `next`.
+Exposing `RawValue` is acceptable as a fallback when no typed value has been constructed yet, but
+the v1 inbound `execute` hook should not require interceptors to branch on `is::<RawValue>` vs
+`is::<Input>`: that's an avoidable footgun for end users.
 
-- expose the payloads as `RawValue` through the same wrapper when no typed value has been
-  constructed yet
-- deserialize to the registered handler input type before the interceptor chain and pass that typed
-  erased value to `next`
+For workflows whose `#[init]` method consumes the args (split-init), `W::init` is folded
+*inside* the chain rather than running before it. The SDK invokes `chain.execute(input,
+terminal)` synchronously at workflow construction time, where the terminal closure reads the
+(possibly-mutated) typed args, calls `W::init(view, Some(typed))`, builds the workflow context,
+and then calls `W::run(ctx, None)` — returning the run future as the chain's wrapped output. A
+shared `Rc<RefCell<Option<...>>>` lets the SDK recover the constructed `Rc<RefCell<W>>` after
+the terminal runs synchronously, so signal/query/update dispatch (which lives on
+`WorkflowExecution` outside the run future) shares the same workflow state. From the
+interceptor author's perspective the flow is identical in both shapes:
 
-The first implementation can choose the simpler path per hook, but the target API should not make
-early payload serialization the only extensibility point for history-producing outbound calls.
+- chain runs once;
+- mutating `ExecuteInput::args` reaches whichever handler ends up consuming them — `W::run` for
+  non-split, `W::init` for split-init;
+- the chain's wrapped future is the workflow's run future in both cases, so post-`next`
+  composition (timing, span end, result observation) works the same way.
+
+The only internal asymmetry is *when* `W::init` runs (inside the terminal for split-init,
+before the chain for non-split). That is invisible to interceptor authors. There is no
+dual-deserialization and no observation-only carve-out.
+
+If an execute interceptor short-circuits the chain (does not call `next.run`) for a split-init
+workflow, `W::init` never runs and there is no workflow to drive — the SDK panics with an
+explicit message. This reinforces the v1 rule that history-producing inbound hooks must call
+`next` exactly once.
+
 Outbound activity, local activity, child workflow, external signal, continue-as-new, workflow
 completion, query result, and update result hooks should all serialize after the last interceptor
 that can modify the value.
