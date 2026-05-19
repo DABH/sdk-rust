@@ -984,7 +984,7 @@ fn find_end_index_of_next_wft_seq_v2(
         prevent_heartbeat = true;
     }
 
-    // We're at the begining of a LWFT. Any command here results from the _previous_ WFT,
+    // We're at the beginning of a LWFT. Any command here results from the _previous_ WFT,
     // and therefore shouldn't affect chunking of the present LWFT, besides
     //
     // Consume `(WFTCompleted -> Command*)?`
@@ -1043,7 +1043,7 @@ fn find_end_index_of_next_wft_seq_v2(
 
                             // WFTStarted -> WFTCompleted -> (unknown)
                             None /* !has_last_wft */ => {
-                                // Can't conclcude yet, as unknown could be a WFTScheduled or UpdateAccepted event.
+                                // Can't conclude yet, as unknown could be a WFTScheduled or UpdateAccepted event.
                                 // Note that we are not making an exception for prevent_heartbeat=true here,
                                 // because we'd still need to if there's an UpdateAccepted event ahead.
                                 return NextWFTSeqEndIndex::NeedMore;
