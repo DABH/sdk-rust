@@ -2447,6 +2447,7 @@ mod tests {
         let termination = sync
             .continue_as_new(
                 &11,
+                #[allow(deprecated)]
                 ContinueAsNewOptions {
                     workflow_type: Some("next-workflow".to_string()),
                     task_queue: Some("next-task-queue".to_string()),

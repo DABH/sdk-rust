@@ -517,6 +517,7 @@ pub struct ContinueAsNewOptions {
     /// If set, the new workflow will have this retry policy. If `None`, reuses the current policy.
     pub retry_policy: Option<RetryPolicy>,
     /// Whether the new workflow should run on a worker with a compatible build id.
+    #[deprecated(note = "Use Worker Deployment based versioning instead")]
     pub versioning_intent: Option<VersioningIntent>,
 }
 
@@ -540,6 +541,7 @@ impl ContinueAsNewOptions {
             headers: self.headers.unwrap_or_default(),
             search_attributes: self.search_attributes,
             retry_policy: self.retry_policy,
+            #[allow(deprecated)]
             versioning_intent: self
                 .versioning_intent
                 .unwrap_or(VersioningIntent::Unspecified)
