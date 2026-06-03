@@ -586,6 +586,9 @@ fn string_user_metadata(summary: Option<String>, details: Option<String>) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temporalio_common_wasm::protos::coresdk::AsJsonPayloadExt;
+
+    const KEYWORD_LIST_SEARCH_ATTRIBUTE: &str = "my-keyword-list";
 
     #[test]
     fn activity_options_with_start_to_close_timeout_wrapper_supports_builder_chaining() {
@@ -662,5 +665,69 @@ mod tests {
         let exec_timeout = req.workflow_execution_timeout.unwrap();
         assert_eq!(exec_timeout.seconds, 60);
         assert!(req.workflow_run_timeout.is_none());
+    }
+
+    #[test]
+    fn keyword_list_null_payload_has_no_type_metadata() {
+        let payload = Option::<Vec<String>>::None.as_json_payload().unwrap();
+
+        assert_eq!(payload.metadata["encoding"], b"json/plain");
+        assert!(!payload.metadata.contains_key("type"));
+    }
+
+    #[test]
+    fn keyword_list_null_payload_not_accepted_as_value() {
+        let payload = Option::<Vec<String>>::None.as_json_payload().unwrap();
+        let attrs = child_workflow_search_attributes_from_payload(payload);
+
+        assert!(
+            !attrs
+                .indexed_fields
+                .contains_key(KEYWORD_LIST_SEARCH_ATTRIBUTE)
+        );
+    }
+
+    #[test]
+    fn keyword_list_null_element_payload_not_accepted_as_value() {
+        let payload = vec![Some("keyword"), None].as_json_payload().unwrap();
+        let attrs = child_workflow_search_attributes_from_payload(payload);
+
+        assert!(
+            !attrs
+                .indexed_fields
+                .contains_key(KEYWORD_LIST_SEARCH_ATTRIBUTE)
+        );
+    }
+
+    #[test]
+    fn keyword_list_legacy_typed_null_payload_decodes_as_absent() {
+        let mut payload = Option::<Vec<String>>::None.as_json_payload().unwrap();
+        payload
+            .metadata
+            .insert("type".to_string(), b"KeywordList".to_vec());
+        let attrs = child_workflow_search_attributes_from_payload(payload);
+
+        assert!(
+            !attrs
+                .indexed_fields
+                .contains_key(KEYWORD_LIST_SEARCH_ATTRIBUTE)
+        );
+    }
+
+    fn child_workflow_search_attributes_from_payload(payload: Payload) -> SearchAttributes {
+        let opts = ChildWorkflowOptions {
+            workflow_id: "test-wf".to_string(),
+            search_attributes: Some(HashMap::from([(
+                KEYWORD_LIST_SEARCH_ATTRIBUTE.to_string(),
+                payload,
+            )])),
+            ..Default::default()
+        };
+        let command = opts.into_command(1, "TestWorkflow".to_string(), vec![]);
+        let Some(workflow_command::Variant::StartChildWorkflowExecution(req)) = command.variant
+        else {
+            panic!("expected StartChildWorkflowExecution command");
+        };
+        req.search_attributes.unwrap()
     }
 }
