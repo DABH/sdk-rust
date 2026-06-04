@@ -102,7 +102,14 @@ async fn build_endpoint(
 /// Creates a balanced channel backed by all DNS-resolved addresses for the target.
 pub(crate) async fn create_balanced_channel(
     options: &ConnectionOptions,
-) -> Result<(Channel, mpsc::Sender<Change<SocketAddr, Endpoint>>), ClientConnectError> {
+) -> Result<
+    (
+        Channel,
+        mpsc::Sender<Change<SocketAddr, Endpoint>>,
+        HashSet<SocketAddr>,
+    ),
+    ClientConnectError,
+> {
     let host = options
         .target
         .host_str()
@@ -125,6 +132,7 @@ pub(crate) async fn create_balanced_channel(
             ),
         });
     }
+    let mut current_addrs = HashSet::with_capacity(addrs.len());
 
     let (channel, sender) = Channel::balance_channel(addrs.len());
 
@@ -140,9 +148,10 @@ pub(crate) async fn create_balanced_channel(
         .await?;
         // Unbounded-ish send into the freshly-created channel; can't realistically fail.
         let _ = sender.send(Change::Insert(addr, endpoint)).await;
+        current_addrs.insert(addr);
     }
 
-    Ok((channel, sender))
+    Ok((channel, sender, current_addrs))
 }
 
 /// Handle that aborts the DNS re-resolution task when dropped.
@@ -159,6 +168,7 @@ impl Drop for DnsReresolutionHandle {
 /// Spawns a background task that periodically re-resolves DNS and updates the balanced channel.
 pub(crate) fn spawn_dns_reresolution(
     sender: mpsc::Sender<Change<SocketAddr, Endpoint>>,
+    current_addrs: HashSet<SocketAddr>,
     target: Url,
     tls_options: Option<TlsOptions>,
     keep_alive: Option<ClientKeepAliveOptions>,
@@ -170,11 +180,7 @@ pub(crate) fn spawn_dns_reresolution(
     let scheme = target.scheme().to_owned();
 
     let handle = tokio::spawn(async move {
-        let mut current_addrs: HashSet<SocketAddr> = HashSet::new();
-        // Populate initial set from the channel we already seeded
-        if let Ok(initial) = resolve_host(&host, port).await {
-            current_addrs.extend(initial);
-        }
+        let mut current_addrs = current_addrs;
 
         loop {
             tokio::time::sleep(resolution_interval).await;
@@ -199,47 +205,72 @@ pub(crate) fn spawn_dns_reresolution(
                 continue;
             }
 
-            // Remove stale endpoints
-            for addr in current_addrs.difference(&new_addrs) {
-                if sender.send(Change::Remove(*addr)).await.is_err() {
-                    return;
-                }
+            if !apply_resolved_addresses(
+                &sender,
+                &mut current_addrs,
+                new_addrs,
+                &host,
+                &scheme,
+                tls_options.as_ref(),
+                keep_alive.as_ref(),
+                override_origin.as_ref(),
+            )
+            .await
+            {
+                return;
             }
-
-            // Add new endpoints
-            for addr in new_addrs.difference(&current_addrs) {
-                match build_endpoint(
-                    *addr,
-                    &host,
-                    &scheme,
-                    tls_options.as_ref(),
-                    keep_alive.as_ref(),
-                    override_origin.as_ref(),
-                )
-                .await
-                {
-                    Ok(endpoint) => {
-                        if sender.send(Change::Insert(*addr, endpoint)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            addr = %addr,
-                            error = %e,
-                            "Failed to build endpoint for resolved address"
-                        );
-                    }
-                }
-            }
-
-            current_addrs = new_addrs;
         }
     });
 
     Arc::new(DnsReresolutionHandle {
         abort_handle: handle.abort_handle(),
     })
+}
+
+async fn apply_resolved_addresses(
+    sender: &mpsc::Sender<Change<SocketAddr, Endpoint>>,
+    current_addrs: &mut HashSet<SocketAddr>,
+    new_addrs: HashSet<SocketAddr>,
+    host: &str,
+    scheme: &str,
+    tls_options: Option<&TlsOptions>,
+    keep_alive: Option<&ClientKeepAliveOptions>,
+    override_origin: Option<&Uri>,
+) -> bool {
+    for addr in current_addrs.difference(&new_addrs) {
+        if sender.send(Change::Remove(*addr)).await.is_err() {
+            return false;
+        }
+    }
+
+    for addr in new_addrs.difference(current_addrs) {
+        match build_endpoint(
+            *addr,
+            host,
+            scheme,
+            tls_options,
+            keep_alive,
+            override_origin,
+        )
+        .await
+        {
+            Ok(endpoint) => {
+                if sender.send(Change::Insert(*addr, endpoint)).await.is_err() {
+                    return false;
+                }
+            }
+            Err(e) => {
+                warn!(
+                    addr = %addr,
+                    error = %e,
+                    "Failed to build endpoint for resolved address"
+                );
+            }
+        }
+    }
+
+    *current_addrs = new_addrs;
+    true
 }
 
 #[cfg(test)]
@@ -302,5 +333,47 @@ mod tests {
     fn endpoint_uri_v6() {
         let addr: SocketAddr = "[::1]:7233".parse().unwrap();
         assert_eq!(endpoint_uri(addr, "https"), "https://[::1]:7233");
+    }
+
+    #[tokio::test]
+    async fn reresolution_uses_seeded_addresses_as_current_state() {
+        let addr_a: SocketAddr = "127.0.0.1:7233".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.2:7233".parse().unwrap();
+        let addr_c: SocketAddr = "127.0.0.3:7233".parse().unwrap();
+        let mut current_addrs = HashSet::from([addr_a, addr_b]);
+        let new_addrs = HashSet::from([addr_b, addr_c]);
+
+        let (sender, mut receiver) = mpsc::channel(4);
+        assert!(
+            apply_resolved_addresses(
+                &sender,
+                &mut current_addrs,
+                new_addrs.clone(),
+                "temporal.example.com",
+                "http",
+                None,
+                None,
+                None,
+            )
+            .await
+        );
+        assert_eq!(current_addrs, new_addrs);
+
+        drop(sender);
+
+        let mut removed_a = false;
+        let mut inserted_c = false;
+        for _ in 0..2 {
+            match receiver.recv().await.expect("expected DNS endpoint change") {
+                Change::Remove(addr) if addr == addr_a => removed_a = true,
+                Change::Insert(addr, _) if addr == addr_c => inserted_c = true,
+                Change::Remove(addr) => panic!("unexpected DNS endpoint removal: {addr}"),
+                Change::Insert(addr, _) => panic!("unexpected DNS endpoint insertion: {addr}"),
+            }
+        }
+
+        assert!(removed_a);
+        assert!(inserted_c);
+        assert!(receiver.recv().await.is_none());
     }
 }

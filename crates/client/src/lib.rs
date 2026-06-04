@@ -165,9 +165,10 @@ impl Connection {
                 None,
             )
         } else if let Some(dns_opts) = &dns_lb_opts {
-            let (channel, sender) = dns::create_balanced_channel(&options).await?;
+            let (channel, sender, current_addrs) = dns::create_balanced_channel(&options).await?;
             let handle = dns::spawn_dns_reresolution(
                 sender,
+                current_addrs,
                 options.target.clone(),
                 options.tls_options.clone(),
                 options.keep_alive.clone(),
