@@ -15,8 +15,8 @@ use std::{
 };
 use temporalio_client::{
     Client, ClientOptions, Connection, ConnectionOptions, GrpcCompression, NamespacedClient,
-    RetryOptions, WorkflowFetchHistoryOptions, WorkflowStartOptions, WorkflowTerminateOptions,
-    grpc::WorkflowService,
+    RetryOptions, WorkflowFetchHistoryOptions, WorkflowSignalOptions, WorkflowStartOptions,
+    WorkflowTerminateOptions, grpc::WorkflowService,
 };
 use temporalio_common::{
     ActivityError, UntypedWorkflow,
@@ -41,8 +41,8 @@ use temporalio_common::{
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, CancellableFuture, WorkflowContext, WorkflowResult, WorkflowTermination,
-    activities::ActivityContext,
+    ActivityOptions, CancellableFuture, SyncWorkflowContext, WorkflowContext, WorkflowResult,
+    WorkflowTermination, activities::ActivityContext,
 };
 use tokio::{
     net::TcpListener,
@@ -413,8 +413,11 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
     let mut starter = CoreWfStarter::new_cloud_or_local(wf_name, "")
         .await
         .unwrap();
+    let client = starter.get_client().await;
 
-    struct WaitForCancelActivities {}
+    struct WaitForCancelActivities {
+        client: Client,
+    }
     #[activities]
     impl WaitForCancelActivities {
         #[activity]
@@ -423,6 +426,22 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
             ctx: ActivityContext,
             _: String,
         ) -> Result<String, ActivityError> {
+            self.client
+                .get_workflow_handle::<CancelWithoutHeartbeatWorkflow>(
+                    ctx.info()
+                        .workflow_execution
+                        .as_ref()
+                        .unwrap()
+                        .workflow_id
+                        .clone(),
+                )
+                .signal(
+                    CancelWithoutHeartbeatWorkflow::act_started,
+                    (),
+                    WorkflowSignalOptions::default(),
+                )
+                .await
+                .unwrap();
             ctx.cancelled().await;
             Ok("done".to_string())
         }
@@ -430,7 +449,7 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
 
     starter
         .sdk_config
-        .register_activities(WaitForCancelActivities {});
+        .register_activities(WaitForCancelActivities { client });
     let mut worker = starter.worker().await;
     if !worker
         .core_worker()
@@ -443,7 +462,9 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
 
     #[workflow]
     #[derive(Default)]
-    struct CancelWithoutHeartbeatWorkflow;
+    struct CancelWithoutHeartbeatWorkflow {
+        act_started: bool,
+    }
 
     #[workflow_methods]
     impl CancelWithoutHeartbeatWorkflow {
@@ -462,14 +483,19 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
                     .do_not_eagerly_execute(true)
                     .build(),
             );
-            // Timer needed to ensure the activity is started on a worker before
-            // cancelling, so the cancel goes through the worker commands path.
-            ctx.timer(Duration::from_secs(5)).await;
+            // ensure the activity is started on a worker before cancelling, so the cancel goes
+            // through the worker commands path.
+            ctx.wait_condition(|s| s.act_started).await;
             act_fut.cancel();
             act_fut
                 .await
                 .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
             Ok(())
+        }
+
+        #[signal]
+        fn act_started(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {
+            self.act_started = true;
         }
     }
 
