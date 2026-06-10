@@ -365,6 +365,10 @@ impl CoreWfStarter {
 
     pub(crate) async fn worker(&mut self) -> TestWorker {
         let worker = self.get_worker().await;
+        worker
+            .validate()
+            .await
+            .expect("Worker validation should succeed");
         let client = self.get_client().await;
         let sdk = Worker::new_from_core_options(
             worker,

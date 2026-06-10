@@ -458,12 +458,17 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
                         ..Default::default()
                     })
                     .cancellation_type(ActivityCancellationType::WaitCancellationCompleted)
+                    // TODO: enable eager dispatch once server supports it for worker commands.
+                    .do_not_eagerly_execute(true)
                     .build(),
             );
-            // Timer needed to avoid cancel-before-sent
-            ctx.timer(Duration::from_millis(10)).await;
+            // Timer needed to ensure the activity is started on a worker before
+            // cancelling, so the cancel goes through the worker commands path.
+            ctx.timer(Duration::from_secs(5)).await;
             act_fut.cancel();
-            let _ = act_fut.await;
+            act_fut
+                .await
+                .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
             Ok(())
         }
     }
@@ -483,7 +488,7 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
         )
         .await
         .unwrap();
-    // Fails with workflow timeout if cancel doesn't work
+    // Fails with workflow timeout if cancel via worker commands doesn't work
     worker.run_until_done().await.unwrap();
     handle.get_result(Default::default()).await.unwrap();
 }
