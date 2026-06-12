@@ -27,7 +27,7 @@ use crate::{
             CommandID, DrivenWorkflow, HistoryUpdate, InternalFlagsRef, LocalResolution,
             OutgoingJob, RunBasics, WFCommand, WFCommandVariant, WFMachinesError,
             WorkflowStartedInfo, fatal,
-            history_update::NextWFT,
+            history_update::{ChunkingVersion, LwftBuffer, NextWFT},
             machines::{
                 HistEventData, activity_state_machine::ActivityMachine,
                 child_workflow_state_machine::ChildWorkflowMachine,
@@ -84,10 +84,16 @@ slotmap::new_key_type! { struct MachineKey; }
 /// comprise the logic of an executing workflow. One instance will exist per currently executing
 /// (or cached) workflow on the worker.
 pub(crate) struct WorkflowMachines {
-    /// The last recorded history we received from the server for this workflow run. This must be
-    /// kept because the lang side polls & completes for every workflow task, but we do not need
-    /// to poll the server that often during replay.
-    last_history_from_server: HistoryUpdate,
+    /// The buffer of yet-to-be-applied history events for this run. Owns the
+    /// per-run chunking version (which is per-workflow, not per-poll, so it
+    /// must outlive any single paginator).
+    ///
+    /// Each fresh `HistoryUpdate` produced by a paginator is installed here
+    /// via [`LwftBuffer::replace_inner`]; the buffer also tracks and overrides
+    /// the chunking version from `observed_internal_flags` to keep the
+    /// chunker from silently falling back to V1 on incremental polls of V2
+    /// workflows.
+    lwft_buffer: LwftBuffer,
     /// Protocol messages that have yet to be processed for the current WFT.
     protocol_msgs: Vec<IncomingProtocolMessage>,
     /// EventId of the last handled WorkflowTaskStarted event
@@ -281,8 +287,18 @@ impl WorkflowMachines {
             // set all flags that should be set but can only be set on the first WFT.
             observed_internal_flags.write_all_cumulative_default_enabled(true);
         };
+        let mut lwft_buffer = LwftBuffer::empty();
+        lwft_buffer.replace_inner(basics.history);
+        // Seed the buffer's chunking version from anything `observed_internal_flags`
+        // has already learned. For freshly-created runs whose flags are filled
+        // from `write_all_cumulative_default_enabled` above, this picks up the
+        // `WftChunkingV2` opt-in. For cache-miss replays the value will be
+        // refined as the first WFTCompleted is applied.
+        if observed_internal_flags.try_use(CoreInternalFlags::WftChunkingV2, false) {
+            lwft_buffer.set_chunking_version(ChunkingVersion::V2);
+        }
         Self {
-            last_history_from_server: basics.history,
+            lwft_buffer,
             protocol_msgs: vec![],
             workflow_id: basics.workflow_id,
             workflow_type: basics.workflow_type,
@@ -347,10 +363,29 @@ impl WorkflowMachines {
     }
 
     pub(crate) fn new_history_from_server(&mut self, update: HistoryUpdate) -> Result<()> {
-        self.last_history_from_server = update;
-        self.replaying = self.last_history_from_server.previous_wft_started_id > 0;
+        self.lwft_buffer.replace_inner(update);
+        self.sync_chunking_version_from_observed_flags();
+        self.replaying = self.lwft_buffer.previous_wft_started_id() > 0;
         self.apply_next_wft_from_history()?;
         Ok(())
+    }
+
+    /// Refresh the buffer's chunking version from `observed_internal_flags`,
+    /// our authoritative source for which `CoreInternalFlags` apply to this
+    /// run. This is what closes the cached-incremental-poll hole: the
+    /// paginator that built the most-recent `HistoryUpdate` likely never saw
+    /// event 1's `WorkflowTaskCompleted`, so its detected version is V1 by
+    /// default — but we (the WFM) have been observing every applied WFT and
+    /// know the truth. Pushing that truth down to the buffer ensures
+    /// subsequent chunker calls run with the correct version.
+    fn sync_chunking_version_from_observed_flags(&mut self) {
+        if self
+            .observed_internal_flags
+            .borrow_mut()
+            .try_use(CoreInternalFlags::WftChunkingV2, false)
+        {
+            self.lwft_buffer.set_chunking_version(ChunkingVersion::V2);
+        }
     }
 
     /// Let this workflow know that something we've been waiting locally on has resolved, like a
@@ -561,7 +596,7 @@ impl WorkflowMachines {
     /// Returns true if machines are ready to apply the next WFT sequence, false if events will need
     /// to be fetched in order to create a complete update with the entire next WFT sequence.
     pub(crate) fn ready_to_apply_next_wft(&self) -> bool {
-        self.last_history_from_server
+        self.lwft_buffer
             .can_take_next_wft_sequence(self.current_started_event_id)
     }
 
@@ -577,9 +612,15 @@ impl WorkflowMachines {
             return Ok(0);
         }
 
+        // Resync the chunking version from the latest observed flags before
+        // running the chunker. The buffer is monotonic so this is a cheap
+        // no-op once V2 is known; the call is what guarantees we don't keep
+        // using a stale V1 default after `apply_wft_complete_data!` populated
+        // the v2 bit into `observed_internal_flags`.
+        self.sync_chunking_version_from_observed_flags();
         let last_handled_wft_started_id = self.current_started_event_id;
         let (events, has_final_event) = match self
-            .last_history_from_server
+            .lwft_buffer
             .take_next_wft_sequence(last_handled_wft_started_id)
         {
             NextWFT::ReplayOver => (vec![], true),
@@ -640,9 +681,7 @@ impl WorkflowMachines {
                 apply_wft_complete_data!(self, wtc);
             }
             if peeked_events.peek().is_none()
-                && let Some(wtc) = self
-                    .last_history_from_server
-                    .peek_next_wft_completed(event.event_id)
+                && let Some(wtc) = self.lwft_buffer.peek_next_wft_completed(event.event_id)
             {
                 apply_wft_complete_data!(self, wtc);
             }
@@ -689,7 +728,7 @@ impl WorkflowMachines {
             // them.
             if self.replaying
                 && has_final_event
-                && eid > self.last_history_from_server.previous_wft_started_id
+                && eid > self.lwft_buffer.previous_wft_started_id()
                 && event.event_type() != EventType::WorkflowTaskCompleted
                 && !event.is_command_event()
             {
@@ -778,7 +817,7 @@ impl WorkflowMachines {
         // that follow a WFT to be _part of_ that wft rather than the next one. That change might
         // make sense to do, and maybe simplifies things slightly, but is a substantial alteration.
         for e in self
-            .last_history_from_server
+            .lwft_buffer
             .peek_next_wft_sequence(last_handled_wft_started_id)
         {
             if let Some((patch_id, _)) = e.get_patch_marker_details() {

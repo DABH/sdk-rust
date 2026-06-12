@@ -53,10 +53,8 @@ pub(crate) struct HistoryUpdate {
     /// heuristic will avoid merging the last WFT in history into a preceding
     /// heartbeat chain, because the update needs its own activation.
     has_pending_speculative_updates: bool,
-    /// True if any WFTCompleted event in this update carries the
-    /// `WftChunkingV2` flag, indicating WFT chunking v2 should be used
-    /// instead of v1 (the legacy algorithm).
-    has_wft_chunking_v2: bool,
+    /// The chunking algorithm version applicable to this workflow.
+    chunking_version: ChunkingVersion,
 }
 
 impl Debug for HistoryUpdate {
@@ -80,6 +78,175 @@ impl Debug for HistoryUpdate {
 impl HistoryUpdate {
     pub(crate) fn get_events(&self) -> &[HistoryEvent] {
         &self.events
+    }
+
+    /// Override the chunking version stored on this update.
+    ///
+    /// Intended for use by `LwftBuffer`, which owns the authoritative per-run
+    /// chunking version (it survives across polls; the paginator that built
+    /// this update only saw a single poll's worth of events and may have
+    /// resolved the version conservatively).
+    ///
+    /// The chunker is invoked on `self.events` at construction time and again
+    /// at each `take_/peek_*` call. This setter only affects the latter group:
+    /// it adjusts which version is used by subsequent chunker calls. The
+    /// construction-time split is not redone. For the cached-incremental
+    /// scenario this is fine because v1 and v2 chunkers agree on single-WFT
+    /// inputs (which is what incremental polls almost always carry).
+    pub(crate) fn set_chunking_version(&mut self, v: ChunkingVersion) {
+        self.chunking_version = v;
+    }
+}
+
+/// Per-workflow-run, long-lived owner of the chunking state.
+///
+/// Today this is a thin shim around [`HistoryUpdate`] that adds one missing
+/// piece: an `Option<ChunkingVersion>` whose lifetime is the whole workflow
+/// run, not a single poll. This matters because the `WftChunkingV2` flag is
+/// only written on the workflow's FIRST `WorkflowTaskCompleted` event, so
+/// per-poll paginators looking at incremental events can't see it. Without a
+/// per-run owner, every cached-incremental poll would silently fall back to
+/// V1 chunking — harmless for trivial single-WFT inputs (v1 and v2 chunkers
+/// agree there) but the kind of "harmlessly wrong" the design needs to
+/// eliminate.
+///
+/// Resolution rules (monotonic):
+/// - The buffer's owner (`WorkflowMachines`) can authoritatively set the
+///   version from `observed_internal_flags` once it has been populated by
+///   any prior `WorkflowTaskCompleted`. This is the cached-workflow path.
+/// - The buffer also scans events of every newly-pushed `HistoryUpdate` and
+///   resolves the version from the v2 flag if seen. This is the fresh-run
+///   and fetch-from-start path.
+/// - Once `Some(_)`, the value is sticky for the lifetime of the run.
+///
+/// Future phases will fold `HistoryUpdate` into this type entirely, move
+/// chunker invocations to be solely through this buffer, and shape the API
+/// around `push_events(envelope, events)` / `next_lwft()`. For now the public
+/// API mirrors the existing `HistoryUpdate` surface so callers don't need to
+/// be reshaped.
+pub(crate) struct LwftBuffer {
+    inner: HistoryUpdate,
+    /// The chunking version for this workflow run. `None` until either:
+    /// - a pushed update contains the `WftChunkingV2` flag → `Some(V2)`, or
+    /// - the owner calls [`Self::set_chunking_version`] with the value read
+    ///   from `WorkflowMachines.observed_internal_flags`.
+    chunking_version: Option<ChunkingVersion>,
+}
+
+impl Debug for LwftBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LwftBuffer")
+            .field("chunking_version", &self.chunking_version)
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+impl LwftBuffer {
+    /// Construct an empty buffer (placeholder for a freshly-created run).
+    pub(crate) fn empty() -> Self {
+        Self {
+            inner: HistoryUpdate::dummy(),
+            chunking_version: None,
+        }
+    }
+
+    /// Replace the buffer's contents with a fresh update from the paginator.
+    ///
+    /// Scans the update's events for the `WftChunkingV2` flag and updates the
+    /// run-level `chunking_version` monotonically. If the buffer already knows
+    /// the version (e.g. from a previous push or from
+    /// [`Self::set_chunking_version`]), the update's own version is overridden
+    /// before it's installed — guaranteeing that chunker calls dispatched
+    /// through this buffer use the run-level answer.
+    pub(crate) fn replace_inner(&mut self, mut update: HistoryUpdate) {
+        // Resolve from the update's events. Monotonic: only ever advances
+        // None → Some.
+        self.chunking_version =
+            resolve_chunking_version_from_events(update.get_events().iter(), self.chunking_version);
+        // Override the incoming update's version with the run-level answer
+        // when we have one. This is what closes the cached-incremental hole.
+        if let Some(v) = self.chunking_version {
+            update.set_chunking_version(v);
+        }
+        self.inner = update;
+    }
+
+    /// Authoritative setter, intended to be called by `WorkflowMachines` after
+    /// it observes a `WorkflowTaskCompleted` (and consequently knows the
+    /// answer from `observed_internal_flags`). Monotonic: a `V2` answer cannot
+    /// be downgraded.
+    pub(crate) fn set_chunking_version(&mut self, v: ChunkingVersion) {
+        match (self.chunking_version, v) {
+            (Some(ChunkingVersion::V2), ChunkingVersion::V1) => {
+                // V2 is a one-way latch; downgrading is meaningless and would
+                // indicate a logic bug somewhere.
+                dbg_panic!(
+                    "LwftBuffer: attempted to downgrade chunking version V2 → V1; \
+                     this should never happen and indicates a bug."
+                );
+            }
+            _ => {
+                self.chunking_version = Some(v);
+                self.inner.set_chunking_version(v);
+            }
+        }
+    }
+
+    /// The currently-known chunking version, if any.
+    #[allow(dead_code)] // reserved for use by future consumers / diagnostics.
+    pub(crate) fn chunking_version(&self) -> Option<ChunkingVersion> {
+        self.chunking_version
+    }
+
+    // --- Pass-throughs to the inner HistoryUpdate. ---
+    //
+    // Some of these aren't used internally yet — external sites currently
+    // reach into `pwft.work.update: HistoryUpdate` directly. They're provided
+    // here so the migration to "buffer is the source of truth" can proceed
+    // incrementally without churning callers.
+
+    pub(crate) fn previous_wft_started_id(&self) -> i64 {
+        self.inner.previous_wft_started_id
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn wft_started_id(&self) -> i64 {
+        self.inner.wft_started_id
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_real(&self) -> bool {
+        self.inner.is_real()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn first_event_id(&self) -> Option<i64> {
+        self.inner.first_event_id()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn get_events(&self) -> &[HistoryEvent] {
+        self.inner.get_events()
+    }
+
+    pub(crate) fn take_next_wft_sequence(&mut self, from_wft_started_id: i64) -> NextWFT {
+        self.inner.take_next_wft_sequence(from_wft_started_id)
+    }
+
+    pub(crate) fn peek_next_wft_sequence(&self, from_wft_started_id: i64) -> &[HistoryEvent] {
+        self.inner.peek_next_wft_sequence(from_wft_started_id)
+    }
+
+    pub(crate) fn can_take_next_wft_sequence(&self, from_wft_started_id: i64) -> bool {
+        self.inner.can_take_next_wft_sequence(from_wft_started_id)
+    }
+
+    pub(crate) fn peek_next_wft_completed(
+        &self,
+        from_id: i64,
+    ) -> Option<&WorkflowTaskCompletedEventAttributes> {
+        self.inner.peek_next_wft_completed(from_id)
     }
 }
 
@@ -123,6 +290,36 @@ pub(crate) enum NextWFT {
     NeedFetch,
 }
 
+/// Which workflow-task chunking algorithm applies to a particular workflow.
+/// See `arch_docs/workflow_task_chunking.md` for the algorithm details.
+///
+/// Chunking is a per-workflow-execution decision: a workflow's first
+/// `WorkflowTaskCompleted` either carries the `WftChunkingV2` SDK flag (→ V2)
+/// or doesn't (→ V1). The choice is then permanent for that workflow.
+///
+/// Using a typed enum (rather than a `bool`) makes the "we don't know yet"
+/// state visible at the type level via `Option<ChunkingVersion>`, so the
+/// chunker can refuse to run with an unresolved version instead of silently
+/// falling back to V1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChunkingVersion {
+    /// Legacy chunking algorithm.
+    V1,
+    /// Newer, more rigorous chunking algorithm. Used for workflows whose
+    /// first `WorkflowTaskCompleted` carries the `WftChunkingV2` SDK flag.
+    V2,
+}
+
+impl ChunkingVersion {
+    /// True iff this is the v2 algorithm.
+    // Not used in production code yet; reserved for the upcoming buffer API
+    // where consumers will want a typed query rather than `==` against the enum.
+    #[allow(dead_code)]
+    pub(crate) fn is_v2(self) -> bool {
+        matches!(self, Self::V2)
+    }
+}
+
 #[derive(derive_more::Debug)]
 #[debug("HistoryPaginator(run_id: {run_id})")]
 pub(crate) struct HistoryPaginator {
@@ -142,9 +339,19 @@ pub(crate) struct HistoryPaginator {
     /// messages. Passed through to `find_end_index_of_next_wft_seq` so the heartbeat
     /// heuristic avoids collapsing the last WFT when an update needs its own activation.
     has_pending_speculative_updates: bool,
-    /// True if the workflow uses WFT chunking v2. Detected from the initial
-    /// events and propagated to all subsequent `from_events` calls.
-    has_wft_chunking_v2: bool,
+    /// The chunking algorithm version applicable to this workflow.
+    ///
+    /// `None` means we have not yet seen enough events to determine the
+    /// version (the `WftChunkingV2` flag is only set on the workflow's first
+    /// `WorkflowTaskCompleted`, so the answer is only knowable once event 1's
+    /// completion is in our fetched events). Once resolved to `Some(_)`, the
+    /// value is sticky for the lifetime of the paginator.
+    ///
+    /// The chunker MUST NOT be called while this is `None` — that would mean
+    /// silently choosing V1, which is the bug this typed state exists to
+    /// prevent. Callers (notably `extract_next_update`) keep fetching pages
+    /// until this resolves before invoking the chunker.
+    chunking_version: Option<ChunkingVersion>,
 }
 
 #[derive(Clone, Debug)]
@@ -196,13 +403,16 @@ impl HistoryPaginator {
             return Err(EMPTY_TASK_ERR.clone());
         }
         let update = if empty_hist {
+            // Empty history: no events to chunk, version is moot. Use V1 as the
+            // arbitrary placeholder — the chunker never runs on an empty event
+            // slice in a way that depends on the version.
             HistoryUpdate::from_events(
                 [],
                 wft.previous_started_event_id,
                 wft.started_event_id,
                 true,
                 has_pending_speculative_updates,
-                paginator.has_wft_chunking_v2,
+                ChunkingVersion::V1,
             )
             .0
         } else {
@@ -239,7 +449,14 @@ impl HistoryPaginator {
             next_page_token: NextPageToken::FetchFromStart,
             final_events: req.original_wft.work.update.events,
             has_pending_speculative_updates: !req.original_wft.work.messages.is_empty(),
-            has_wft_chunking_v2: req.original_wft.paginator.has_wft_chunking_v2,
+            // Deliberately do NOT copy `chunking_version` from the original
+            // paginator. That paginator was built from a partial poll history
+            // that, by definition (cache miss → incremental poll), does not
+            // contain event 1's WFTCompleted, so its computed version was
+            // either correct-by-luck or wrong-and-silent. Reset to `None` and
+            // rely on `get_next_page`'s monotonic scan to discover the truth
+            // from the start of history we're about to fetch.
+            chunking_version: None,
         };
         let first_update = paginator.extract_next_update().await?;
         req.original_wft.work.update = first_update;
@@ -258,7 +475,6 @@ impl HistoryPaginator {
         client: Arc<dyn WorkerClient>,
         has_pending_speculative_updates: bool,
     ) -> Self {
-        let has_wft_chunking_v2 = events_have_wft_chunking_v2(&initial_history.events);
         let next_page_token = next_page_token.into();
         let (event_queue, final_events) =
             if matches!(next_page_token, NextPageToken::FetchFromStart) {
@@ -266,6 +482,15 @@ impl HistoryPaginator {
             } else {
                 (initial_history.events.into(), vec![])
             };
+        // Best-effort scan of the initial events for the V2 flag. May resolve
+        // the version immediately (fresh polls and full-history fetches will
+        // always include event 1's WFTCompleted); for incremental polls the
+        // result will be `None` and `get_next_page` will continue scanning as
+        // events arrive.
+        let chunking_version = resolve_chunking_version_from_events(
+            event_queue.iter().chain(final_events.iter()),
+            None,
+        );
         Self {
             client,
             event_queue,
@@ -277,7 +502,7 @@ impl HistoryPaginator {
             wft_started_event_id,
             id_of_last_event_in_last_extracted_update: None,
             has_pending_speculative_updates,
-            has_wft_chunking_v2,
+            chunking_version,
         }
     }
 
@@ -318,13 +543,16 @@ impl HistoryPaginator {
             if current_events.is_empty() && no_next_page && already_sent_update_with_enough_events {
                 // We must return an empty update which also says is contains the final WFT so we
                 // know we're done with replay.
+                // No events here, so chunking version doesn't matter; fall back
+                // to V1 (any prior real update would have already resolved the
+                // version on the workflow-machines side).
                 return Ok(HistoryUpdate::from_events(
                     [],
                     self.previous_wft_started_id,
                     self.wft_started_event_id,
                     true,
                     self.has_pending_speculative_updates,
-                    self.has_wft_chunking_v2,
+                    self.chunking_version.unwrap_or(ChunkingVersion::V1),
                 )
                 .0);
             }
@@ -346,13 +574,37 @@ impl HistoryPaginator {
             // We only *really* have the last WFT if the events go all the way up to at least the
             // WFT started event id. Otherwise we somehow still have partial history.
             let no_more = matches!(self.next_page_token, NextPageToken::Done) && seen_enough_events;
+            // Belt-and-suspenders: re-scan to pick up anything that entered via
+            // direct constructor args rather than `get_next_page`. The monotonic
+            // resolver no-ops if a version is already known.
+            self.chunking_version =
+                resolve_chunking_version_from_events(current_events.iter(), self.chunking_version);
+            // If the chunking version is still unresolved and we haven't
+            // exhausted pagination, the only correct move is to fetch more —
+            // running the chunker now would mean silently picking V1, which is
+            // exactly the class of bug the typed `Option<ChunkingVersion>`
+            // exists to prevent. Put the events back and loop.
+            if self.chunking_version.is_none()
+                && !matches!(self.next_page_token, NextPageToken::Done)
+            {
+                self.event_queue = current_events;
+                continue;
+            }
+            // At this point we've either resolved the version or fully
+            // paginated without ever seeing a `WorkflowTaskCompleted`. The
+            // latter shouldn't happen for any workflow that has actually run
+            // (every WFT must complete to produce events the worker sees),
+            // but if it does, V1 is the conservative legacy default and the
+            // remaining events have no WFT boundaries for the chunker to find
+            // anyway — so the choice is moot for correctness.
+            let chunking_version = self.chunking_version.unwrap_or(ChunkingVersion::V1);
             let (update, extra) = HistoryUpdate::from_events(
                 current_events,
                 self.previous_wft_started_id,
                 self.wft_started_event_id,
                 no_more,
                 self.has_pending_speculative_updates,
-                self.has_wft_chunking_v2,
+                chunking_version,
             );
 
             // If there are potentially more events and we haven't extracted two WFTs yet, keep
@@ -421,6 +673,7 @@ impl HistoryPaginator {
             .back()
             .map(|e| e.event_id)
             .unwrap_or_default();
+        let queue_len_before = self.event_queue.len();
         self.event_queue.extend(
             history
                 .map(|h| h.events)
@@ -440,6 +693,16 @@ impl HistoryPaginator {
                 );
             }
         };
+        // Monotonically resolve the chunking version from any events that just
+        // entered the queue. Without this, a paginator that starts in the
+        // "I don't know yet" state (e.g. one built by `from_fetchreq`, where
+        // event 1 is never in the constructor-time events) would chunk every
+        // fetched page as V1 — silently, even for V2 workflows.
+        if self.chunking_version.is_none() {
+            let newly_added = self.event_queue.iter().skip(queue_len_before);
+            self.chunking_version =
+                resolve_chunking_version_from_events(newly_added, self.chunking_version);
+        }
         Ok(!matches!(&self.next_page_token, NextPageToken::Done))
     }
 }
@@ -507,7 +770,9 @@ impl HistoryUpdate {
             has_last_wft: false,
             wft_count: 0,
             has_pending_speculative_updates: false,
-            has_wft_chunking_v2: false,
+            // V1 is the conservative default for the sentinel; a dummy has no
+            // events so the chunker is never actually invoked on it.
+            chunking_version: ChunkingVersion::V1,
         }
     }
 
@@ -543,7 +808,7 @@ impl HistoryUpdate {
         wft_started_id: i64,
         has_last_wft: bool,
         has_pending_speculative_updates: bool,
-        has_wft_chunking_v2: bool,
+        chunking_version: ChunkingVersion,
     ) -> (Self, Vec<HistoryEvent>)
     where
         <I as IntoIterator>::IntoIter: Send + 'static,
@@ -556,7 +821,7 @@ impl HistoryUpdate {
             wft_started_id,
             has_last_wft,
             has_pending_speculative_updates,
-            has_wft_chunking_v2,
+            chunking_version,
         )
     }
 
@@ -566,14 +831,14 @@ impl HistoryUpdate {
         wft_started_id: i64,
         has_last_wft: bool,
         has_pending_speculative_updates: bool,
-        has_wft_chunking_v2: bool,
+        chunking_version: ChunkingVersion,
     ) -> (Self, Vec<HistoryEvent>) {
         let mut last_end = find_end_index_of_next_wft_seq(
             all_events.as_slice(),
             previous_wft_started_id,
             has_last_wft,
             has_pending_speculative_updates,
-            has_wft_chunking_v2,
+            chunking_version,
         );
 
         if matches!(
@@ -589,7 +854,7 @@ impl HistoryUpdate {
                         has_last_wft,
                         wft_count: 1,
                         has_pending_speculative_updates,
-                        has_wft_chunking_v2,
+                        chunking_version,
                     },
                     vec![],
                 )
@@ -602,7 +867,7 @@ impl HistoryUpdate {
                         has_last_wft,
                         wft_count: 0,
                         has_pending_speculative_updates,
-                        has_wft_chunking_v2,
+                        chunking_version,
                     },
                     all_events,
                 )
@@ -618,7 +883,7 @@ impl HistoryUpdate {
                 next_end_eid,
                 has_last_wft,
                 has_pending_speculative_updates,
-                has_wft_chunking_v2,
+                chunking_version,
             )
             .add(next_end_ix);
             if matches!(
@@ -644,7 +909,7 @@ impl HistoryUpdate {
                 has_last_wft,
                 wft_count,
                 has_pending_speculative_updates,
-                has_wft_chunking_v2,
+                chunking_version,
             },
             remaining_events,
         )
@@ -660,7 +925,7 @@ impl HistoryUpdate {
         wft_started_id: i64,
         has_last_wft: bool,
         has_pending_speculative_updates: bool,
-        has_wft_chunking_v2: bool,
+        chunking_version: ChunkingVersion,
     ) -> Self
     where
         <I as IntoIterator>::IntoIter: Send + 'static,
@@ -672,7 +937,7 @@ impl HistoryUpdate {
             has_last_wft,
             wft_count: 0,
             has_pending_speculative_updates,
-            has_wft_chunking_v2,
+            chunking_version,
         }
     }
 
@@ -696,7 +961,7 @@ impl HistoryUpdate {
             from_wft_started_id,
             self.has_last_wft,
             self.has_pending_speculative_updates,
-            self.has_wft_chunking_v2,
+            self.chunking_version,
         );
 
         match chunk {
@@ -746,7 +1011,7 @@ impl HistoryUpdate {
             from_wft_started_id,
             self.has_last_wft,
             self.has_pending_speculative_updates,
-            self.has_wft_chunking_v2,
+            self.chunking_version,
         )
         .end_index_in_slice(relevant_events.len());
 
@@ -761,7 +1026,7 @@ impl HistoryUpdate {
             from_wft_started_id,
             self.has_last_wft,
             self.has_pending_speculative_updates,
-            self.has_wft_chunking_v2,
+            self.chunking_version,
         );
         match next_wft_ix {
             NextWFTSeqEndIndex::NeedMore => false,
@@ -798,9 +1063,9 @@ fn starting_index_after_skipping(
 
 /// Returns true if any WFTCompleted event in the given events carries the
 /// `WftChunkingV2` flag.
-fn events_have_wft_chunking_v2(events: &[HistoryEvent]) -> bool {
+fn events_have_wft_chunking_v2<'a, I: IntoIterator<Item = &'a HistoryEvent>>(events: I) -> bool {
     let flag_value = CoreInternalFlags::WftChunkingV2 as u32;
-    events.iter().any(|e| {
+    events.into_iter().any(|e| {
         if let Some(Attributes::WorkflowTaskCompletedEventAttributes(ref attr)) = e.attributes
             && let Some(ref metadata) = attr.sdk_metadata
         {
@@ -811,23 +1076,69 @@ fn events_have_wft_chunking_v2(events: &[HistoryEvent]) -> bool {
     })
 }
 
-/// Dispatches to v1 (legacy) or v2 chunking based on the `has_wft_chunking_v2` flag.
+/// Returns true if any `WorkflowTaskCompleted` event is present in the slice.
+fn events_have_any_wft_completed<'a, I: IntoIterator<Item = &'a HistoryEvent>>(events: I) -> bool {
+    events.into_iter().any(|e| {
+        matches!(
+            &e.attributes,
+            Some(Attributes::WorkflowTaskCompletedEventAttributes(_))
+        )
+    })
+}
+
+/// Monotonically resolve the chunking version from a window of events, given
+/// whatever we already knew. Resolution rules:
+///
+/// - If we already have `Some(_)`, the answer is sticky and we return it
+///   unchanged. The decision is per-workflow and cannot change.
+/// - If any event carries the `WftChunkingV2` flag, the workflow uses V2.
+/// - Else, if any `WorkflowTaskCompleted` is present (meaning we've seen at
+///   least one completion and none of them advertise V2), the workflow uses
+///   V1.
+/// - Otherwise we still don't know.
+///
+/// This function is the single source of truth for "what version is this
+/// workflow's chunking?" within `history_update.rs`. The bug Copilot flagged
+/// in `from_fetchreq` came from a different, snapshot-style detection that
+/// only ran at construction time; the monotonic, repeatedly-invoked variant
+/// here closes that hole.
+fn resolve_chunking_version_from_events<'a, I>(
+    events: I,
+    prior: Option<ChunkingVersion>,
+) -> Option<ChunkingVersion>
+where
+    I: IntoIterator<Item = &'a HistoryEvent> + Clone,
+{
+    if prior.is_some() {
+        return prior;
+    }
+    if events_have_wft_chunking_v2(events.clone()) {
+        return Some(ChunkingVersion::V2);
+    }
+    if events_have_any_wft_completed(events) {
+        return Some(ChunkingVersion::V1);
+    }
+    None
+}
+
+/// Dispatches to v1 (legacy) or v2 chunking based on the [`ChunkingVersion`].
 fn find_end_index_of_next_wft_seq(
     events: &[HistoryEvent],
     from_event_id: i64,
     has_last_wft: bool,
     has_pending_speculative_updates: bool,
-    has_wft_chunking_v2: bool,
+    chunking_version: ChunkingVersion,
 ) -> NextWFTSeqEndIndex {
-    if has_wft_chunking_v2 {
-        find_end_index_of_next_wft_seq_v2(
+    match chunking_version {
+        ChunkingVersion::V2 => find_end_index_of_next_wft_seq_v2(
             events,
             from_event_id,
             has_last_wft,
             has_pending_speculative_updates,
-        )
-    } else {
-        find_end_index_of_next_wft_seq_v1(events, from_event_id, has_last_wft)
+        ),
+        ChunkingVersion::V1 => {
+            find_end_index_of_next_wft_seq_v1(events, from_event_id, has_last_wft)
+        }
     }
 }
 
@@ -1284,25 +1595,36 @@ mod tests {
     };
     use futures_util::TryStreamExt;
     use temporalio_common::protos::temporal::api::{
-        common::v1::WorkflowExecution,
-        enums::v1::WorkflowTaskFailedCause,
-        history::v1::{History, history_event::Attributes},
-        workflowservice::v1::{
-            GetWorkflowExecutionHistoryResponse, update_activity_options_request,
-        },
+        common::v1::WorkflowExecution, enums::v1::WorkflowTaskFailedCause, history::v1::History,
+        workflowservice::v1::GetWorkflowExecutionHistoryResponse,
     };
+
+    /// Test helper: maps the `chunking_v2: bool` test parameter (parameterized
+    /// via `#[values(false, true)]`) to a [`ChunkingVersion`]. Tests use the
+    /// `bool` form to stay terse; production code uses the enum.
+    fn cv(chunking_v2: bool) -> ChunkingVersion {
+        if chunking_v2 {
+            ChunkingVersion::V2
+        } else {
+            ChunkingVersion::V1
+        }
+    }
 
     impl From<HistoryInfo> for HistoryUpdate {
         fn from(v: HistoryInfo) -> Self {
             let events = v.events().to_vec();
-            let has_chunking_v2 = events_have_wft_chunking_v2(&events);
+            let chunking_version = if events_have_wft_chunking_v2(events.iter()) {
+                ChunkingVersion::V2
+            } else {
+                ChunkingVersion::V1
+            };
             Self::new_from_events(
                 events,
                 v.previous_started_event_id(),
                 v.workflow_task_started_event_id(),
                 true,
                 false,
-                has_chunking_v2,
+                chunking_version,
             )
         }
     }
@@ -1682,7 +2004,7 @@ mod tests {
                 .workflow_task_started_event_id(),
             false,
             false,
-            chunking_v2,
+            cv(chunking_v2),
         );
         assert_eq!(remaining[0].event_id, 12);
         assert_eq!(remaining.last().unwrap().event_id, truncate_at as i64);
@@ -2380,7 +2702,7 @@ mod tests {
                 3,
                 true,
                 false,
-                chunking_v2,
+                cv(chunking_v2),
             );
 
             // WFEStarted -> WFTScheduled -> WFTStarted
@@ -2398,7 +2720,7 @@ mod tests {
                 3,
                 true,
                 false,
-                chunking_v2,
+                cv(chunking_v2),
             );
 
             // Can't collapse because of WFExecutionStarted.
@@ -2420,7 +2742,7 @@ mod tests {
                 6,
                 true,
                 false,
-                chunking_v2,
+                cv(chunking_v2),
             );
 
             // Can't collapse because of WFExecutionStarted.
@@ -2443,7 +2765,7 @@ mod tests {
                 6,
                 true,
                 false,
-                chunking_v2,
+                cv(chunking_v2),
             );
 
             // Can't collapse because of WFExecutionStarted.
@@ -2468,7 +2790,7 @@ mod tests {
                 9,
                 true,
                 false,
-                chunking_v2,
+                cv(chunking_v2),
             );
 
             // WFEStarted -> WFTScheduled -> WFTStarted
@@ -2490,7 +2812,7 @@ mod tests {
                 9,
                 true,
                 true,
-                chunking_v2,
+                cv(chunking_v2),
             );
 
             // WFEStarted -> WFTScheduled -> WFTStarted
@@ -2515,7 +2837,7 @@ mod tests {
                 6,
                 true,
                 false,
-                chunking_v2,
+                cv(chunking_v2),
             );
 
             // WFEStarted -> WFTScheduled -> WFTStarted
@@ -2540,7 +2862,7 @@ mod tests {
                 9,
                 true,
                 false,
-                chunking_v2,
+                cv(chunking_v2),
             );
 
             // WFEStarted -> WFTScheduled -> WFTStarted
@@ -2613,7 +2935,7 @@ mod tests {
                 3,
                 false,
                 false,
-                chunking_v2,
+                cv(chunking_v2),
             );
 
             // Buffer:
@@ -2635,7 +2957,7 @@ mod tests {
                 3,
                 false,
                 false,
-                chunking_v2,
+                cv(chunking_v2),
             );
 
             // Buffer:
@@ -2655,7 +2977,7 @@ mod tests {
 
             let events = t.get_full_history_info().unwrap().into_events().to_vec();
             let mut update =
-                HistoryUpdate::new_from_events(events, 0, 3, false, false, chunking_v2);
+                HistoryUpdate::new_from_events(events, 0, 3, false, false, cv(chunking_v2));
 
             // Buffer:
             //   WFEStarted -> WFTScheduled -> WFTStarted -> WFTCompleted -> TimerStarted -> (unknown)
@@ -2675,7 +2997,7 @@ mod tests {
                 3,
                 false,
                 false,
-                chunking_v2,
+                cv(chunking_v2),
             );
 
             // Buffer:
@@ -2697,7 +3019,7 @@ mod tests {
 
             let events = t.get_full_history_info().unwrap().into_events().to_vec();
             let mut update =
-                HistoryUpdate::new_from_events(events, 0, 3, false, false, chunking_v2);
+                HistoryUpdate::new_from_events(events, 0, 3, false, false, cv(chunking_v2));
 
             // Buffer:
             //   WFEStarted -> WFTScheduled -> WFTStarted -> WFTCompleted -> WFTScheduled -> WeSignaled -> (unknown)
@@ -2718,7 +3040,7 @@ mod tests {
                 6,
                 false,
                 false,
-                chunking_v2,
+                cv(chunking_v2),
             );
 
             // Buffer:
@@ -2740,7 +3062,7 @@ mod tests {
 
             let events = t.get_full_history_info().unwrap().into_events().to_vec();
             let mut update =
-                HistoryUpdate::new_from_events(events, 0, 3, false, false, chunking_v2);
+                HistoryUpdate::new_from_events(events, 0, 3, false, false, cv(chunking_v2));
 
             // Buffer:
             //   WFEStarted -> WFTScheduled -> WFTStarted -> WFTCompleted -> WFTScheduled -> WFTStarted -> WFTFailed -> (unknown)
@@ -2760,7 +3082,7 @@ mod tests {
                 6,
                 false,
                 false,
-                chunking_v2,
+                cv(chunking_v2),
             );
 
             // Buffer:
@@ -2781,7 +3103,7 @@ mod tests {
 
             let events = t.get_full_history_info().unwrap().into_events().to_vec();
             let mut update =
-                HistoryUpdate::new_from_events(events, 0, 3, false, false, chunking_v2);
+                HistoryUpdate::new_from_events(events, 0, 3, false, false, cv(chunking_v2));
 
             // Buffer:
             //   WFEStarted -> WFTScheduled -> WFTStarted -> WFTCompleted -> WFTScheduled -> WFTStarted -> WFTCompleted -> TimerStarted -> (unknown)
@@ -2803,7 +3125,7 @@ mod tests {
                 9,
                 false,
                 false,
-                chunking_v2,
+                cv(chunking_v2),
             );
 
             // Buffer:
@@ -2826,7 +3148,7 @@ mod tests {
 
             let events = t.get_full_history_info().unwrap().into_events().to_vec();
             let mut update =
-                HistoryUpdate::new_from_events(events, 0, 0, false, false, chunking_v2);
+                HistoryUpdate::new_from_events(events, 0, 0, false, false, cv(chunking_v2));
 
             // Buffer:
             //   WFEStarted -> WFTScheduled -> WFTStarted -> WFTCompleted -> WFTScheduled -> WFTStarted -> WFTCompleted -> WFTScheduled -> WFTStarted -> WFTTimedOut -> (unknown)
@@ -2849,7 +3171,7 @@ mod tests {
                 9,
                 false,
                 false,
-                chunking_v2,
+                cv(chunking_v2),
             );
 
             // Buffer:
@@ -2872,7 +3194,7 @@ mod tests {
                 9,
                 false,
                 false,
-                chunking_v2,
+                cv(chunking_v2),
             );
 
             // Buffer:
@@ -2897,7 +3219,7 @@ mod tests {
                 9,
                 false,
                 false,
-                chunking_v2,
+                cv(chunking_v2),
             );
 
             // Buffer:
@@ -2922,7 +3244,7 @@ mod tests {
                 9,
                 false,
                 false,
-                chunking_v2,
+                cv(chunking_v2),
             );
 
             // Buffer:
@@ -3019,7 +3341,7 @@ mod tests {
         // Without speculative updates: WFT2+WFT3+WFT4 all collapse via heartbeat coalescing.
         {
             let (mut update, _) =
-                HistoryUpdate::from_events(all_events.clone(), 0, 12, true, false, chunking_v2);
+                HistoryUpdate::from_events(all_events.clone(), 0, 12, true, false, cv(chunking_v2));
 
             // WFT1 alone (follows WFExecutionStarted).
             let seq = next_check_peek(&mut update, 0);
@@ -3044,7 +3366,7 @@ mod tests {
         // the earlier heartbeats (WFT2+WFT3) are still collapsed together.
         {
             let (mut update, _) =
-                HistoryUpdate::from_events(all_events.clone(), 0, 12, true, true, chunking_v2);
+                HistoryUpdate::from_events(all_events.clone(), 0, 12, true, true, cv(chunking_v2));
 
             // WFT1 alone (follows WFExecutionStarted).
             let seq = next_check_peek(&mut update, 0);
