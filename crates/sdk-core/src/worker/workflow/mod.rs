@@ -12,7 +12,7 @@ pub(crate) mod wft_poller;
 mod workflow_stream;
 
 pub(crate) use driven_workflow::DrivenWorkflow;
-pub(crate) use history_update::HistoryUpdate;
+pub(crate) use history_update::WftEnvelope;
 
 use crate::{
     MetricsContext, WorkerConfig,
@@ -79,6 +79,7 @@ use temporalio_common::{
             },
             enums::v1::{VersioningBehavior, WorkflowTaskFailedCause},
             failure::v1::{ApplicationFailureInfo, failure::FailureInfo},
+            history::v1::HistoryEvent,
             protocol::v1::Message as ProtocolMessage,
             query::v1::WorkflowQuery,
             sdk::v1::{UserMetadata, WorkflowTaskCompletedMetadata},
@@ -152,7 +153,6 @@ pub(crate) struct RunBasics<'a> {
     pub(crate) workflow_id: String,
     pub(crate) workflow_type: String,
     pub(crate) run_id: String,
-    pub(crate) history: HistoryUpdate,
     pub(crate) metrics: MetricsContext,
     pub(crate) capabilities: &'a get_system_info_response::Capabilities,
     pub(crate) sdk_name: &'a str,
@@ -574,7 +574,10 @@ impl Workflows {
 
         let maybe_pwft = if let Some(wft) = wft_from_complete {
             match HistoryPaginator::from_poll(wft, self.client.clone()).await {
-                Ok((paginator, wft)) => Some(WFTWithPaginator { wft, paginator }),
+                Ok(out) => Some(WFTWithPaginator {
+                    wft: out.prep,
+                    paginator: out.paginator,
+                }),
                 Err(e) => {
                     self.request_eviction(
                         &run_id,
@@ -883,9 +886,13 @@ struct CacheMissFetchReq {
 /// isn't in memory
 #[derive(Debug)]
 #[must_use]
-struct NextPageReq {
-    paginator: HistoryPaginator,
-    span: Span,
+pub(crate) struct NextPageReq {
+    pub(crate) paginator: HistoryPaginator,
+    /// Envelope from the original polled WFT. The paginator no longer holds
+    /// envelope fields itself, but the fetched events need to be paired with
+    /// the envelope when they're pushed back into the buffer downstream.
+    pub(crate) envelope: WftEnvelope,
+    pub(crate) span: Span,
 }
 
 #[derive(Debug)]
@@ -927,30 +934,47 @@ struct WFTWithPaginator {
     paginator: HistoryPaginator,
 }
 
-/// A WFT which has been validated and had a history update extracted from it.
+/// A WFT which has been validated and shaped for the buffer-side machinery
+/// to consume.
+///
+/// The events from the poll are kept here verbatim (`initial_events`); the
+/// chunker runs later, on the buffer, once these events have been pushed in.
 #[derive(Debug)]
-struct PreparedWFT {
-    task_token: TaskToken,
-    attempt: u32,
-    execution: WorkflowExecution,
-    workflow_type: String,
-    legacy_query: Option<WorkflowQuery>,
-    query_requests: Vec<QueryWorkflow>,
-    update: HistoryUpdate,
-    messages: Vec<IncomingProtocolMessage>,
+pub(crate) struct PreparedWFT {
+    pub(crate) task_token: TaskToken,
+    pub(crate) attempt: u32,
+    pub(crate) execution: WorkflowExecution,
+    pub(crate) workflow_type: String,
+    pub(crate) legacy_query: Option<WorkflowQuery>,
+    pub(crate) query_requests: Vec<QueryWorkflow>,
+    /// Per-poll envelope metadata (`previous_wft_started_id`,
+    /// `wft_started_id`, `has_pending_speculative_updates`).
+    pub(crate) envelope: WftEnvelope,
+    /// Events from this poll's history. Empty for sticky cache-hit polls
+    /// that carry only protocol messages.
+    pub(crate) initial_events: Vec<HistoryEvent>,
+    /// `true` iff there are no more pages of history to fetch for this poll.
+    /// In the cache-miss path (`from_fetchreq`), this is always `true` after
+    /// pre-fetching. For normal polls, follows the poll's next-page token.
+    pub(crate) no_more_pages: bool,
+    pub(crate) messages: Vec<IncomingProtocolMessage>,
 }
 
 impl PreparedWFT {
-    /// Returns true if the contained history update is incremental (IE: expects to hit a cached
-    /// workflow)
+    /// Returns true if this WFT's events are incremental (i.e. the poll
+    /// expected to hit a cached workflow, so events start after event 1).
+    /// A sticky-cache-hit poll with no new history (empty initial_events) is
+    /// also incremental.
     fn is_incremental(&self) -> bool {
-        let start_event_id = self.update.first_event_id();
+        let start_event_id = self.initial_events.first().map(|e| e.event_id);
         let poll_resp_is_incremental = start_event_id.map(|eid| eid > 1).unwrap_or_default();
         poll_resp_is_incremental || start_event_id.is_none()
     }
 
     fn is_query_only(&self) -> bool {
-        let no_new_history = self.update.wft_started_id == 0;
+        // A query-only WFT has no new history events to apply (so
+        // wft_started_id is 0) and carries a legacy query.
+        let no_new_history = self.envelope.wft_started_id == 0;
         no_new_history && self.legacy_query.is_some()
     }
 
@@ -959,7 +983,7 @@ impl PreparedWFT {
     fn print_details(&self) -> String {
         format!(
             "WFT events: [{}], messages: {:?}, legacy_query: {:?}, queries: {:?}",
-            self.update.get_events().iter().format(", "),
+            self.initial_events.iter().format(", "),
             &self.messages,
             &self.legacy_query,
             &self.query_requests

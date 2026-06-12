@@ -5,11 +5,12 @@ use crate::{
         WorkflowSlotKind,
         client::WorkerClient,
         workflow::{
-            CacheMissFetchReq, HistoryUpdate, NextPageReq, PermittedWFT,
+            CacheMissFetchReq, NextPageReq, PermittedWFT, WftEnvelope,
             history_update::HistoryPaginator,
         },
     },
 };
+use temporalio_common::protos::temporal::api::history::v1::HistoryEvent;
 use futures_util::{FutureExt, Stream, StreamExt, stream, stream::PollNext};
 use std::{future, sync::Arc};
 use temporalio_common::protos::{TaskToken, coresdk::WorkflowSlotInfo};
@@ -28,7 +29,9 @@ pub(super) enum WFTExtractorOutput {
     ),
     NextPage {
         paginator: HistoryPaginator,
-        update: HistoryUpdate,
+        envelope: WftEnvelope,
+        events: Vec<HistoryEvent>,
+        no_more_pages: bool,
         span: Span,
         rc: Arc<HistfetchRC>,
     },
@@ -73,13 +76,13 @@ impl WFTExtractor {
                             let run_id = wft.workflow_execution.run_id.clone();
                             let tt = wft.task_token.clone();
                             Ok(match HistoryPaginator::from_poll(wft, client).await {
-                                Ok((pag, prep)) => WFTExtractorOutput::NewWFT(PermittedWFT {
+                                Ok(out) => WFTExtractorOutput::NewWFT(PermittedWFT {
                                     permit: permit.into_used(WorkflowSlotInfo {
-                                        workflow_type: prep.workflow_type.clone(),
-                                        is_sticky: prep.is_incremental(),
+                                        workflow_type: out.prep.workflow_type.clone(),
+                                        is_sticky: out.prep.is_incremental(),
                                     }),
-                                    work: prep,
-                                    paginator: pag,
+                                    work: out.prep,
+                                    paginator: out.paginator,
                                 }),
                                 Err(err) => WFTExtractorOutput::FailedFetch {
                                     run_id,
@@ -121,10 +124,12 @@ impl WFTExtractor {
                             }
                         }
                         HistoryFetchReq::NextPage(mut req, rc) => {
-                            match req.paginator.extract_next_update().await {
-                                Ok(update) => WFTExtractorOutput::NextPage {
+                            match req.paginator.fetch_next_page().await {
+                                Ok(page) => WFTExtractorOutput::NextPage {
                                     paginator: req.paginator,
-                                    update,
+                                    envelope: req.envelope,
+                                    events: page.events,
+                                    no_more_pages: page.no_more_pages,
                                     span: req.span,
                                     rc,
                                 },

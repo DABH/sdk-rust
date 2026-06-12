@@ -2,7 +2,7 @@ use crate::{
     MetricsContext, WorkerConfig,
     telemetry::metrics::workflow_type,
     worker::workflow::{
-        HistoryUpdate, LocalActivityRequestSink, PermittedWFT, RequestEvictMsg, RunBasics,
+        LocalActivityRequestSink, PermittedWFT, RequestEvictMsg, RunBasics,
         managed_run::{ManagedRun, RunUpdateAct},
     },
 };
@@ -73,7 +73,6 @@ impl RunCache {
                 workflow_id: pwft.work.execution.workflow_id.clone(),
                 workflow_type: pwft.work.workflow_type.clone(),
                 run_id: run_id.clone(),
-                history: HistoryUpdate::dummy(),
                 metrics,
                 capabilities: &self.server_capabilities,
                 sdk_name: &self.sdk_name_and_version.0,

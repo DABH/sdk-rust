@@ -10,7 +10,10 @@ use crate::{
 };
 use futures_util::{Stream, StreamExt, stream, stream::PollNext};
 use std::{collections::VecDeque, fmt::Debug, future, sync::Arc};
-use temporalio_common::protos::coresdk::workflow_activation::remove_from_cache::EvictionReason;
+use temporalio_common::protos::{
+    coresdk::workflow_activation::remove_from_cache::EvictionReason,
+    temporal::api::history::v1::HistoryEvent,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, Span};
 
@@ -122,9 +125,19 @@ impl WFStream {
                                 ));
                                 None // completions can return more than one activation
                             }
-                            LocalInputs::FetchedPageCompletion { paginator, update } => {
+                            LocalInputs::FetchedPageCompletion {
+                                paginator,
+                                envelope,
+                                events,
+                                no_more_pages,
+                            } => {
                                 activations.extend(state.process_completion(
-                                    NewOrFetchedComplete::Fetched(update, Box::new(paginator)),
+                                    NewOrFetchedComplete::Fetched {
+                                        envelope,
+                                        events,
+                                        no_more_pages,
+                                        paginator: Box::new(paginator),
+                                    },
                                 ));
                                 None // completions can return more than one activation
                             }
@@ -310,9 +323,12 @@ impl WFStream {
                     )
                 }
             },
-            NewOrFetchedComplete::Fetched(update, paginator) => {
-                rh.fetched_page_completion(update, *paginator)
-            }
+            NewOrFetchedComplete::Fetched {
+                envelope,
+                events,
+                no_more_pages,
+                paginator,
+            } => rh.fetched_page_completion(envelope, events, no_more_pages, *paginator),
         }
         .into_iter()
         .collect();
@@ -629,7 +645,9 @@ pub(super) enum LocalInputs {
     Completion(WFActCompleteMsg),
     FetchedPageCompletion {
         paginator: HistoryPaginator,
-        update: HistoryUpdate,
+        envelope: WftEnvelope,
+        events: Vec<HistoryEvent>,
+        no_more_pages: bool,
     },
     LocalResolution(LocalResolutionMsg),
     PostActivation(Box<PostActivationMsg>),
@@ -660,7 +678,9 @@ enum ExternalPollerInputs {
     FetchedUpdate(PermittedWFT),
     NextPage {
         paginator: HistoryPaginator,
-        update: HistoryUpdate,
+        envelope: WftEnvelope,
+        events: Vec<HistoryEvent>,
+        no_more_pages: bool,
         span: Span,
     },
     FailedFetch {
@@ -687,10 +707,17 @@ impl From<ExternalPollerInputs> for WFStreamInput {
             },
             ExternalPollerInputs::NextPage {
                 paginator,
-                update,
+                envelope,
+                events,
+                no_more_pages,
                 span,
             } => WFStreamInput::Local(Box::new(LocalInput {
-                input: LocalInputs::FetchedPageCompletion { paginator, update },
+                input: LocalInputs::FetchedPageCompletion {
+                    paginator,
+                    envelope,
+                    events,
+                    no_more_pages,
+                },
                 span,
             })),
         }
@@ -705,12 +732,16 @@ impl From<Result<WFTExtractorOutput, tonic::Status>> for ExternalPollerInputs {
             }
             Ok(WFTExtractorOutput::NextPage {
                 paginator,
-                update,
+                envelope,
+                events,
+                no_more_pages,
                 span,
                 rc: _rc,
             }) => ExternalPollerInputs::NextPage {
                 paginator,
-                update,
+                envelope,
+                events,
+                no_more_pages,
                 span,
             },
             Ok(WFTExtractorOutput::FailedFetch {
@@ -730,13 +761,18 @@ impl From<Result<WFTExtractorOutput, tonic::Status>> for ExternalPollerInputs {
 #[derive(Debug)]
 enum NewOrFetchedComplete {
     New(Box<WFActCompleteMsg>),
-    Fetched(HistoryUpdate, Box<HistoryPaginator>),
+    Fetched {
+        envelope: WftEnvelope,
+        events: Vec<HistoryEvent>,
+        no_more_pages: bool,
+        paginator: Box<HistoryPaginator>,
+    },
 }
 impl NewOrFetchedComplete {
     fn run_id(&self) -> &str {
         match self {
             NewOrFetchedComplete::New(c) => c.completion.run_id(),
-            NewOrFetchedComplete::Fetched(_, p) => &p.run_id,
+            NewOrFetchedComplete::Fetched { paginator, .. } => &paginator.run_id,
         }
     }
 }

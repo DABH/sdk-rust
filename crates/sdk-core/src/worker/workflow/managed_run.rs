@@ -9,11 +9,11 @@ use crate::{
         workflow::{
             ActivationAction, ActivationCompleteOutcome, ActivationCompleteResult,
             ActivationOrAuto, BufferedTasks, DrivenWorkflow, EvictionRequestResult,
-            FailedActivationWFTReport, HeartbeatTimeoutMsg, HistoryUpdate,
-            LocalActivityRequestSink, LocalResolution, NextPageReq, OutstandingActivation,
-            OutstandingTask, PermittedWFT, RequestEvictMsg, RunBasics,
-            ServerCommandsWithWorkflowInfo, WFCommand, WFCommandVariant, WFMachinesError,
-            WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus, WorkflowTaskInfo,
+            FailedActivationWFTReport, HeartbeatTimeoutMsg, LocalActivityRequestSink,
+            LocalResolution, NextPageReq, OutstandingActivation, OutstandingTask, PermittedWFT,
+            RequestEvictMsg, RunBasics, ServerCommandsWithWorkflowInfo, WFCommand,
+            WFCommandVariant, WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus,
+            WftEnvelope, WorkflowTaskInfo,
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
         },
@@ -180,7 +180,8 @@ impl ManagedRun {
         let work = pwft.work;
         debug!(
             task_token = %&work.task_token,
-            update = ?work.update,
+            envelope = ?work.envelope,
+            event_count = work.initial_events.len(),
             has_legacy_query = %work.legacy_query.is_some(),
             messages = ?work.messages,
             attempt = %work.attempt,
@@ -223,9 +224,13 @@ impl ManagedRun {
             permit: pwft.permit,
         });
 
+        // Detect "query expired" before pushing the (empty-or-old-history)
+        // events: a legacy-query-only WFT carries no new history
+        // (`wft_started_id == 0`) and its `previous_wft_started_id` will lag
+        // behind the cached run's last applied WFT.
         if was_legacy_query
-            && work.update.wft_started_id == 0
-            && work.update.previous_wft_started_id < self.wfm.machines.get_last_wft_started_id()
+            && work.envelope.wft_started_id == 0
+            && work.envelope.previous_wft_started_id < self.wfm.machines.get_last_wft_started_id()
         {
             return Ok(Some(ActivationOrAuto::AutoFail {
                 run_id: self.run_id().to_string(),
@@ -233,25 +238,15 @@ impl ManagedRun {
             }));
         }
 
-        // The update field is only populated in the event we hit the cache
-        let activation = if work.update.is_real() {
-            if is_incremental {
-                self.metrics.sticky_cache_hit();
-            }
-            self.wfm.new_work_from_server(work.update, work.messages)?
-        } else {
-            let r = self.wfm.get_next_activation()?;
-            if r.jobs.is_empty() {
-                return Err(RunUpdateErr {
-                    source: crate::worker::workflow::fatal!(
-                        "Machines created for {} with no jobs",
-                        self.wfm.machines.run_id
-                    ),
-                    complete_resp_chan: None,
-                });
-            }
-            r
-        };
+        if is_incremental {
+            self.metrics.sticky_cache_hit();
+        }
+        let activation = self.wfm.new_work_from_server(
+            work.envelope,
+            work.initial_events,
+            work.no_more_pages,
+            work.messages,
+        )?;
 
         if activation.jobs.is_empty() {
             if self.wfm.machines.outstanding_local_activity_count() > 0 {
@@ -471,8 +466,13 @@ impl ManagedRun {
                 return if let Some(paginator) = self.paginator.take() {
                     debug!("Need to fetch a history page before next WFT can be applied");
                     self.completion_waiting_on_page_fetch = Some(rac);
+                    // Snapshot the envelope from the buffer's most recent
+                    // push so the paginator-side fetched events can be
+                    // re-paired with it on the way back.
+                    let envelope = self.wfm.machines.current_wft_envelope();
                     Err(Box::new(NextPageReq {
                         paginator,
+                        envelope,
                         span: Span::current(),
                     }))
                 } else {
@@ -523,26 +523,35 @@ impl ManagedRun {
         }
     }
 
-    /// Called after the higher-up machinery has fetched more pages of event history needed to apply
-    /// the next workflow task. The history update and paginator used to perform the fetch are
-    /// passed in, with the update being used to apply the task, and the paginator stored to be
-    /// attached with another fetch request if needed.
+    /// Called after the higher-up machinery has fetched more pages of event
+    /// history needed to apply the next workflow task. Pushes the fetched
+    /// events into the buffer (so the next chunker pass can use them), stores
+    /// the paginator for further fetches if needed, and resumes the
+    /// suspended completion that was waiting on this fetch.
     pub(super) fn fetched_page_completion(
         &mut self,
-        update: HistoryUpdate,
+        envelope: WftEnvelope,
+        events: Vec<temporalio_common::protos::temporal::api::history::v1::HistoryEvent>,
+        no_more_pages: bool,
         paginator: HistoryPaginator,
     ) -> RunUpdateAct {
-        let res = self._fetched_page_completion(update, paginator);
+        let res = self._fetched_page_completion(envelope, events, no_more_pages, paginator);
         self.update_to_acts(res.map(Into::into))
     }
     fn _fetched_page_completion(
         &mut self,
-        update: HistoryUpdate,
+        envelope: WftEnvelope,
+        events: Vec<temporalio_common::protos::temporal::api::history::v1::HistoryEvent>,
+        no_more_pages: bool,
         paginator: HistoryPaginator,
     ) -> Result<Option<FulfillableActivationComplete>, RunUpdateErr> {
         self.paginator = Some(paginator);
+        // Feed fetched events into the buffer before resuming the suspended
+        // completion. The buffer is the single owner of the run's events; the
+        // completion logic below will then ask the buffer for the next LWFT.
+        self.wfm.feed_history_from_new_page(envelope, events, no_more_pages)?;
         if let Some(d) = self.completion_waiting_on_page_fetch.take() {
-            self._process_completion(d, Some(update))
+            self._process_completion(d)
         } else {
             dbg_panic!(
                 "Shouldn't be possible to be applying a next-page-fetch update when \
@@ -690,14 +699,13 @@ impl ManagedRun {
     }
 
     fn process_completion(&mut self, completion: RunActivationCompletion) -> RunUpdateAct {
-        let res = self._process_completion(completion, None);
+        let res = self._process_completion(completion);
         self.update_to_acts(res.map(Into::into))
     }
 
     fn _process_completion(
         &mut self,
         completion: RunActivationCompletion,
-        update_from_new_page: Option<HistoryUpdate>,
     ) -> Result<Option<FulfillableActivationComplete>, RunUpdateErr> {
         let data = CompletionDataForWFT {
             task_token: completion.task_token,
@@ -722,11 +730,11 @@ impl ManagedRun {
 
         let outcome = (|| {
             // Send commands from lang into the machines then check if the workflow run needs
-            // another activation and mark it if so
+            // another activation and mark it if so. Note: any fetched-page
+            // events are pushed into the buffer in `_fetched_page_completion`
+            // *before* this routine is invoked, so by the time we get here
+            // the buffer already has any newly-available events.
             self.wfm.push_commands_and_iterate(completion.commands)?;
-            if let Some(update) = update_from_new_page {
-                self.wfm.feed_history_from_new_page(update)?;
-            }
             // Don't bother applying the next task if we're evicting at the end of this activation
             // or are otherwise broken.
             if !completion.activation_was_eviction && !self.am_broken {
@@ -1374,17 +1382,26 @@ impl WorkflowManager {
     /// will return a workflow activation if one is needed.
     fn new_work_from_server(
         &mut self,
-        update: HistoryUpdate,
+        envelope: WftEnvelope,
+        events: Vec<temporalio_common::protos::temporal::api::history::v1::HistoryEvent>,
+        no_more_pages: bool,
         messages: Vec<IncomingProtocolMessage>,
     ) -> Result<WorkflowActivation> {
-        self.machines.new_work_from_server(update, messages)?;
+        self.machines
+            .new_work_from_server(envelope, events, no_more_pages, messages)?;
         self.get_next_activation()
     }
 
-    /// Update the machines with some events from fetching another page of history. Does *not*
-    /// attempt to pull the next activation, unlike [Self::new_work_from_server].
-    fn feed_history_from_new_page(&mut self, update: HistoryUpdate) -> Result<()> {
-        self.machines.new_history_from_server(update)
+    /// Push fetched-page events into the buffer. Does *not* attempt to pull the
+    /// next activation, unlike [Self::new_work_from_server].
+    fn feed_history_from_new_page(
+        &mut self,
+        envelope: WftEnvelope,
+        events: Vec<temporalio_common::protos::temporal::api::history::v1::HistoryEvent>,
+        no_more_pages: bool,
+    ) -> Result<()> {
+        self.machines
+            .feed_history_from_new_page(envelope, events, no_more_pages)
     }
 
     /// Let this workflow know that something we've been waiting locally on has resolved, like a

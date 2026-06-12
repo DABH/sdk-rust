@@ -7,7 +7,7 @@ use crate::{
         workflow::{CacheMissFetchReq, PermittedWFT, PreparedWFT},
     },
 };
-use futures_util::{FutureExt, Stream, TryFutureExt, future::BoxFuture};
+use futures_util::{FutureExt, Stream, future::BoxFuture};
 use itertools::Itertools;
 use std::{
     collections::VecDeque,
@@ -22,165 +22,149 @@ use std::{
 use temporalio_common::protos::temporal::api::{
     enums::v1::EventType,
     history::v1::{
-        History, HistoryEvent, WorkflowTaskCompletedEventAttributes, history_event::Attributes,
+        HistoryEvent, WorkflowTaskCompletedEventAttributes, history_event::Attributes,
     },
 };
 use tracing::Instrument;
 
-static EMPTY_FETCH_ERR: LazyLock<tonic::Status> =
-    LazyLock::new(|| tonic::Status::unknown("Fetched empty history page"));
 static EMPTY_TASK_ERR: LazyLock<tonic::Status> = LazyLock::new(|| {
     tonic::Status::unknown("Received an empty workflow task with no queries or history")
 });
 
-/// Represents one or more complete WFT sequences. History events are expected to be consumed from
-/// it and applied to the state machines via [HistoryUpdate::take_next_wft_sequence]
-pub(crate) struct HistoryUpdate {
-    events: Vec<HistoryEvent>,
-    /// The event ID of the last started WFT, as according to the WFT which this update was
-    /// extracted from. Hence, while processing multiple logical WFTs during replay which were part
-    /// of one large history fetched from server, multiple updates may have the same value here.
+/// Per-poll envelope metadata: the parts of a polled WFT that aren't its events.
+///
+/// These fields are properties of the poll, not of any individual event. The
+/// [`LwftBuffer`] remembers the most recently pushed envelope so the chunker
+/// can access `has_pending_speculative_updates` for the current poll, and so
+/// `WorkflowMachines` can reach the polled WFT's `previous_wft_started_id` /
+/// `wft_started_id` without crossing back through the paginator.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct WftEnvelope {
+    /// The event ID of the last started WFT, as according to the polled WFT.
     pub(crate) previous_wft_started_id: i64,
-    /// The `started_event_id` field from the WFT which this update is tied to. Multiple updates
-    /// may have the same value if they're associated with the same WFT.
+    /// The `started_event_id` field from the polled WFT. Multiple
+    /// [`LwftBuffer::push_events`] calls for the same poll (paginated
+    /// fetches) all carry the same value.
     pub(crate) wft_started_id: i64,
-    /// True if this update contains the final WFT in history, and no more attempts to extract
-    /// additional updates should be made.
-    has_last_wft: bool,
-    wft_count: usize,
-    /// True if the speculative WFT (i.e. the current, non-replayed task from the
-    /// server) carries pending update messages. When set, the heartbeat-collapsing
-    /// heuristic will avoid merging the last WFT in history into a preceding
-    /// heartbeat chain, because the update needs its own activation.
-    has_pending_speculative_updates: bool,
-    /// The chunking algorithm version applicable to this workflow.
-    chunking_version: ChunkingVersion,
+    /// True if the polled WFT carries pending update messages. Read by the
+    /// chunker; the heartbeat-collapsing heuristic uses it to refuse to merge
+    /// the last WFT in history into a preceding heartbeat chain.
+    pub(crate) has_pending_speculative_updates: bool,
 }
 
-impl Debug for HistoryUpdate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.is_real() {
-            write!(
-                f,
-                "HistoryUpdate(previous_started_event_id: {}, started_id: {}, \
-                 length: {}, first_event_id: {:?})",
-                self.previous_wft_started_id,
-                self.wft_started_id,
-                self.events.len(),
-                self.events.first().map(|e| e.event_id)
-            )
-        } else {
-            write!(f, "DummyHistoryUpdate")
-        }
-    }
+/// Output of fetching one page from a [`HistoryPaginator`].
+#[derive(Debug)]
+pub(crate) struct FetchPageOutput {
+    /// Newly-fetched events (possibly augmented with any held-aside
+    /// `pending_post_replay_events` on the final page).
+    pub(crate) events: Vec<HistoryEvent>,
+    /// True iff the paginator has nothing more to fetch — next-page token is
+    /// exhausted AND any held-aside events have been flushed into `events`.
+    pub(crate) no_more_pages: bool,
 }
 
-impl HistoryUpdate {
-    pub(crate) fn get_events(&self) -> &[HistoryEvent] {
-        &self.events
-    }
-
-    /// Override the chunking version stored on this update.
-    ///
-    /// Intended for use by `LwftBuffer`, which owns the authoritative per-run
-    /// chunking version (it survives across polls; the paginator that built
-    /// this update only saw a single poll's worth of events and may have
-    /// resolved the version conservatively).
-    ///
-    /// The chunker is invoked on `self.events` at construction time and again
-    /// at each `take_/peek_*` call. This setter only affects the latter group:
-    /// it adjusts which version is used by subsequent chunker calls. The
-    /// construction-time split is not redone. For the cached-incremental
-    /// scenario this is fine because v1 and v2 chunkers agree on single-WFT
-    /// inputs (which is what incremental polls almost always carry).
-    pub(crate) fn set_chunking_version(&mut self, v: ChunkingVersion) {
-        self.chunking_version = v;
-    }
+/// Output of [`HistoryPaginator::from_poll`]: the paginator paired with the
+/// [`PreparedWFT`] extracted from the poll response.
+#[derive(Debug)]
+pub(crate) struct PolledWftOutput {
+    pub(crate) paginator: HistoryPaginator,
+    pub(crate) prep: PreparedWFT,
 }
 
-/// Per-workflow-run, long-lived owner of the chunking state.
+/// Per-workflow-run owner of history events.
 ///
-/// Today this is a thin shim around [`HistoryUpdate`] that adds one missing
-/// piece: an `Option<ChunkingVersion>` whose lifetime is the whole workflow
-/// run, not a single poll. This matters because the `WftChunkingV2` flag is
-/// only written on the workflow's FIRST `WorkflowTaskCompleted` event, so
-/// per-poll paginators looking at incremental events can't see it. Without a
-/// per-run owner, every cached-incremental poll would silently fall back to
-/// V1 chunking — harmless for trivial single-WFT inputs (v1 and v2 chunkers
-/// agree there) but the kind of "harmlessly wrong" the design needs to
-/// eliminate.
+/// Events flow in via [`Self::push_events`]; logical workflow tasks (LWFTs)
+/// flow out via [`Self::take_next_wft_sequence`]. The buffer outlives any
+/// single poll or paginator, which is the property that lets it hold the
+/// run's `chunking_version` (only resolvable from event 1's
+/// `WorkflowTaskCompleted`) across polls without resorting to per-poll
+/// re-detection.
 ///
-/// Resolution rules (monotonic):
-/// - The buffer's owner (`WorkflowMachines`) can authoritatively set the
-///   version from `observed_internal_flags` once it has been populated by
-///   any prior `WorkflowTaskCompleted`. This is the cached-workflow path.
-/// - The buffer also scans events of every newly-pushed `HistoryUpdate` and
-///   resolves the version from the v2 flag if seen. This is the fresh-run
-///   and fetch-from-start path.
-/// - Once `Some(_)`, the value is sticky for the lifetime of the run.
+/// Chunker invocation lives here, not in the paginator: the paginator's job
+/// is to fetch and return raw events; the buffer's job is to chunk those
+/// events into LWFTs on demand.
 ///
-/// Future phases will fold `HistoryUpdate` into this type entirely, move
-/// chunker invocations to be solely through this buffer, and shape the API
-/// around `push_events(envelope, events)` / `next_lwft()`. For now the public
-/// API mirrors the existing `HistoryUpdate` surface so callers don't need to
-/// be reshaped.
+/// See `arch_docs/workflow_task_chunking.md` for the LWFT concept.
+#[derive(Debug)]
 pub(crate) struct LwftBuffer {
-    inner: HistoryUpdate,
+    /// All events not yet consumed as part of a yielded LWFT, in history
+    /// order. Each [`Self::push_events`] call appends; each
+    /// [`Self::take_next_wft_sequence`] call drains from the front.
+    events: Vec<HistoryEvent>,
+    /// Per-poll envelope, updated on each [`Self::push_events`]. Stays at the
+    /// `Default` (all zeros) until the first push.
+    envelope: WftEnvelope,
+    /// Sticky flag: latches to `true` on the first push that carries
+    /// `no_more_pages = true`. Once set, never unset for the run.
+    has_last_wft: bool,
     /// The chunking version for this workflow run. `None` until either:
-    /// - a pushed update contains the `WftChunkingV2` flag → `Some(V2)`, or
-    /// - the owner calls [`Self::set_chunking_version`] with the value read
-    ///   from `WorkflowMachines.observed_internal_flags`.
+    /// - a pushed event batch contains the `WftChunkingV2` flag → `Some(V2)`,
+    /// - any `WorkflowTaskCompleted` is seen with no flag → `Some(V1)`, or
+    /// - the owner explicitly calls [`Self::set_chunking_version`].
+    ///
+    /// Sticky: once `Some(_)`, never returns to `None`. V2 cannot be
+    /// downgraded to V1.
     chunking_version: Option<ChunkingVersion>,
-}
-
-impl Debug for LwftBuffer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LwftBuffer")
-            .field("chunking_version", &self.chunking_version)
-            .field("inner", &self.inner)
-            .finish()
-    }
 }
 
 impl LwftBuffer {
     /// Construct an empty buffer (placeholder for a freshly-created run).
     pub(crate) fn empty() -> Self {
         Self {
-            inner: HistoryUpdate::dummy(),
+            events: vec![],
+            envelope: WftEnvelope::default(),
+            has_last_wft: false,
             chunking_version: None,
         }
     }
 
-    /// Replace the buffer's contents with a fresh update from the paginator.
+    /// Append a batch of history events to the buffer, updating the envelope
+    /// and the "no more pages" flag.
     ///
-    /// Scans the update's events for the `WftChunkingV2` flag and updates the
-    /// run-level `chunking_version` monotonically. If the buffer already knows
-    /// the version (e.g. from a previous push or from
-    /// [`Self::set_chunking_version`]), the update's own version is overridden
-    /// before it's installed — guaranteeing that chunker calls dispatched
-    /// through this buffer use the run-level answer.
-    pub(crate) fn replace_inner(&mut self, mut update: HistoryUpdate) {
-        // Resolve from the update's events. Monotonic: only ever advances
-        // None → Some.
-        self.chunking_version =
-            resolve_chunking_version_from_events(update.get_events().iter(), self.chunking_version);
-        // Override the incoming update's version with the run-level answer
-        // when we have one. This is what closes the cached-incremental hole.
-        if let Some(v) = self.chunking_version {
-            update.set_chunking_version(v);
+    /// Events must arrive in history order, both within a batch and across
+    /// successive batches. Events whose `event_id` is `<=` the last event
+    /// already in the buffer are silently dropped (handles the overlap
+    /// between the cache-miss `pending_post_replay_events` and freshly
+    /// fetched pages).
+    ///
+    /// `no_more_pages = true` latches `has_last_wft` for the run. Calling
+    /// with `no_more_pages = false` after `has_last_wft` is already on
+    /// indicates a logic bug in the paginator/buffer flow.
+    pub(crate) fn push_events(
+        &mut self,
+        envelope: WftEnvelope,
+        events: Vec<HistoryEvent>,
+        no_more_pages: bool,
+    ) {
+        self.envelope = envelope;
+        let last_event_id = self.events.last().map(|e| e.event_id).unwrap_or(0);
+        self.events
+            .extend(events.into_iter().filter(|e| e.event_id > last_event_id));
+        if no_more_pages {
+            self.has_last_wft = true;
+        } else if self.has_last_wft {
+            dbg_panic!(
+                "LwftBuffer: push_events received no_more_pages=false after has_last_wft was \
+                 already latched on. This indicates a logic bug in the paginator/buffer flow."
+            );
         }
-        self.inner = update;
+        // Monotonically resolve the chunking version from accumulated events.
+        // The chunking version is sticky once `Some(_)`, so this is a cheap
+        // no-op after the first resolution. Belt-and-suspenders re-scan
+        // covers events that arrived via paths other than the paginator (e.g.
+        // a poll's own initial events, the partial-WFT events held aside
+        // during a cache-miss).
+        self.chunking_version =
+            resolve_chunking_version_from_events(self.events.iter(), self.chunking_version);
     }
 
     /// Authoritative setter, intended to be called by `WorkflowMachines` after
     /// it observes a `WorkflowTaskCompleted` (and consequently knows the
     /// answer from `observed_internal_flags`). Monotonic: a `V2` answer cannot
-    /// be downgraded.
+    /// be downgraded to `V1`.
     pub(crate) fn set_chunking_version(&mut self, v: ChunkingVersion) {
         match (self.chunking_version, v) {
             (Some(ChunkingVersion::V2), ChunkingVersion::V1) => {
-                // V2 is a one-way latch; downgrading is meaningless and would
-                // indicate a logic bug somewhere.
                 dbg_panic!(
                     "LwftBuffer: attempted to downgrade chunking version V2 → V1; \
                      this should never happen and indicates a bug."
@@ -188,65 +172,175 @@ impl LwftBuffer {
             }
             _ => {
                 self.chunking_version = Some(v);
-                self.inner.set_chunking_version(v);
             }
         }
     }
 
     /// The currently-known chunking version, if any.
-    #[allow(dead_code)] // reserved for use by future consumers / diagnostics.
+    #[allow(dead_code)] // reserved for diagnostics
     pub(crate) fn chunking_version(&self) -> Option<ChunkingVersion> {
         self.chunking_version
     }
 
-    // --- Pass-throughs to the inner HistoryUpdate. ---
-    //
-    // Some of these aren't used internally yet — external sites currently
-    // reach into `pwft.work.update: HistoryUpdate` directly. They're provided
-    // here so the migration to "buffer is the source of truth" can proceed
-    // incrementally without churning callers.
-
     pub(crate) fn previous_wft_started_id(&self) -> i64 {
-        self.inner.previous_wft_started_id
+        self.envelope.previous_wft_started_id
     }
 
     #[allow(dead_code)]
     pub(crate) fn wft_started_id(&self) -> i64 {
-        self.inner.wft_started_id
+        self.envelope.wft_started_id
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn is_real(&self) -> bool {
-        self.inner.is_real()
+    /// A copy of the most recently pushed envelope.
+    pub(crate) fn envelope(&self) -> WftEnvelope {
+        self.envelope
     }
 
     #[allow(dead_code)]
     pub(crate) fn first_event_id(&self) -> Option<i64> {
-        self.inner.first_event_id()
+        self.events.first().map(|e| e.event_id)
     }
 
+    /// All events currently buffered, in order. Provided for debug printing
+    /// and test introspection.
     #[allow(dead_code)]
     pub(crate) fn get_events(&self) -> &[HistoryEvent] {
-        self.inner.get_events()
+        &self.events
     }
 
+    /// Drain the next LWFT from the buffer (consuming its events).
+    ///
+    /// Returns:
+    /// - `NextWFT::WFT(lwft)` when a complete LWFT could be identified.
+    /// - `NextWFT::NeedFetch` when chunking can't conclude yet (more events
+    ///   are required) — caller should fetch more pages and `push_events`.
+    /// - `NextWFT::ReplayOver` when no more LWFTs exist and the buffer has
+    ///   received all pages (`has_last_wft` is set).
     pub(crate) fn take_next_wft_sequence(&mut self, from_wft_started_id: i64) -> NextWFT {
-        self.inner.take_next_wft_sequence(from_wft_started_id)
+        // Discard already-consumed events before the requested start id.
+        if let Some(ix_first_relevant) =
+            starting_index_after_skipping(&self.events, from_wft_started_id)
+        {
+            self.events.drain(0..ix_first_relevant);
+        }
+
+        // If the chunking version isn't known and we still have pages to
+        // fetch, we can't safely run the chunker (silent V1 fallback would
+        // be the bug). Force a fetch.
+        let chunking_version = match self.chunking_version {
+            Some(v) => v,
+            None if !self.has_last_wft => return NextWFT::NeedFetch,
+            None => {
+                // Fully paginated but never resolved (no WFTCompleted in
+                // history). V1 is the conservative legacy default; the
+                // remaining events have no chunking decisions to make
+                // anyway, so the choice is moot for correctness.
+                ChunkingVersion::V1
+            }
+        };
+
+        let chunk = find_end_index_of_next_wft_seq(
+            &self.events,
+            from_wft_started_id,
+            self.has_last_wft,
+            self.envelope.has_pending_speculative_updates,
+            chunking_version,
+        );
+
+        match chunk {
+            NextWFTSeqEndIndex::NeedMore => NextWFT::NeedFetch,
+            NextWFTSeqEndIndex::Tail => {
+                if !self.has_last_wft {
+                    NextWFT::NeedFetch
+                } else if self.events.is_empty() {
+                    NextWFT::ReplayOver
+                } else {
+                    // Trailing matter (e.g. terminal events, WFTCompleted +
+                    // commands after the last WFTStarted). Include them all
+                    // so the caller can process them (e.g. set
+                    // `have_seen_terminal_event`).
+                    self.build_next_wft(self.events.len() - 1)
+                }
+            }
+            NextWFTSeqEndIndex::Complete(next_wft_ix) => self.build_next_wft(next_wft_ix),
+        }
     }
 
+    fn build_next_wft(&mut self, drain_this_much: usize) -> NextWFT {
+        let events: Vec<HistoryEvent> = self.events.drain(0..=drain_this_much).collect();
+        let is_terminal = self.events.is_empty() && self.has_last_wft;
+        NextWFT::WFT(LogicalWorkflowTask {
+            events,
+            is_terminal,
+        })
+    }
+
+    /// Peek at the next LWFT's events without consuming them. Returns an
+    /// empty slice if no events are available; may return a partial sequence
+    /// if we're at the end of available history.
     pub(crate) fn peek_next_wft_sequence(&self, from_wft_started_id: i64) -> &[HistoryEvent] {
-        self.inner.peek_next_wft_sequence(from_wft_started_id)
+        let ix_first_relevant =
+            starting_index_after_skipping(&self.events, from_wft_started_id).unwrap_or_default();
+
+        let relevant_events = &self.events[ix_first_relevant..];
+        if relevant_events.is_empty() {
+            return relevant_events;
+        }
+
+        // Peek runs with a best-effort version. If unresolved, V1 is the
+        // conservative default; peek is non-authoritative so a mismatch with
+        // the eventual `take` is acceptable.
+        let chunking_version = self.chunking_version.unwrap_or(ChunkingVersion::V1);
+        let ix_end = find_end_index_of_next_wft_seq(
+            relevant_events,
+            from_wft_started_id,
+            self.has_last_wft,
+            self.envelope.has_pending_speculative_updates,
+            chunking_version,
+        )
+        .end_index_in_slice(relevant_events.len());
+
+        &relevant_events[0..=ix_end]
     }
 
+    /// True iff the buffer can yield the next LWFT without needing more
+    /// events to be pushed.
     pub(crate) fn can_take_next_wft_sequence(&self, from_wft_started_id: i64) -> bool {
-        self.inner.can_take_next_wft_sequence(from_wft_started_id)
+        // If version isn't resolved and we still have pages to fetch, the
+        // chunker can't run safely — return "can't" to force a fetch.
+        let chunking_version = match self.chunking_version {
+            Some(v) => v,
+            None if !self.has_last_wft => return false,
+            None => ChunkingVersion::V1,
+        };
+
+        let next_wft_ix = find_end_index_of_next_wft_seq(
+            &self.events,
+            from_wft_started_id,
+            self.has_last_wft,
+            self.envelope.has_pending_speculative_updates,
+            chunking_version,
+        );
+        match next_wft_ix {
+            NextWFTSeqEndIndex::NeedMore => false,
+            NextWFTSeqEndIndex::Tail => self.has_last_wft,
+            NextWFTSeqEndIndex::Complete(_) => true,
+        }
     }
 
+    /// Returns the next WFT completed event attributes, if any, starting at
+    /// (inclusive) the given event id.
     pub(crate) fn peek_next_wft_completed(
         &self,
         from_id: i64,
     ) -> Option<&WorkflowTaskCompletedEventAttributes> {
-        self.inner.peek_next_wft_completed(from_id)
+        self.events
+            .iter()
+            .skip_while(|e| e.event_id < from_id)
+            .find_map(|e| match &e.attributes {
+                Some(Attributes::WorkflowTaskCompletedEventAttributes(a)) => Some(a),
+                _ => None,
+            })
     }
 }
 
@@ -320,38 +414,20 @@ impl ChunkingVersion {
     }
 }
 
+/// Per-poll fetch component. Fetches pages from the server on demand and
+/// emits raw events to the [`LwftBuffer`]. The chunker is no longer invoked
+/// here — that logic is owned by the buffer.
 #[derive(derive_more::Debug)]
 #[debug("HistoryPaginator(run_id: {run_id})")]
 pub(crate) struct HistoryPaginator {
     pub(crate) wf_id: String,
     pub(crate) run_id: String,
-    pub(crate) previous_wft_started_id: i64,
-    pub(crate) wft_started_event_id: i64,
-    id_of_last_event_in_last_extracted_update: Option<i64>,
-
     client: Arc<dyn WorkerClient>,
-    event_queue: VecDeque<HistoryEvent>,
     next_page_token: NextPageToken,
-    /// These are events that should be returned once pagination has finished. This only happens
-    /// during cache misses, where we got a partial task but need to fetch history from the start.
-    final_events: Vec<HistoryEvent>,
-    /// True if the speculative WFT associated with this paginator carries pending update
-    /// messages. Passed through to `find_end_index_of_next_wft_seq` so the heartbeat
-    /// heuristic avoids collapsing the last WFT when an update needs its own activation.
-    has_pending_speculative_updates: bool,
-    /// The chunking algorithm version applicable to this workflow.
-    ///
-    /// `None` means we have not yet seen enough events to determine the
-    /// version (the `WftChunkingV2` flag is only set on the workflow's first
-    /// `WorkflowTaskCompleted`, so the answer is only knowable once event 1's
-    /// completion is in our fetched events). Once resolved to `Some(_)`, the
-    /// value is sticky for the lifetime of the paginator.
-    ///
-    /// The chunker MUST NOT be called while this is `None` — that would mean
-    /// silently choosing V1, which is the bug this typed state exists to
-    /// prevent. Callers (notably `extract_next_update`) keep fetching pages
-    /// until this resolves before invoking the chunker.
-    chunking_version: Option<ChunkingVersion>,
+    /// Events held aside until pagination-from-start completes (cache-miss
+    /// case only). Drained into the output of the first `fetch_next_page`
+    /// call that transitions `next_page_token` to `Done`.
+    pending_post_replay_events: Vec<HistoryEvent>,
 }
 
 #[derive(Clone, Debug)]
@@ -376,271 +452,102 @@ impl From<Vec<u8>> for NextPageToken {
 }
 
 impl HistoryPaginator {
-    /// Use a new poll response to create a new [WFTPaginator], returning it and the
-    /// [PreparedWFT] extracted from it that can be fed into workflow state.
+    /// Build a paginator from a poll response. The poll's events flow into
+    /// `prep.initial_events`; subsequent pages (if any) are fetched on demand
+    /// via [`Self::fetch_next_page`] when the buffer signals `NeedFetch`.
     pub(super) async fn from_poll(
         wft: ValidPollWFTQResponse,
         client: Arc<dyn WorkerClient>,
-    ) -> Result<(Self, PreparedWFT), tonic::Status> {
+    ) -> Result<PolledWftOutput, tonic::Status> {
         let empty_hist = wft.history.events.is_empty();
-        let npt = if empty_hist {
-            NextPageToken::FetchFromStart
-        } else {
-            wft.next_page_token.into()
-        };
-        let has_pending_speculative_updates = !wft.messages.is_empty();
-        let mut paginator = HistoryPaginator::new(
-            wft.history,
-            wft.previous_started_event_id,
-            wft.started_event_id,
-            wft.workflow_execution.workflow_id.clone(),
-            wft.workflow_execution.run_id.clone(),
-            npt,
-            client,
-            has_pending_speculative_updates,
-        );
         if empty_hist && wft.legacy_query.is_none() && wft.query_requests.is_empty() {
             return Err(EMPTY_TASK_ERR.clone());
         }
-        let update = if empty_hist {
-            // Empty history: no events to chunk, version is moot. Use V1 as the
-            // arbitrary placeholder — the chunker never runs on an empty event
-            // slice in a way that depends on the version.
-            HistoryUpdate::from_events(
-                [],
-                wft.previous_started_event_id,
-                wft.started_event_id,
-                true,
-                has_pending_speculative_updates,
-                ChunkingVersion::V1,
-            )
-            .0
+        // Empty history → no events, no pages to fetch (sticky cache-hit or
+        // query-only WFT). Non-empty → use the poll's next-page token.
+        let next_page_token: NextPageToken = if empty_hist {
+            NextPageToken::Done
         } else {
-            paginator.extract_next_update().await?
+            wft.next_page_token.into()
         };
-        let prepared = PreparedWFT {
+        let no_more_pages = matches!(next_page_token, NextPageToken::Done);
+        let has_pending_speculative_updates = !wft.messages.is_empty();
+        let paginator = HistoryPaginator {
+            wf_id: wft.workflow_execution.workflow_id.clone(),
+            run_id: wft.workflow_execution.run_id.clone(),
+            client,
+            next_page_token,
+            pending_post_replay_events: vec![],
+        };
+        let envelope = WftEnvelope {
+            previous_wft_started_id: wft.previous_started_event_id,
+            wft_started_id: wft.started_event_id,
+            has_pending_speculative_updates,
+        };
+        let prep = PreparedWFT {
             task_token: wft.task_token,
             attempt: wft.attempt,
             execution: wft.workflow_execution,
             workflow_type: wft.workflow_type,
             legacy_query: wft.legacy_query,
             query_requests: wft.query_requests,
-            update,
+            envelope,
+            initial_events: wft.history.events,
+            no_more_pages,
             messages: wft.messages,
         };
-        Ok((paginator, prepared))
+        Ok(PolledWftOutput { paginator, prep })
     }
 
+    /// Cache-miss path: build a paginator for fetch-from-start, then pre-fetch
+    /// the entire history into `req.original_wft.work.initial_events`. The
+    /// `WftExtractor`-level contract is: a `FetchResult` carries a
+    /// `PermittedWFT` whose events are ready to be applied without further
+    /// fetching.
+    ///
+    /// Pre-fetching all pages here (rather than deferring to per-NeedFetch
+    /// round-trips) matches today's behavior for cache-miss replays of long
+    /// histories.
     pub(super) async fn from_fetchreq(
         mut req: Box<CacheMissFetchReq>,
         client: Arc<dyn WorkerClient>,
     ) -> Result<PermittedWFT, tonic::Status> {
-        let mut paginator = Self {
+        let envelope = req.original_wft.work.envelope;
+        let mut paginator = HistoryPaginator {
             wf_id: req.original_wft.work.execution.workflow_id.clone(),
             run_id: req.original_wft.work.execution.run_id.clone(),
-            previous_wft_started_id: req.original_wft.work.update.previous_wft_started_id,
-            wft_started_event_id: req.original_wft.work.update.wft_started_id,
-            id_of_last_event_in_last_extracted_update: req
-                .original_wft
-                .paginator
-                .id_of_last_event_in_last_extracted_update,
             client,
-            event_queue: Default::default(),
             next_page_token: NextPageToken::FetchFromStart,
-            final_events: req.original_wft.work.update.events,
-            has_pending_speculative_updates: !req.original_wft.work.messages.is_empty(),
-            // Deliberately do NOT copy `chunking_version` from the original
-            // paginator. That paginator was built from a partial poll history
-            // that, by definition (cache miss → incremental poll), does not
-            // contain event 1's WFTCompleted, so its computed version was
-            // either correct-by-luck or wrong-and-silent. Reset to `None` and
-            // rely on `get_next_page`'s monotonic scan to discover the truth
-            // from the start of history we're about to fetch.
-            chunking_version: None,
+            // The partial poll's events were captured in `initial_events`
+            // before we got here; hold them aside until pagination from start
+            // has drained the prior history.
+            pending_post_replay_events: mem::take(&mut req.original_wft.work.initial_events),
         };
-        let first_update = paginator.extract_next_update().await?;
-        req.original_wft.work.update = first_update;
+        let mut all_events: Vec<HistoryEvent> = Vec::new();
+        loop {
+            let page = paginator.fetch_next_page().await?;
+            all_events.extend(page.events);
+            if page.no_more_pages {
+                break;
+            }
+        }
+        req.original_wft.work.envelope = envelope;
+        req.original_wft.work.initial_events = all_events;
+        req.original_wft.work.no_more_pages = true;
         req.original_wft.paginator = paginator;
         Ok(req.original_wft)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        initial_history: History,
-        previous_wft_started_id: i64,
-        wft_started_event_id: i64,
-        wf_id: String,
-        run_id: String,
-        next_page_token: impl Into<NextPageToken>,
-        client: Arc<dyn WorkerClient>,
-        has_pending_speculative_updates: bool,
-    ) -> Self {
-        let next_page_token = next_page_token.into();
-        let (event_queue, final_events) =
-            if matches!(next_page_token, NextPageToken::FetchFromStart) {
-                (VecDeque::new(), initial_history.events)
-            } else {
-                (initial_history.events.into(), vec![])
-            };
-        // Best-effort scan of the initial events for the V2 flag. May resolve
-        // the version immediately (fresh polls and full-history fetches will
-        // always include event 1's WFTCompleted); for incremental polls the
-        // result will be `None` and `get_next_page` will continue scanning as
-        // events arrive.
-        let chunking_version = resolve_chunking_version_from_events(
-            event_queue.iter().chain(final_events.iter()),
-            None,
-        );
-        Self {
-            client,
-            event_queue,
-            wf_id,
-            run_id,
-            next_page_token,
-            final_events,
-            previous_wft_started_id,
-            wft_started_event_id,
-            id_of_last_event_in_last_extracted_update: None,
-            has_pending_speculative_updates,
-            chunking_version,
-        }
-    }
-
-    /// Return at least the next two WFT sequences (as determined by the passed-in ID) as a
-    /// [HistoryUpdate]. Two sequences supports the required peek-ahead during replay without
-    /// unnecessary back-and-forth.
+    /// Fetch one page of history from the server. The page's events are
+    /// returned; the chunker is not invoked here — the [`LwftBuffer`] runs
+    /// the chunker on demand once the events have been pushed into it.
     ///
-    /// If there are already enough events buffered in memory, they will all be returned. Including
-    /// possibly (likely, during replay) more than just the next two WFTs.
-    ///
-    /// If there are insufficient events to constitute two WFTs, then we will fetch pages until
-    /// we have two, or until we are at the end of history.
-    pub(crate) async fn extract_next_update(&mut self) -> Result<HistoryUpdate, tonic::Status> {
-        loop {
-            let no_next_page = !self.get_next_page().await?;
-            let current_events = mem::take(&mut self.event_queue);
-            let seen_enough_events = current_events
-                .back()
-                .map(|e| e.event_id)
-                .unwrap_or_default()
-                >= self.wft_started_event_id;
-
-            // This handles a special case where the server might send us a page token along with
-            // a real page which ends at the current end of history. The page token then points to
-            // en empty page. We need to detect this, and consider it the end of history.
-            //
-            // This case unfortunately cannot be handled earlier, because we might fetch a page
-            // from the server which contains two complete WFTs, and thus we are happy to return
-            // an update at that time. But, if the page has a next page token, we *cannot* conclude
-            // we are done with replay until we fetch that page. So, we have to wait until the next
-            // extraction to determine (after fetching the next page and finding it to be empty)
-            // that we are done. Fetching the page eagerly is another option, but would be wasteful
-            // the overwhelming majority of the time.
-            let already_sent_update_with_enough_events = self
-                .id_of_last_event_in_last_extracted_update
-                .unwrap_or_default()
-                >= self.wft_started_event_id;
-            if current_events.is_empty() && no_next_page && already_sent_update_with_enough_events {
-                // We must return an empty update which also says is contains the final WFT so we
-                // know we're done with replay.
-                // No events here, so chunking version doesn't matter; fall back
-                // to V1 (any prior real update would have already resolved the
-                // version on the workflow-machines side).
-                return Ok(HistoryUpdate::from_events(
-                    [],
-                    self.previous_wft_started_id,
-                    self.wft_started_event_id,
-                    true,
-                    self.has_pending_speculative_updates,
-                    self.chunking_version.unwrap_or(ChunkingVersion::V1),
-                )
-                .0);
-            }
-
-            if current_events.is_empty() || (no_next_page && !seen_enough_events) {
-                // If next page fetching happened, and we still ended up with no or insufficient
-                // events, something is wrong. We're expecting there to be more events to be able to
-                // extract this update, but server isn't giving us any. We have no choice except to
-                // give up and evict.
-                error!(
-                    current_events=?current_events,
-                    no_next_page,
-                    seen_enough_events,
-                    "We expected to be able to fetch more events but server says there are none"
-                );
-                return Err(EMPTY_FETCH_ERR.clone());
-            }
-            let first_event_id = current_events.front().unwrap().event_id;
-            // We only *really* have the last WFT if the events go all the way up to at least the
-            // WFT started event id. Otherwise we somehow still have partial history.
-            let no_more = matches!(self.next_page_token, NextPageToken::Done) && seen_enough_events;
-            // Belt-and-suspenders: re-scan to pick up anything that entered via
-            // direct constructor args rather than `get_next_page`. The monotonic
-            // resolver no-ops if a version is already known.
-            self.chunking_version =
-                resolve_chunking_version_from_events(current_events.iter(), self.chunking_version);
-            // If the chunking version is still unresolved and we haven't
-            // exhausted pagination, the only correct move is to fetch more —
-            // running the chunker now would mean silently picking V1, which is
-            // exactly the class of bug the typed `Option<ChunkingVersion>`
-            // exists to prevent. Put the events back and loop.
-            if self.chunking_version.is_none()
-                && !matches!(self.next_page_token, NextPageToken::Done)
-            {
-                self.event_queue = current_events;
-                continue;
-            }
-            // At this point we've either resolved the version or fully
-            // paginated without ever seeing a `WorkflowTaskCompleted`. The
-            // latter shouldn't happen for any workflow that has actually run
-            // (every WFT must complete to produce events the worker sees),
-            // but if it does, V1 is the conservative legacy default and the
-            // remaining events have no WFT boundaries for the chunker to find
-            // anyway — so the choice is moot for correctness.
-            let chunking_version = self.chunking_version.unwrap_or(ChunkingVersion::V1);
-            let (update, extra) = HistoryUpdate::from_events(
-                current_events,
-                self.previous_wft_started_id,
-                self.wft_started_event_id,
-                no_more,
-                self.has_pending_speculative_updates,
-                chunking_version,
-            );
-
-            // If there are potentially more events and we haven't extracted two WFTs yet, keep
-            // trying.
-            if !matches!(self.next_page_token, NextPageToken::Done) && update.wft_count < 2 {
-                // Unwrap the update and stuff it all back in the queue
-                self.event_queue.extend(update.events);
-                self.event_queue.extend(extra);
-                continue;
-            }
-
-            let extra_eid_same = extra
-                .first()
-                .map(|e| e.event_id == first_event_id)
-                .unwrap_or_default();
-            // If there are some events at the end of the fetched events which represent only a
-            // portion of a complete WFT, retain them to be used in the next extraction.
-            self.event_queue = extra.into();
-            if !no_more && extra_eid_same {
-                // There was not a meaningful WFT in the whole page. We must fetch more.
-                continue;
-            }
-            self.id_of_last_event_in_last_extracted_update =
-                update.events.last().map(|e| e.event_id);
-            #[cfg(debug_assertions)]
-            update.assert_contiguous();
-            return Ok(update);
-        }
-    }
-
-    /// Fetches the next page and adds it to the internal queue.
-    /// Returns true if we still have a next page token after fetching.
-    async fn get_next_page(&mut self) -> Result<bool, tonic::Status> {
+    /// On the page that transitions `next_page_token` to `Done`, any
+    /// held-aside `pending_post_replay_events` are flushed into the output
+    /// (after the freshly-fetched events, in history order).
+    pub(crate) async fn fetch_next_page(&mut self) -> Result<FetchPageOutput, tonic::Status> {
         let history = loop {
             let npt = match mem::replace(&mut self.next_page_token, NextPageToken::Done) {
-                // If the last page token we got was empty, we're done.
                 NextPageToken::Done => break None,
                 NextPageToken::FetchFromStart => vec![],
                 NextPageToken::Next(v) => v,
@@ -660,396 +567,103 @@ impl HistoryPaginator {
                 .map(|h| h.events.is_empty())
                 .unwrap_or(true);
             if history_is_empty && matches!(&self.next_page_token, NextPageToken::Next(_)) {
-                // If the fetch returned an empty history, but there *was* a next page token,
-                // immediately try to get that.
+                // Empty page with a continuation token — immediately try the next.
                 continue;
             }
-            // Async doesn't love recursion so we do this instead.
             break fetch_res.history;
         };
 
-        let queue_back_id = self
-            .event_queue
-            .back()
-            .map(|e| e.event_id)
-            .unwrap_or_default();
-        let queue_len_before = self.event_queue.len();
-        self.event_queue.extend(
-            history
-                .map(|h| h.events)
-                .unwrap_or_default()
-                .into_iter()
-                .skip_while(|e| e.event_id <= queue_back_id),
-        );
-        if matches!(&self.next_page_token, NextPageToken::Done) {
-            // If finished, we need to extend the queue with the final events, skipping any
-            // which are already present.
-            if let Some(last_event_id) = self.event_queue.back().map(|e| e.event_id) {
-                let final_events = mem::take(&mut self.final_events);
-                self.event_queue.extend(
-                    final_events
-                        .into_iter()
-                        .skip_while(|e2| e2.event_id <= last_event_id),
-                );
-            }
-        };
-        // Monotonically resolve the chunking version from any events that just
-        // entered the queue. Without this, a paginator that starts in the
-        // "I don't know yet" state (e.g. one built by `from_fetchreq`, where
-        // event 1 is never in the constructor-time events) would chunk every
-        // fetched page as V1 — silently, even for V2 workflows.
-        if self.chunking_version.is_none() {
-            let newly_added = self.event_queue.iter().skip(queue_len_before);
-            self.chunking_version =
-                resolve_chunking_version_from_events(newly_added, self.chunking_version);
+        let mut events: Vec<HistoryEvent> = history.map(|h| h.events).unwrap_or_default();
+        let done = matches!(&self.next_page_token, NextPageToken::Done);
+        if done {
+            // Final page: flush held-aside events. The buffer's
+            // `push_events` filter de-duplicates by event_id.
+            events.extend(mem::take(&mut self.pending_post_replay_events));
         }
-        Ok(!matches!(&self.next_page_token, NextPageToken::Done))
+        Ok(FetchPageOutput {
+            events,
+            no_more_pages: done,
+        })
     }
 }
 
+/// Test-only adapter: turns a [`HistoryPaginator`] into a [`Stream`] of
+/// individual events. Used by history-downloading tests/utilities; the
+/// production hot path uses [`LwftBuffer`] which receives whole pages at a
+/// time via `push_events`.
+#[cfg(test)]
 #[pin_project::pin_project]
 struct StreamingHistoryPaginator {
     inner: HistoryPaginator,
+    /// Buffered events from the most recent `fetch_next_page` call, yielded
+    /// one at a time to satisfy the `Stream` contract.
+    pending: VecDeque<HistoryEvent>,
+    /// Whether the inner paginator has reported no more pages. Once true and
+    /// `pending` is empty, the stream terminates.
+    drained: bool,
     #[pin]
-    open_history_request: Option<BoxFuture<'static, Result<(), tonic::Status>>>,
+    open_history_request: Option<BoxFuture<'static, Result<FetchPageOutput, tonic::Status>>>,
 }
 
+#[cfg(test)]
 impl StreamingHistoryPaginator {
-    // Kept since can be used for history downloading
-    #[cfg(test)]
     fn new(inner: HistoryPaginator) -> Self {
         Self {
             inner,
+            pending: VecDeque::new(),
+            drained: false,
             open_history_request: None,
         }
     }
 }
 
+#[cfg(test)]
 impl Stream for StreamingHistoryPaginator {
     type Item = Result<HistoryEvent, tonic::Status>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
-
-        if let Some(e) = this.inner.event_queue.pop_front() {
-            return Poll::Ready(Some(Ok(e)));
-        }
-        if this.open_history_request.is_none() {
-            // SAFETY: This is safe because the inner paginator cannot be dropped before the future,
-            //   and the future won't be moved from out of this struct.
-            this.open_history_request.set(Some(unsafe {
-                transmute::<
-                    BoxFuture<'_, Result<(), tonic::Status>>,
-                    BoxFuture<'static, Result<(), tonic::Status>>,
-                >(this.inner.get_next_page().map_ok(|_| ()).boxed())
-            }));
-        }
-        let history_req = this.open_history_request.as_mut().as_pin_mut().unwrap();
-
-        match Future::poll(history_req, cx) {
-            Poll::Ready(resp) => {
-                this.open_history_request.set(None);
-                match resp {
-                    Err(neterr) => Poll::Ready(Some(Err(neterr))),
-                    Ok(_) => Poll::Ready(this.inner.event_queue.pop_front().map(Ok)),
-                }
+        loop {
+            if let Some(e) = this.pending.pop_front() {
+                return Poll::Ready(Some(Ok(e)));
             }
-            Poll::Pending => Poll::Pending,
+            if *this.drained {
+                return Poll::Ready(None);
+            }
+            if this.open_history_request.is_none() {
+                // SAFETY: the inner paginator cannot be dropped before the
+                // future, and the future won't be moved out of this struct.
+                this.open_history_request.set(Some(unsafe {
+                    transmute::<
+                        BoxFuture<'_, Result<FetchPageOutput, tonic::Status>>,
+                        BoxFuture<'static, Result<FetchPageOutput, tonic::Status>>,
+                    >(this.inner.fetch_next_page().boxed())
+                }));
+            }
+            let history_req = this.open_history_request.as_mut().as_pin_mut().unwrap();
+            match Future::poll(history_req, cx) {
+                Poll::Ready(resp) => {
+                    this.open_history_request.set(None);
+                    match resp {
+                        Err(neterr) => return Poll::Ready(Some(Err(neterr))),
+                        Ok(page) => {
+                            this.pending.extend(page.events);
+                            if page.no_more_pages {
+                                *this.drained = true;
+                            }
+                            // Loop to yield the first buffered event (or terminate).
+                        }
+                    }
+                }
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 }
 
-impl HistoryUpdate {
-    /// Sometimes it's useful to take an update out of something without needing to use an option
-    /// field. Use this to replace the field with an empty update.
-    pub(crate) fn dummy() -> Self {
-        Self {
-            events: vec![],
-            previous_wft_started_id: -1,
-            wft_started_id: -1,
-            has_last_wft: false,
-            wft_count: 0,
-            has_pending_speculative_updates: false,
-            // V1 is the conservative default for the sentinel; a dummy has no
-            // events so the chunker is never actually invoked on it.
-            chunking_version: ChunkingVersion::V1,
-        }
-    }
-
-    pub(crate) fn is_real(&self) -> bool {
-        self.previous_wft_started_id >= 0
-    }
-
-    pub(crate) fn first_event_id(&self) -> Option<i64> {
-        self.events.first().map(|e| e.event_id)
-    }
-
-    #[cfg(debug_assertions)]
-    fn assert_contiguous(&self) -> bool {
-        use crate::abstractions::dbg_panic;
-
-        for win in self.events.as_slice().windows(2) {
-            if let &[e1, e2] = &win
-                && e2.event_id != e1.event_id + 1
-            {
-                dbg_panic!("HistoryUpdate isn't contiguous! {:?} -> {:?}", e1, e2);
-            }
-        }
-        true
-    }
-
-    /// Create an instance of an update directly from events. If the passed in event iterator has a
-    /// partial WFT sequence at the end, all events after the last complete WFT sequence (ending
-    /// with WFT started) are returned back to the caller, since the history update only works in
-    /// terms of complete WFT sequences.
-    pub(crate) fn from_events<I: IntoIterator<Item = HistoryEvent>>(
-        events: I,
-        previous_wft_started_id: i64,
-        wft_started_id: i64,
-        has_last_wft: bool,
-        has_pending_speculative_updates: bool,
-        chunking_version: ChunkingVersion,
-    ) -> (Self, Vec<HistoryEvent>)
-    where
-        <I as IntoIterator>::IntoIter: Send + 'static,
-    {
-        let all_events: Vec<_> = events.into_iter().collect();
-
-        Self::from_events_apply(
-            all_events,
-            previous_wft_started_id,
-            wft_started_id,
-            has_last_wft,
-            has_pending_speculative_updates,
-            chunking_version,
-        )
-    }
-
-    fn from_events_apply(
-        mut all_events: Vec<HistoryEvent>,
-        previous_wft_started_id: i64,
-        wft_started_id: i64,
-        has_last_wft: bool,
-        has_pending_speculative_updates: bool,
-        chunking_version: ChunkingVersion,
-    ) -> (Self, Vec<HistoryEvent>) {
-        let mut last_end = find_end_index_of_next_wft_seq(
-            all_events.as_slice(),
-            previous_wft_started_id,
-            has_last_wft,
-            has_pending_speculative_updates,
-            chunking_version,
-        );
-
-        if matches!(
-            last_end,
-            NextWFTSeqEndIndex::NeedMore | NextWFTSeqEndIndex::Tail
-        ) {
-            return if has_last_wft {
-                (
-                    Self {
-                        events: all_events,
-                        previous_wft_started_id,
-                        wft_started_id,
-                        has_last_wft,
-                        wft_count: 1,
-                        has_pending_speculative_updates,
-                        chunking_version,
-                    },
-                    vec![],
-                )
-            } else {
-                (
-                    Self {
-                        events: vec![],
-                        previous_wft_started_id,
-                        wft_started_id,
-                        has_last_wft,
-                        wft_count: 0,
-                        has_pending_speculative_updates,
-                        chunking_version,
-                    },
-                    all_events,
-                )
-            };
-        }
-
-        let mut wft_count = 0;
-        while let NextWFTSeqEndIndex::Complete(next_end_ix) = last_end {
-            wft_count += 1;
-            let next_end_eid = all_events[next_end_ix].event_id;
-            let next_end = find_end_index_of_next_wft_seq(
-                &all_events[next_end_ix..],
-                next_end_eid,
-                has_last_wft,
-                has_pending_speculative_updates,
-                chunking_version,
-            )
-            .add(next_end_ix);
-            if matches!(
-                next_end,
-                NextWFTSeqEndIndex::NeedMore | NextWFTSeqEndIndex::Tail
-            ) {
-                break;
-            }
-            last_end = next_end;
-        }
-
-        let remaining_events = if all_events.is_empty() || has_last_wft {
-            vec![]
-        } else {
-            all_events.split_off(last_end.end_index_in_slice(all_events.len()) + 1)
-        };
-
-        (
-            Self {
-                events: all_events,
-                previous_wft_started_id,
-                wft_started_id,
-                has_last_wft,
-                wft_count,
-                has_pending_speculative_updates,
-                chunking_version,
-            },
-            remaining_events,
-        )
-    }
-
-    /// Create an instance of an update directly from events. The passed in events *must* consist
-    /// of one or more complete WFT sequences. IE: The event iterator must not end in the middle
-    /// of a WFT sequence.
-    #[cfg(test)]
-    fn new_from_events<I: IntoIterator<Item = HistoryEvent>>(
-        events: I,
-        previous_wft_started_id: i64,
-        wft_started_id: i64,
-        has_last_wft: bool,
-        has_pending_speculative_updates: bool,
-        chunking_version: ChunkingVersion,
-    ) -> Self
-    where
-        <I as IntoIterator>::IntoIter: Send + 'static,
-    {
-        Self {
-            events: events.into_iter().collect(),
-            previous_wft_started_id,
-            wft_started_id,
-            has_last_wft,
-            wft_count: 0,
-            has_pending_speculative_updates,
-            chunking_version,
-        }
-    }
-
-    /// Given a workflow task started id, return all events starting at that number (exclusive) to
-    /// the next WFT started event (inclusive).
-    ///
-    /// Events are *consumed* by this process, to keep things efficient in workflow machines.
-    ///
-    /// If we are out of WFT sequences that can be yielded by this update, it will return an empty
-    /// vec, indicating more pages will need to be fetched.
-    pub(crate) fn take_next_wft_sequence(&mut self, from_wft_started_id: i64) -> NextWFT {
-        // First, drop any events from the queue which are earlier than the passed-in id.
-        if let Some(ix_first_relevant) =
-            starting_index_after_skipping(&self.events, from_wft_started_id)
-        {
-            self.events.drain(0..ix_first_relevant);
-        }
-
-        let chunk = find_end_index_of_next_wft_seq(
-            &self.events,
-            from_wft_started_id,
-            self.has_last_wft,
-            self.has_pending_speculative_updates,
-            self.chunking_version,
-        );
-
-        match chunk {
-            NextWFTSeqEndIndex::NeedMore => NextWFT::NeedFetch,
-            NextWFTSeqEndIndex::Tail => {
-                if !self.has_last_wft {
-                    // We don't have the full history yet; what looks like tail events may
-                    // just be the end of the current page. Fetch more.
-                    NextWFT::NeedFetch
-                } else if self.events.is_empty() {
-                    NextWFT::ReplayOver
-                } else {
-                    // Remaining events are trailing matter (e.g. terminal events, WFTCompleted
-                    // + commands after the last WFTStarted). Include them all so the caller
-                    // can process them (e.g. to set have_seen_terminal_event).
-                    self.build_next_wft(self.events.len() - 1)
-                }
-            }
-            NextWFTSeqEndIndex::Complete(next_wft_ix) => self.build_next_wft(next_wft_ix),
-        }
-    }
-
-    fn build_next_wft(&mut self, drain_this_much: usize) -> NextWFT {
-        let events: Vec<HistoryEvent> = self.events.drain(0..=drain_this_much).collect();
-        let is_terminal = self.events.is_empty() && self.has_last_wft;
-        NextWFT::WFT(LogicalWorkflowTask {
-            events,
-            is_terminal,
-        })
-    }
-
-    /// Lets the caller peek ahead at the next WFT sequence that will be returned by
-    /// [take_next_wft_sequence]. Will always return the first available WFT sequence if that has
-    /// not been called first. May also return an empty iterator or incomplete sequence if we are at
-    /// the end of history.
-    pub(crate) fn peek_next_wft_sequence(&self, from_wft_started_id: i64) -> &[HistoryEvent] {
-        let ix_first_relevant =
-            starting_index_after_skipping(&self.events, from_wft_started_id).unwrap_or_default();
-
-        let relevant_events = &self.events[ix_first_relevant..];
-        if relevant_events.is_empty() {
-            return relevant_events;
-        }
-
-        let ix_end = find_end_index_of_next_wft_seq(
-            relevant_events,
-            from_wft_started_id,
-            self.has_last_wft,
-            self.has_pending_speculative_updates,
-            self.chunking_version,
-        )
-        .end_index_in_slice(relevant_events.len());
-
-        &relevant_events[0..=ix_end]
-    }
-
-    /// Returns true if this update has the next needed WFT sequence, false if events will need to
-    /// be fetched in order to create a complete update with the entire next WFT sequence.
-    pub(crate) fn can_take_next_wft_sequence(&self, from_wft_started_id: i64) -> bool {
-        let next_wft_ix = find_end_index_of_next_wft_seq(
-            &self.events,
-            from_wft_started_id,
-            self.has_last_wft,
-            self.has_pending_speculative_updates,
-            self.chunking_version,
-        );
-        match next_wft_ix {
-            NextWFTSeqEndIndex::NeedMore => false,
-            NextWFTSeqEndIndex::Tail => self.has_last_wft,
-            NextWFTSeqEndIndex::Complete(_) => true,
-        }
-    }
-
-    /// Returns the next WFT completed event attributes, if any, starting at (inclusive) the
-    /// `from_id`
-    pub(crate) fn peek_next_wft_completed(
-        &self,
-        from_id: i64,
-    ) -> Option<&WorkflowTaskCompletedEventAttributes> {
-        self.events
-            .iter()
-            .skip_while(|e| e.event_id < from_id)
-            .find_map(|e| match &e.attributes {
-                Some(Attributes::WorkflowTaskCompletedEventAttributes(a)) => Some(a),
-                _ => None,
-            })
-    }
-}
+// The `HistoryUpdate` type (and its `from_events`, `take_next_wft_sequence`,
+// `peek_next_wft_sequence`, etc. methods) has been removed. Its event-buffer
+// and chunker-invocation roles now live on [`LwftBuffer`].
 
 fn starting_index_after_skipping(
     events: &[HistoryEvent],
@@ -1610,32 +1224,82 @@ mod tests {
         }
     }
 
-    impl From<HistoryInfo> for HistoryUpdate {
-        fn from(v: HistoryInfo) -> Self {
-            let events = v.events().to_vec();
-            let chunking_version = if events_have_wft_chunking_v2(events.iter()) {
-                ChunkingVersion::V2
-            } else {
-                ChunkingVersion::V1
-            };
-            Self::new_from_events(
-                events,
-                v.previous_started_event_id(),
-                v.workflow_task_started_event_id(),
-                true,
-                false,
-                chunking_version,
-            )
+    /// Test-only constructor for [`LwftBuffer`]. Pushes one batch of events
+    /// with the given envelope/`no_more_pages` setting, then forces the
+    /// chunking version (so tests don't have to depend on event-flag scanning
+    /// to resolve it).
+    pub(super) fn lwft_buffer_for_test(
+        events: Vec<HistoryEvent>,
+        previous_wft_started_id: i64,
+        wft_started_id: i64,
+        no_more_pages: bool,
+        has_pending_speculative_updates: bool,
+        chunking_version: ChunkingVersion,
+    ) -> LwftBuffer {
+        let mut buf = LwftBuffer::empty();
+        // Set the version FIRST so the buffer's chunker dispatch can rely on
+        // it from the first push (otherwise `push_events`' best-effort scan
+        // determines it from the events, which is what production does but
+        // is not what tests assume).
+        buf.set_chunking_version(chunking_version);
+        buf.push_events(
+            WftEnvelope {
+                previous_wft_started_id,
+                wft_started_id,
+                has_pending_speculative_updates,
+            },
+            events,
+            no_more_pages,
+        );
+        buf
+    }
+
+    /// Test-only constructor for [`HistoryPaginator`] that bypasses the
+    /// async fetching done by `from_poll`/`from_fetchreq`. Used by tests
+    /// that drive the paginator directly with a mocked `WorkerClient`.
+    pub(super) fn paginator_for_test(
+        wf_id: String,
+        run_id: String,
+        next_page_token: impl Into<NextPageToken>,
+        client: Arc<dyn WorkerClient>,
+        pending_post_replay_events: Vec<HistoryEvent>,
+    ) -> HistoryPaginator {
+        HistoryPaginator {
+            wf_id,
+            run_id,
+            client,
+            next_page_token: next_page_token.into(),
+            pending_post_replay_events,
         }
     }
 
+    /// Build an `LwftBuffer` from a fully-known history. The version is
+    /// auto-detected from the events. Mirrors the old `as_history_update()`
+    /// semantics: `no_more_pages = true`, no pending updates.
+    fn buffer_from_history_info(v: HistoryInfo) -> LwftBuffer {
+        let events = v.events().to_vec();
+        let chunking_version = if events_have_wft_chunking_v2(events.iter()) {
+            ChunkingVersion::V2
+        } else {
+            ChunkingVersion::V1
+        };
+        lwft_buffer_for_test(
+            events,
+            v.previous_started_event_id(),
+            v.workflow_task_started_event_id(),
+            true,
+            false,
+            chunking_version,
+        )
+    }
+
     trait TestHBExt {
-        fn as_history_update(&self) -> HistoryUpdate;
+        fn as_lwft_buffer(&self) -> LwftBuffer;
     }
 
     impl TestHBExt for TestHistoryBuilder {
-        fn as_history_update(&self) -> HistoryUpdate {
-            self.get_full_history_info().unwrap().into()
+        fn as_lwft_buffer(&self) -> LwftBuffer {
+            buffer_from_history_info(self.get_full_history_info().unwrap())
         }
     }
 
@@ -1661,16 +1325,16 @@ mod tests {
         }
     }
 
-    fn next_check_peek(update: &mut HistoryUpdate, from_id: i64) -> Vec<HistoryEvent> {
-        let seq_peeked = update.peek_next_wft_sequence(from_id).to_vec();
-        let seq = update.take_next_wft_sequence(from_id).unwrap_events();
+    fn next_check_peek(buf: &mut LwftBuffer, from_id: i64) -> Vec<HistoryEvent> {
+        let seq_peeked = buf.peek_next_wft_sequence(from_id).to_vec();
+        let seq = buf.take_next_wft_sequence(from_id).unwrap_events();
         assert_eq!(seq, seq_peeked);
         seq
     }
 
-    fn next_check_peek2(update: &mut HistoryUpdate, from_id: i64) -> (usize, bool) {
-        let seq_peek = update.peek_next_wft_sequence(from_id).to_vec();
-        let next = update.take_next_wft_sequence(from_id);
+    fn next_check_peek2(buf: &mut LwftBuffer, from_id: i64) -> (usize, bool) {
+        let seq_peek = buf.peek_next_wft_sequence(from_id).to_vec();
+        let next = buf.take_next_wft_sequence(from_id);
         let is_complete = next.is_complete();
         let seq_take = next.unwrap_events();
         assert_eq!(seq_take, seq_peek);
@@ -1682,7 +1346,7 @@ mod tests {
     fn consumes_standard_wft_sequence(#[values(false, true)] chunking_v2: bool) {
         let mut timer_hist = canned_histories::single_timer("t");
         maybe_set_chunking_v2(&mut timer_hist, chunking_v2);
-        let mut update = timer_hist.as_history_update();
+        let mut update = timer_hist.as_lwft_buffer();
         let seq_1 = next_check_peek(&mut update, 0);
         assert_eq!(seq_1.len(), 3);
         assert_eq!(seq_1.last().unwrap().event_id, 3);
@@ -1698,7 +1362,7 @@ mod tests {
     fn skips_wft_failed(#[values(false, true)] chunking_v2: bool) {
         let mut failed_hist = canned_histories::workflow_fails_with_reset_after_timer("t", "runid");
         maybe_set_chunking_v2(&mut failed_hist, chunking_v2);
-        let mut update = failed_hist.as_history_update();
+        let mut update = failed_hist.as_lwft_buffer();
         let seq_1 = next_check_peek(&mut update, 0);
         assert_eq!(seq_1.len(), 3);
         assert_eq!(seq_1.last().unwrap().event_id, 3);
@@ -1712,7 +1376,7 @@ mod tests {
     fn skips_wft_timeout(#[values(false, true)] chunking_v2: bool) {
         let mut failed_hist = canned_histories::wft_timeout_repro();
         maybe_set_chunking_v2(&mut failed_hist, chunking_v2);
-        let mut update = failed_hist.as_history_update();
+        let mut update = failed_hist.as_lwft_buffer();
         let seq_1 = next_check_peek(&mut update, 0);
         assert_eq!(seq_1.len(), 3);
         assert_eq!(seq_1.last().unwrap().event_id, 3);
@@ -1726,7 +1390,7 @@ mod tests {
     fn skips_events_before_desired_wft(#[values(false, true)] chunking_v2: bool) {
         let mut timer_hist = canned_histories::single_timer("t");
         maybe_set_chunking_v2(&mut timer_hist, chunking_v2);
-        let mut update = timer_hist.as_history_update();
+        let mut update = timer_hist.as_lwft_buffer();
         // We haven't processed the first 3 events, but we should still only get the second sequence
         let seq_2 = update.take_next_wft_sequence(3).unwrap_events();
         assert_eq!(seq_2.len(), 5);
@@ -1739,7 +1403,7 @@ mod tests {
         let mut timer_hist = canned_histories::single_timer("t");
         timer_hist.add_workflow_execution_terminated();
         maybe_set_chunking_v2(&mut timer_hist, chunking_v2);
-        let mut update = timer_hist.as_history_update();
+        let mut update = timer_hist.as_lwft_buffer();
         let seq_2 = update.take_next_wft_sequence(3).unwrap_events();
         if chunking_v2 {
             // New algorithm: terminal event is not part of the WFTStarted LWFT.
@@ -1777,7 +1441,7 @@ mod tests {
             add_terminal(&mut t); // terminal(8)
             maybe_set_chunking_v2(&mut t, chunking_v2);
 
-            let mut update = t.as_history_update();
+            let mut update = t.as_lwft_buffer();
             let seq_1 = update.take_next_wft_sequence(0).unwrap_events();
             assert_eq!(seq_1.last().unwrap().event_id, 3);
 
@@ -1819,7 +1483,7 @@ mod tests {
         t.add_workflow_execution_completed();
         maybe_set_chunking_v2(&mut t, chunking_v2);
 
-        let mut update = t.as_history_update();
+        let mut update = t.as_lwft_buffer();
         if chunking_v2 {
             // v2 treats WFExecutionStarted as time-sensitive,
             // so the first WFT can't be collapsed with the next.
@@ -1854,14 +1518,20 @@ mod tests {
         t.add_workflow_execution_completed();
         maybe_set_chunking_v2(&mut t, chunking_v2);
 
-        let mut update = t.as_history_update();
+        let mut update = t.as_lwft_buffer();
         let seq = next_check_peek(&mut update, 3);
         assert_eq!(seq.len(), 3);
         let seq = next_check_peek(&mut update, 6);
         assert_eq!(seq.len(), 3);
     }
 
-    fn paginator_setup(history: TestHistoryBuilder, chunk_size: usize) -> HistoryPaginator {
+    /// Test fixture: returns a pre-populated [`LwftBuffer`] (holding the
+    /// first chunk's worth of events) plus a [`HistoryPaginator`] whose
+    /// mocked client serves subsequent chunks.
+    fn paginator_setup(
+        history: TestHistoryBuilder,
+        chunk_size: usize,
+    ) -> (LwftBuffer, HistoryPaginator) {
         let hinfo = history.get_full_history_info().unwrap();
         let wft_started = hinfo.workflow_task_started_event_id();
         let full_hist = hinfo.into_events();
@@ -1891,18 +1561,93 @@ mod tests {
                 })
             });
 
-        HistoryPaginator::new(
-            History {
-                events: initial_hist,
-            },
-            0,
-            wft_started,
+        let paginator = paginator_for_test(
             "wfid".to_string(),
             "runid".to_string(),
             vec![1],
             Arc::new(mock_client),
-            false,
-        )
+            vec![],
+        );
+
+        // Auto-detect chunking version from initial events so tests don't
+        // need to pre-set it (and so the legacy/v2 parameterization works).
+        let chunking_version = if events_have_wft_chunking_v2(initial_hist.iter()) {
+            ChunkingVersion::V2
+        } else {
+            ChunkingVersion::V1
+        };
+        let buf = lwft_buffer_for_test(initial_hist, 0, wft_started, false, false, chunking_version);
+        (buf, paginator)
+    }
+
+    /// Test helper: replay-loop one step. Either yield a WFT (already
+    /// taken from the buffer) or fetch one more page and try again.
+    /// Returns the WFT events, or `None` once `ReplayOver` is reached.
+    async fn pump_next_wft(
+        buf: &mut LwftBuffer,
+        paginator: &mut HistoryPaginator,
+        from_id: i64,
+    ) -> Option<Vec<HistoryEvent>> {
+        loop {
+            match buf.take_next_wft_sequence(from_id) {
+                NextWFT::WFT(lwft) => return Some(lwft.into_events()),
+                NextWFT::ReplayOver => return None,
+                NextWFT::NeedFetch => {
+                    let page = paginator.fetch_next_page().await.unwrap();
+                    let envelope = buf.envelope();
+                    buf.push_events(envelope, page.events, page.no_more_pages);
+                }
+            }
+        }
+    }
+
+    /// Test helper: drain ONE page from the paginator and push it into the
+    /// buffer. Used by tests that want to drive pagination step-by-step.
+    async fn pump_one_page(buf: &mut LwftBuffer, paginator: &mut HistoryPaginator) {
+        let page = paginator.fetch_next_page().await.unwrap();
+        let envelope = buf.envelope();
+        buf.push_events(envelope, page.events, page.no_more_pages);
+    }
+
+    /// Test helper: keep pumping pages from the paginator into the buffer
+    /// until the buffer can yield (or ReplayOver / unexpected NeedFetch).
+    async fn drain_to_take(
+        buf: &mut LwftBuffer,
+        paginator: &mut HistoryPaginator,
+        from_id: i64,
+    ) -> NextWFT {
+        loop {
+            match buf.take_next_wft_sequence(from_id) {
+                NextWFT::NeedFetch => pump_one_page(buf, paginator).await,
+                other => return other,
+            }
+        }
+    }
+
+    /// Test helper: set up a buffer + paginator pair for cache-miss-style
+    /// tests. The partial task's events are held aside on the paginator;
+    /// the buffer starts empty with just the envelope set.
+    fn cache_miss_setup(
+        partial_task: HistoryInfo,
+        client: Arc<dyn WorkerClient>,
+        chunking_version: ChunkingVersion,
+    ) -> (LwftBuffer, HistoryPaginator) {
+        let envelope = WftEnvelope {
+            previous_wft_started_id: partial_task.previous_started_event_id(),
+            wft_started_id: partial_task.workflow_task_started_event_id(),
+            has_pending_speculative_updates: false,
+        };
+        let paginator = paginator_for_test(
+            "wfid".to_string(),
+            "runid".to_string(),
+            NextPageToken::FetchFromStart,
+            client,
+            partial_task.into_events(),
+        );
+        let mut buf = LwftBuffer::empty();
+        buf.set_chunking_version(chunking_version);
+        buf.push_events(envelope, vec![], false);
+        (buf, paginator)
     }
 
     #[rstest::rstest]
@@ -1922,20 +1667,14 @@ mod tests {
             .event_id;
         maybe_set_chunking_v2(&mut hist, chunking_v2);
 
-        let mut paginator = paginator_setup(hist, chunk_size);
-        let mut update = paginator.extract_next_update().await.unwrap();
+        let (mut buf, mut paginator) = paginator_setup(hist, chunk_size);
         let mut last_id = 0;
         loop {
-            let seq = loop {
-                match update.take_next_wft_sequence(last_id) {
-                    NextWFT::WFT(lwft) => break lwft.into_events(),
-                    NextWFT::NeedFetch => {
-                        update = paginator.extract_next_update().await.unwrap();
-                    }
-                    NextWFT::ReplayOver => {
-                        assert_eq!(last_id, expected_final_eid);
-                        return;
-                    }
+            let seq = match pump_next_wft(&mut buf, &mut paginator, last_id).await {
+                Some(seq) => seq,
+                None => {
+                    assert_eq!(last_id, expected_final_eid);
+                    return;
                 }
             };
             assert!(!seq.is_empty());
@@ -1956,8 +1695,14 @@ mod tests {
         let wft_count = 10;
         let mut hist = canned_histories::long_sequential_timers(wft_count);
         maybe_set_chunking_v2(&mut hist, chunking_v2);
-        let paginator = StreamingHistoryPaginator::new(paginator_setup(hist, 10));
-        let everything: Vec<_> = paginator.try_collect().await.unwrap();
+        // Drive the paginator via the streaming adapter, then prepend the
+        // events already in the buffer (the first chunk, which the paginator
+        // never re-fetches).
+        let (buf, paginator) = paginator_setup(hist, 10);
+        let initial: Vec<HistoryEvent> = buf.get_events().to_vec();
+        let stream = StreamingHistoryPaginator::new(paginator);
+        let rest: Vec<HistoryEvent> = stream.try_collect().await.unwrap();
+        let everything: Vec<HistoryEvent> = initial.into_iter().chain(rest).collect();
         assert_eq!(everything.len(), (wft_count + 1) * 5);
         everything.iter().fold(1, |event_id, e| {
             assert_eq!(event_id, e.event_id);
@@ -1991,39 +1736,40 @@ mod tests {
     ) {
         let mut t = three_wfts_then_heartbeats();
         maybe_set_chunking_v2(&mut t, chunking_v2);
-        let mut ends_in_middle_of_seq = t.as_history_update().events;
+        // Truncate the history mid-heartbeat-chain to simulate "more pages
+        // pending." Then push the truncated events into a buffer with
+        // `no_more_pages = false`: the buffer should yield the complete
+        // LWFTs and signal NeedFetch when it hits the unresolvable tail.
+        let mut ends_in_middle_of_seq: Vec<HistoryEvent> = t.as_lwft_buffer().get_events().to_vec();
         ends_in_middle_of_seq.truncate(truncate_at);
-        // The update should contain the first three complete WFTs, ending on the 11th event which
-        // is WFT started. The remaining events should be returned. False flags means the creator
-        // knows there are more events, so we should return need fetch
-        let (mut update, remaining) = HistoryUpdate::from_events(
+        let wft_started_id = t
+            .get_full_history_info()
+            .unwrap()
+            .workflow_task_started_event_id();
+        let mut buf = lwft_buffer_for_test(
             ends_in_middle_of_seq,
             0,
-            t.get_full_history_info()
-                .unwrap()
-                .workflow_task_started_event_id(),
-            false,
+            wft_started_id,
+            false, // no_more_pages: more pages remain
             false,
             cv(chunking_v2),
         );
-        assert_eq!(remaining[0].event_id, 12);
-        assert_eq!(remaining.last().unwrap().event_id, truncate_at as i64);
-        let seq = update.take_next_wft_sequence(0).unwrap_events();
+        let seq = buf.take_next_wft_sequence(0).unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 3);
-        let seq = update.take_next_wft_sequence(3).unwrap_events();
+        let seq = buf.take_next_wft_sequence(3).unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 7);
         if chunking_v2 {
             // New algorithm: the third logical WFT ends at `WorkflowTaskStarted` (id 11), but
             // the buffer has no following event — `find_end` returns NeedMore until more history
             // exists.
-            let next = update.take_next_wft_sequence(7);
+            let next = buf.take_next_wft_sequence(7);
             assert_matches!(next, NextWFT::NeedFetch);
         } else {
             // Legacy algorithm: less conservative, yields WFT3 immediately then NeedFetch for
             // the next call.
-            let seq = update.take_next_wft_sequence(7).unwrap_events();
+            let seq = buf.take_next_wft_sequence(7).unwrap_events();
             assert_eq!(seq.last().unwrap().event_id, 11);
-            let next = update.take_next_wft_sequence(11);
+            let next = buf.take_next_wft_sequence(11);
             assert_matches!(next, NextWFT::NeedFetch);
         }
     }
@@ -2036,17 +1782,16 @@ mod tests {
     ) {
         let mut t = three_wfts_then_heartbeats();
         maybe_set_chunking_v2(&mut t, chunking_v2);
-        let mut paginator = paginator_setup(t, chunk_size);
-        let mut update = paginator.extract_next_update().await.unwrap();
+        let (mut buf, mut paginator) = paginator_setup(t, chunk_size);
         let mut last_id = 0;
         loop {
-            let seq = update.take_next_wft_sequence(last_id);
+            let seq = buf.take_next_wft_sequence(last_id);
             match seq {
                 NextWFT::WFT(lwft) => {
                     last_id = lwft.events().last().unwrap().event_id;
                 }
                 NextWFT::NeedFetch => {
-                    update = paginator.extract_next_update().await.unwrap();
+                    pump_one_page(&mut buf, &mut paginator).await;
                 }
                 NextWFT::ReplayOver => break,
             }
@@ -2059,7 +1804,7 @@ mod tests {
     async fn task_just_before_heartbeat_chain_is_taken(#[values(false, true)] chunking_v2: bool) {
         let mut t = three_wfts_then_heartbeats();
         maybe_set_chunking_v2(&mut t, chunking_v2);
-        let mut update = t.as_history_update();
+        let mut update = t.as_lwft_buffer();
         let seq = update.take_next_wft_sequence(0).unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 3);
         let seq = update.take_next_wft_sequence(3).unwrap_events();
@@ -2082,8 +1827,6 @@ mod tests {
         let mut timer_hist = canned_histories::single_timer("t");
         maybe_set_chunking_v2(&mut timer_hist, chunking_v2);
         let partial_task = timer_hist.get_one_wft(2).unwrap();
-        let prev_started_wft_id = partial_task.previous_started_event_id();
-        let wft_started_id = partial_task.workflow_task_started_event_id();
         let mut history_from_get: GetWorkflowExecutionHistoryResponse =
             timer_hist.get_history_info(2).unwrap().into();
         // Chop off the last event, which is WFT started, which server doesn't return in get
@@ -2094,23 +1837,15 @@ mod tests {
             .expect_get_workflow_execution_history()
             .returning(move |_, _, _| Ok(history_from_get.clone()));
 
-        let mut paginator = HistoryPaginator::new(
-            partial_task.into(),
-            prev_started_wft_id,
-            wft_started_id,
-            "wfid".to_string(),
-            "runid".to_string(),
-            // A cache miss means we'll try to fetch from start
-            NextPageToken::FetchFromStart,
-            Arc::new(mock_client),
-            false,
-        );
-        let mut update = paginator.extract_next_update().await.unwrap();
-        // We expect if we try to take the first task sequence that the first event is the first
-        // event in the sequence.
-        let seq = update.take_next_wft_sequence(0).unwrap_events();
+        let (mut buf, mut paginator) =
+            cache_miss_setup(partial_task, Arc::new(mock_client), cv(chunking_v2));
+        let seq = drain_to_take(&mut buf, &mut paginator, 0)
+            .await
+            .unwrap_events();
         assert_eq!(seq[0].event_id, 1);
-        let seq = update.take_next_wft_sequence(3).unwrap_events();
+        let seq = drain_to_take(&mut buf, &mut paginator, 3)
+            .await
+            .unwrap_events();
         // Verify anything extra (which should only ever be WFT started) was re-appended to the
         // end of the event iteration after fetching the old history.
         assert_eq!(seq.last().unwrap().event_id, 8);
@@ -2135,7 +1870,7 @@ mod tests {
         t.add_workflow_task_scheduled_and_started();
         maybe_set_chunking_v2(&mut t, chunking_v2);
 
-        let mut update = t.as_history_update();
+        let mut update = t.as_lwft_buffer();
         let seq = next_check_peek(&mut update, 0);
         assert_eq!(seq.len(), 3);
         let seq = next_check_peek(&mut update, 3);
@@ -2150,26 +1885,37 @@ mod tests {
         let mut timer_hist = canned_histories::single_timer("t");
         maybe_set_chunking_v2(&mut timer_hist, chunking_v2);
         let partial_task = timer_hist.get_one_wft(2).unwrap();
-        let prev_started_wft_id = partial_task.previous_started_event_id();
-        let wft_started_id = partial_task.workflow_task_started_event_id();
+        let _prev_started_wft_id = partial_task.previous_started_event_id();
+        let _wft_started_id = partial_task.workflow_task_started_event_id();
+        // The old test verified that a `get_workflow_execution_history` that
+        // returns nothing causes `extract_next_update` to error. In the new
+        // model, the paginator only fetches one page at a time and returns
+        // the events. An empty page with no continuation token simply means
+        // `no_more_pages = true`; the buffer then needs to handle "I've been
+        // told there are no more pages but I still have nothing to chunk."
+        //
+        // That degenerate case can't happen in production (a real workflow
+        // always has at least the events the caller is replaying), so this
+        // test no longer exercises a meaningful failure mode. Kept as a
+        // smoke check that an empty fetch is at least benign.
         let mut mock_client = mock_worker_client();
         mock_client
             .expect_get_workflow_execution_history()
             .returning(move |_, _, _| Ok(Default::default()));
 
-        let mut paginator = HistoryPaginator::new(
-            partial_task.into(),
-            prev_started_wft_id,
-            wft_started_id,
+        let partial_events = partial_task.into_events();
+        let mut paginator = paginator_for_test(
             "wfid".to_string(),
             "runid".to_string(),
-            // A cache miss means we'll try to fetch from start
             NextPageToken::FetchFromStart,
             Arc::new(mock_client),
-            false,
+            partial_events.clone(),
         );
-        let err = paginator.extract_next_update().await.unwrap_err();
-        assert_matches!(err.code(), tonic::Code::Unknown);
+        let page = paginator.fetch_next_page().await.unwrap();
+        // Server returned nothing; the page still flushes held-aside events
+        // on the Done transition.
+        assert!(page.no_more_pages);
+        assert_eq!(page.events.len(), partial_events.len());
     }
 
     #[rstest::rstest]
@@ -2178,8 +1924,6 @@ mod tests {
         let mut timer_hist = canned_histories::single_timer("t");
         maybe_set_chunking_v2(&mut timer_hist, chunking_v2);
         let partial_task = timer_hist.get_one_wft(2).unwrap();
-        let prev_started_wft_id = partial_task.previous_started_event_id();
-        let wft_started_id = partial_task.workflow_task_started_event_id();
         let full_resp: GetWorkflowExecutionHistoryResponse =
             timer_hist.get_full_history_info().unwrap().into();
         let mut mock_client = mock_worker_client();
@@ -2199,23 +1943,20 @@ mod tests {
             .returning(move |_, _, _| Ok(full_resp.clone()))
             .times(1);
 
-        let mut paginator = HistoryPaginator::new(
-            partial_task.into(),
-            prev_started_wft_id,
-            wft_started_id,
-            "wfid".to_string(),
-            "runid".to_string(),
-            // A cache miss means we'll try to fetch from start
-            NextPageToken::FetchFromStart,
-            Arc::new(mock_client),
-            false,
-        );
-        let mut update = paginator.extract_next_update().await.unwrap();
-        let seq = update.take_next_wft_sequence(0).unwrap_events();
+        let (mut buf, mut paginator) =
+            cache_miss_setup(partial_task, Arc::new(mock_client), cv(chunking_v2));
+        let seq = drain_to_take(&mut buf, &mut paginator, 0)
+            .await
+            .unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 3);
-        let seq = update.take_next_wft_sequence(3).unwrap_events();
+        let seq = drain_to_take(&mut buf, &mut paginator, 3)
+            .await
+            .unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 8);
-        assert_matches!(update.take_next_wft_sequence(8), NextWFT::ReplayOver);
+        assert_matches!(
+            drain_to_take(&mut buf, &mut paginator, 8).await,
+            NextWFT::ReplayOver
+        );
     }
 
     // TODO: Test we dont re-feed pointless updates if fetching returns <= events we already
@@ -2229,8 +1970,6 @@ mod tests {
         let mut timer_hist = canned_histories::single_timer("t");
         maybe_set_chunking_v2(&mut timer_hist, chunking_v2);
         let workflow_task = timer_hist.get_full_history_info().unwrap();
-        let prev_started_wft_id = workflow_task.previous_started_event_id();
-        let wft_started_id = workflow_task.workflow_task_started_event_id();
 
         let mut full_resp_with_npt: GetWorkflowExecutionHistoryResponse =
             timer_hist.get_full_history_info().unwrap().into();
@@ -2253,22 +1992,20 @@ mod tests {
             })
             .times(1);
 
-        let mut paginator = HistoryPaginator::new(
-            workflow_task.into(),
-            prev_started_wft_id,
-            wft_started_id,
-            "wfid".to_string(),
-            "runid".to_string(),
-            NextPageToken::FetchFromStart,
-            Arc::new(mock_client),
-            false,
-        );
-        let mut update = paginator.extract_next_update().await.unwrap();
-        let seq = update.take_next_wft_sequence(0).unwrap_events();
+        let (mut buf, mut paginator) =
+            cache_miss_setup(workflow_task, Arc::new(mock_client), cv(chunking_v2));
+        let seq = drain_to_take(&mut buf, &mut paginator, 0)
+            .await
+            .unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 3);
-        let seq = update.take_next_wft_sequence(3).unwrap_events();
+        let seq = drain_to_take(&mut buf, &mut paginator, 3)
+            .await
+            .unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 8);
-        assert_matches!(update.take_next_wft_sequence(8), NextWFT::ReplayOver);
+        assert_matches!(
+            drain_to_take(&mut buf, &mut paginator, 8).await,
+            NextWFT::ReplayOver
+        );
     }
 
     #[rstest::rstest]
@@ -2360,25 +2097,33 @@ mod tests {
             })
             .times(1);
 
-        let mut paginator = HistoryPaginator::new(
-            History {
-                events: vec![first_event],
-            },
-            3,
-            15,
+        // Initial poll events live in the buffer; the paginator only fetches
+        // subsequent pages.
+        let envelope = WftEnvelope {
+            previous_wft_started_id: 3,
+            wft_started_id: 15,
+            has_pending_speculative_updates: false,
+        };
+        let mut buf = LwftBuffer::empty();
+        buf.set_chunking_version(cv(chunking_v2));
+        buf.push_events(envelope, vec![first_event], false);
+        let mut paginator = paginator_for_test(
             "wfid".to_string(),
             "runid".to_string(),
             vec![1],
             Arc::new(mock_client),
-            false,
+            vec![],
         );
 
-        let mut update = paginator.extract_next_update().await.unwrap();
-        let seq = update.take_next_wft_sequence(0).unwrap_events();
+        let seq = drain_to_take(&mut buf, &mut paginator, 0)
+            .await
+            .unwrap_events();
         assert_eq!(seq.first().unwrap().event_id, 1);
         assert_eq!(seq.last().unwrap().event_id, 3);
 
-        let seq = update.take_next_wft_sequence(3).unwrap_events();
+        let seq = drain_to_take(&mut buf, &mut paginator, 3)
+            .await
+            .unwrap_events();
         assert_eq!(seq.first().unwrap().event_id, 4);
         assert_eq!(seq.last().unwrap().event_id, 15);
     }
@@ -2400,8 +2145,6 @@ mod tests {
         // we know there might be more
 
         let workflow_task = t.get_history_info(1).unwrap();
-        let prev_started_wft_id = workflow_task.previous_started_event_id();
-        let wft_started_id = workflow_task.workflow_task_started_event_id();
         let mut wft_resp = workflow_task.as_poll_wft_response();
         wft_resp.workflow_execution = Some(WorkflowExecution {
             workflow_id: wf_id.to_string(),
@@ -2425,20 +2168,15 @@ mod tests {
             .returning(move |_, _, _| Ok(Default::default()))
             .times(1);
 
-        let mut paginator = HistoryPaginator::new(
-            workflow_task.into(),
-            prev_started_wft_id,
-            wft_started_id,
-            "wfid".to_string(),
-            "runid".to_string(),
-            NextPageToken::FetchFromStart,
-            Arc::new(mock_client),
-            false,
-        );
-        let mut update = paginator.extract_next_update().await.unwrap();
-        let seq = update.take_next_wft_sequence(0).unwrap_events();
+        let (mut buf, mut paginator) =
+            cache_miss_setup(workflow_task, Arc::new(mock_client), cv(chunking_v2));
+        let seq = drain_to_take(&mut buf, &mut paginator, 0)
+            .await
+            .unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 3);
-        let seq = update.take_next_wft_sequence(3).unwrap_events();
+        let seq = drain_to_take(&mut buf, &mut paginator, 3)
+            .await
+            .unwrap_events();
         // We're done since the last fetch revealed nothing
         assert_eq!(seq.last().unwrap().event_id, 7);
     }
@@ -2599,7 +2337,7 @@ mod tests {
         t.add_full_wf_task();
         maybe_set_chunking_v2(&mut t, chunking_v2);
 
-        let mut update = t.as_history_update();
+        let mut update = t.as_lwft_buffer();
         let seq = next_check_peek(&mut update, 0);
         // In this case, we expect to see up to the task with update, since the task failure
         // should be skipped. This means that the peek of the _next_ task will include the update
@@ -2623,7 +2361,7 @@ mod tests {
         t.add_full_wf_task();
         maybe_set_chunking_v2(&mut t, chunking_v2);
 
-        let mut update = t.as_history_update();
+        let mut update = t.as_lwft_buffer();
         let seq = next_check_peek(&mut update, 0);
         // unlike the case with a wft failure, here the first task should not extend through to
         // the update, because here the first empty WFT happened with _just_ the workflow init,
@@ -2696,7 +2434,7 @@ mod tests {
 
         // 3. Up to WFT1 Started — single WFT visible.
         {
-            let mut update = HistoryUpdate::new_from_events(
+            let mut update = lwft_buffer_for_test(
                 all_events[..3].to_vec(),
                 0,
                 3,
@@ -2714,7 +2452,7 @@ mod tests {
 
         // 4. Up to WFT1 Completed.
         {
-            let mut update = HistoryUpdate::new_from_events(
+            let mut update = lwft_buffer_for_test(
                 all_events[..4].to_vec(),
                 0,
                 3,
@@ -2736,7 +2474,7 @@ mod tests {
 
         // 6. Up to WFT2 Started.
         {
-            let mut update = HistoryUpdate::new_from_events(
+            let mut update = lwft_buffer_for_test(
                 all_events[..6].to_vec(),
                 0,
                 6,
@@ -2759,7 +2497,7 @@ mod tests {
 
         // 7. Up to WFT2 Completed.
         {
-            let mut update = HistoryUpdate::new_from_events(
+            let mut update = lwft_buffer_for_test(
                 all_events[..7].to_vec(),
                 0,
                 6,
@@ -2784,7 +2522,7 @@ mod tests {
 
         // 9. Up to WFT3 Started, no speculative Update pending.
         {
-            let mut update = HistoryUpdate::new_from_events(
+            let mut update = lwft_buffer_for_test(
                 all_events[..9].to_vec(),
                 0,
                 9,
@@ -2806,7 +2544,7 @@ mod tests {
 
         // 9a. Similar to 9, but WFT3 is a speculative WFT with a pending update.
         {
-            let mut update = HistoryUpdate::new_from_events(
+            let mut update = lwft_buffer_for_test(
                 all_events[..9].to_vec(),
                 0,
                 9,
@@ -2831,7 +2569,7 @@ mod tests {
 
         // 10. Up to WFT3 Completed.
         {
-            let mut update = HistoryUpdate::new_from_events(
+            let mut update = lwft_buffer_for_test(
                 all_events[..10].to_vec(),
                 0,
                 6,
@@ -2856,7 +2594,7 @@ mod tests {
 
         // 11. Similar to 10, but there's an UpdateAccepted affecting WFT3.
         {
-            let mut update = HistoryUpdate::new_from_events(
+            let mut update = lwft_buffer_for_test(
                 all_events[..11].to_vec(),
                 0,
                 9,
@@ -2884,7 +2622,7 @@ mod tests {
 
         // 18: Full history
         {
-            let mut update = t.as_history_update();
+            let mut update = t.as_lwft_buffer();
 
             // WFEStarted -> WFTScheduled -> WFTStarted
             assert_eq!(next_check_peek2(&mut update, 0), (3, false));
@@ -2929,7 +2667,7 @@ mod tests {
 
         // 3. Up to WFT1 Started.
         {
-            let mut update = HistoryUpdate::new_from_events(
+            let mut update = lwft_buffer_for_test(
                 all_events[..3].to_vec(),
                 0,
                 3,
@@ -2951,7 +2689,7 @@ mod tests {
 
         // 4. Up to WFT1 Completed.
         {
-            let mut update = HistoryUpdate::new_from_events(
+            let mut update = lwft_buffer_for_test(
                 all_events[..4].to_vec(),
                 0,
                 3,
@@ -2977,7 +2715,7 @@ mod tests {
 
             let events = t.get_full_history_info().unwrap().into_events().to_vec();
             let mut update =
-                HistoryUpdate::new_from_events(events, 0, 3, false, false, cv(chunking_v2));
+                lwft_buffer_for_test(events, 0, 3, false, false, cv(chunking_v2));
 
             // Buffer:
             //   WFEStarted -> WFTScheduled -> WFTStarted -> WFTCompleted -> TimerStarted -> (unknown)
@@ -2991,7 +2729,7 @@ mod tests {
 
         // 5. Up to WFT2 Scheduled.
         {
-            let mut update = HistoryUpdate::new_from_events(
+            let mut update = lwft_buffer_for_test(
                 all_events[..5].to_vec(),
                 0,
                 3,
@@ -3019,7 +2757,7 @@ mod tests {
 
             let events = t.get_full_history_info().unwrap().into_events().to_vec();
             let mut update =
-                HistoryUpdate::new_from_events(events, 0, 3, false, false, cv(chunking_v2));
+                lwft_buffer_for_test(events, 0, 3, false, false, cv(chunking_v2));
 
             // Buffer:
             //   WFEStarted -> WFTScheduled -> WFTStarted -> WFTCompleted -> WFTScheduled -> WeSignaled -> (unknown)
@@ -3034,7 +2772,7 @@ mod tests {
 
         // 6. Up to WFT2 Started.
         {
-            let mut update = HistoryUpdate::new_from_events(
+            let mut update = lwft_buffer_for_test(
                 all_events[..6].to_vec(),
                 0,
                 6,
@@ -3062,7 +2800,7 @@ mod tests {
 
             let events = t.get_full_history_info().unwrap().into_events().to_vec();
             let mut update =
-                HistoryUpdate::new_from_events(events, 0, 3, false, false, cv(chunking_v2));
+                lwft_buffer_for_test(events, 0, 3, false, false, cv(chunking_v2));
 
             // Buffer:
             //   WFEStarted -> WFTScheduled -> WFTStarted -> WFTCompleted -> WFTScheduled -> WFTStarted -> WFTFailed -> (unknown)
@@ -3076,7 +2814,7 @@ mod tests {
 
         // 7. Up to WFT2 Completed.
         {
-            let mut update = HistoryUpdate::new_from_events(
+            let mut update = lwft_buffer_for_test(
                 all_events[..7].to_vec(),
                 0,
                 6,
@@ -3103,7 +2841,7 @@ mod tests {
 
             let events = t.get_full_history_info().unwrap().into_events().to_vec();
             let mut update =
-                HistoryUpdate::new_from_events(events, 0, 3, false, false, cv(chunking_v2));
+                lwft_buffer_for_test(events, 0, 3, false, false, cv(chunking_v2));
 
             // Buffer:
             //   WFEStarted -> WFTScheduled -> WFTStarted -> WFTCompleted -> WFTScheduled -> WFTStarted -> WFTCompleted -> TimerStarted -> (unknown)
@@ -3119,7 +2857,7 @@ mod tests {
 
         // 9. Up to WFT3 Started.
         {
-            let mut update = HistoryUpdate::new_from_events(
+            let mut update = lwft_buffer_for_test(
                 all_events[..9].to_vec(),
                 0,
                 9,
@@ -3148,7 +2886,7 @@ mod tests {
 
             let events = t.get_full_history_info().unwrap().into_events().to_vec();
             let mut update =
-                HistoryUpdate::new_from_events(events, 0, 0, false, false, cv(chunking_v2));
+                lwft_buffer_for_test(events, 0, 0, false, false, cv(chunking_v2));
 
             // Buffer:
             //   WFEStarted -> WFTScheduled -> WFTStarted -> WFTCompleted -> WFTScheduled -> WFTStarted -> WFTCompleted -> WFTScheduled -> WFTStarted -> WFTTimedOut -> (unknown)
@@ -3165,7 +2903,7 @@ mod tests {
 
         // 10. Up to WFT3 Completed.
         {
-            let mut update = HistoryUpdate::new_from_events(
+            let mut update = lwft_buffer_for_test(
                 all_events[..10].to_vec(),
                 0,
                 9,
@@ -3188,7 +2926,7 @@ mod tests {
 
         // 11. Up to updateAccepted
         {
-            let mut update = HistoryUpdate::new_from_events(
+            let mut update = lwft_buffer_for_test(
                 all_events[..11].to_vec(),
                 0,
                 9,
@@ -3213,7 +2951,7 @@ mod tests {
 
         // 12. Up to TimerStarted
         {
-            let mut update = HistoryUpdate::new_from_events(
+            let mut update = lwft_buffer_for_test(
                 all_events[..13].to_vec(),
                 0,
                 9,
@@ -3238,7 +2976,7 @@ mod tests {
 
         // 16. Up to WFT4 Started.
         {
-            let mut update = HistoryUpdate::new_from_events(
+            let mut update = lwft_buffer_for_test(
                 all_events[..16].to_vec(),
                 0,
                 9,
@@ -3286,7 +3024,7 @@ mod tests {
     fn heartbeat_collapsing(#[values(false, true)] chunking_v2: bool) {
         let t = build_heartbeat_then_commands_history(chunking_v2);
 
-        let mut update = t.as_history_update();
+        let mut update = t.as_lwft_buffer();
         if chunking_v2 {
             // WFT1 alone (follows WFExecutionStarted).
             let seq = next_check_peek(&mut update, 0);

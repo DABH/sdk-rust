@@ -24,9 +24,8 @@ use crate::{
     worker::{
         ExecutingLAId, LocalActRequest, LocalActivityExecutionResult, LocalActivityResolution,
         workflow::{
-            CommandID, DrivenWorkflow, HistoryUpdate, InternalFlagsRef, LocalResolution,
-            OutgoingJob, RunBasics, WFCommand, WFCommandVariant, WFMachinesError,
-            WorkflowStartedInfo, fatal,
+            CommandID, DrivenWorkflow, InternalFlagsRef, LocalResolution, OutgoingJob, RunBasics,
+            WFCommand, WFCommandVariant, WFMachinesError, WftEnvelope, WorkflowStartedInfo, fatal,
             history_update::{ChunkingVersion, LwftBuffer, NextWFT},
             machines::{
                 HistEventData, activity_state_machine::ActivityMachine,
@@ -272,31 +271,33 @@ macro_rules! cancel_machine {
 
 impl WorkflowMachines {
     pub(crate) fn new(basics: RunBasics, driven_wf: DrivenWorkflow) -> Self {
-        let replaying = basics.history.previous_wft_started_id > 0;
         let mut observed_internal_flags = InternalFlags::new(
             basics.capabilities,
             basics.sdk_name.to_owned(),
             basics.sdk_version.to_owned(),
         );
-        // Peek ahead to determine used flags in the first WFT.
-        if let Some(attrs) = basics.history.peek_next_wft_completed(0) {
-            observed_internal_flags.add_from_complete(attrs);
-        } else {
-            // There's not even a single WFT Completed event for this workflow, which implies
-            // that 1) this is the first WFT and 2) we're not replaying. That's a good time to
-            // set all flags that should be set but can only be set on the first WFT.
-            observed_internal_flags.write_all_cumulative_default_enabled(true);
-        };
+        // The buffer starts empty. The first `push_events` call (via the
+        // first `new_work_from_server`) brings in events and the envelope.
+        // Fresh runs have no events yet, so we can't peek at any
+        // WFTCompleted for internal-flag bootstrap; set the
+        // first-WFT-only default flags (which is the original codepath for
+        // workflows that have never seen a WFT before).
+        //
+        // Note: for cache-miss replays (existing run, first push will carry
+        // real events), the first push's `push_events` will pull the
+        // observed flags into the buffer's `chunking_version` via
+        // `sync_chunking_version_from_observed_flags`, called below.
+        observed_internal_flags.write_all_cumulative_default_enabled(true);
         let mut lwft_buffer = LwftBuffer::empty();
-        lwft_buffer.replace_inner(basics.history);
         // Seed the buffer's chunking version from anything `observed_internal_flags`
-        // has already learned. For freshly-created runs whose flags are filled
-        // from `write_all_cumulative_default_enabled` above, this picks up the
-        // `WftChunkingV2` opt-in. For cache-miss replays the value will be
-        // refined as the first WFTCompleted is applied.
+        // has already learned (e.g. the `WftChunkingV2` opt-in for newly
+        // started workflows).
         if observed_internal_flags.try_use(CoreInternalFlags::WftChunkingV2, false) {
             lwft_buffer.set_chunking_version(ChunkingVersion::V2);
         }
+        // Replaying starts false; the first push will set this correctly via
+        // its envelope.
+        let replaying = false;
         Self {
             lwft_buffer,
             protocol_msgs: vec![],
@@ -348,36 +349,66 @@ impl WorkflowMachines {
             .and_then(|(st, et)| et.duration_since(st).ok())
     }
 
-    /// Must be called every time a new WFT is received
+    /// Must be called every time a new WFT is received. Pushes the WFT's
+    /// events into the buffer (which will chunk them lazily on demand) and
+    /// kicks off the apply loop.
     pub(crate) fn new_work_from_server(
         &mut self,
-        update: HistoryUpdate,
+        envelope: WftEnvelope,
+        events: Vec<HistoryEvent>,
+        no_more_pages: bool,
         protocol_messages: Vec<IncomingProtocolMessage>,
     ) -> Result<()> {
         if !self.protocol_msgs.is_empty() {
             dbg_panic!("There are unprocessed protocol messages while receiving new work");
         }
         self.protocol_msgs = protocol_messages;
-        self.new_history_from_server(update)?;
-        Ok(())
-    }
-
-    pub(crate) fn new_history_from_server(&mut self, update: HistoryUpdate) -> Result<()> {
-        self.lwft_buffer.replace_inner(update);
-        self.sync_chunking_version_from_observed_flags();
-        self.replaying = self.lwft_buffer.previous_wft_started_id() > 0;
+        self.push_events_into_buffer(envelope, events, no_more_pages);
         self.apply_next_wft_from_history()?;
         Ok(())
     }
 
+    /// Called when a follow-up page of history has been fetched for the
+    /// current poll. Pushes the events into the buffer and ensures the
+    /// chunking-version state is in sync with the latest observed flags.
+    /// Does *not* attempt to apply — that's done by the caller's subsequent
+    /// completion-processing path.
+    pub(crate) fn feed_history_from_new_page(
+        &mut self,
+        envelope: WftEnvelope,
+        events: Vec<HistoryEvent>,
+        no_more_pages: bool,
+    ) -> Result<()> {
+        self.push_events_into_buffer(envelope, events, no_more_pages);
+        Ok(())
+    }
+
+    fn push_events_into_buffer(
+        &mut self,
+        envelope: WftEnvelope,
+        events: Vec<HistoryEvent>,
+        no_more_pages: bool,
+    ) {
+        self.lwft_buffer.push_events(envelope, events, no_more_pages);
+        self.sync_chunking_version_from_observed_flags();
+        // The buffer's envelope (just-pushed) carries the authoritative
+        // `previous_wft_started_id` for the current poll. Replay status
+        // tracks whether this poll is catching up to an earlier WFT state.
+        self.replaying = self.lwft_buffer.previous_wft_started_id() > 0;
+    }
+
+    /// The envelope from the buffer's most-recent push. Used by `ManagedRun`
+    /// when constructing a `NextPageReq` so fetched-page events can be
+    /// re-paired with their envelope on the way back.
+    pub(crate) fn current_wft_envelope(&self) -> WftEnvelope {
+        self.lwft_buffer.envelope()
+    }
+
     /// Refresh the buffer's chunking version from `observed_internal_flags`,
     /// our authoritative source for which `CoreInternalFlags` apply to this
-    /// run. This is what closes the cached-incremental-poll hole: the
-    /// paginator that built the most-recent `HistoryUpdate` likely never saw
-    /// event 1's `WorkflowTaskCompleted`, so its detected version is V1 by
-    /// default — but we (the WFM) have been observing every applied WFT and
-    /// know the truth. Pushing that truth down to the buffer ensures
-    /// subsequent chunker calls run with the correct version.
+    /// run. Called before each chunker invocation to ensure cached-incremental
+    /// polls (where the per-poll paginator never sees event 1's
+    /// `WorkflowTaskCompleted`) get the run-level V2 answer.
     fn sync_chunking_version_from_observed_flags(&mut self) {
         if self
             .observed_internal_flags
