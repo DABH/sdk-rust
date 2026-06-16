@@ -259,6 +259,11 @@ pub struct WorkerOptions {
     /// channels, etc.) will have their tasks failed with a descriptive error.
     #[builder(default = true)]
     pub detect_nondeterministic_futures: bool,
+    /// If set true, the worker will not proactively fail workflow/activity tasks whose payloads
+    /// exceed the namespace error limits; oversized payloads are sent to server, which enforces the
+    /// limit. Defaults to false.
+    #[builder(default = false)]
+    pub disable_payload_error_limit: bool,
 }
 
 impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
@@ -428,6 +433,7 @@ impl WorkerOptions {
             ))
             .workflow_failure_errors(self.workflow_failure_errors.clone())
             .workflow_types_to_failure_errors(self.workflow_types_to_failure_errors.clone())
+            .disable_payload_error_limit(self.disable_payload_error_limit)
             .build()
     }
 }
@@ -1372,5 +1378,23 @@ mod tests {
             .to_core_options("ns".into(), connection_identity.into())
             .unwrap();
         assert_eq!(config.client_identity_override, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::default_enforces_error_limit(None, false)]
+    #[case::opt_out_disables_error_limit(Some(true), true)]
+    #[case::explicit_enable_error_limit(Some(false), false)]
+    #[test]
+    fn disable_payload_error_limit_propagates(
+        #[case] override_value: Option<bool>,
+        #[case] expected: bool,
+    ) {
+        let config = WorkerOptions::new("task_q")
+            .task_types(WorkerTaskTypes::activity_only())
+            .maybe_disable_payload_error_limit(override_value)
+            .build()
+            .to_core_options("ns".into(), String::new())
+            .unwrap();
+        assert_eq!(config.disable_payload_error_limit, expected);
     }
 }

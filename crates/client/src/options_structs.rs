@@ -85,6 +85,10 @@ pub struct ConnectionOptions {
     /// If service_override is specified, is forced to `None`.
     #[builder(default)]
     pub grpc_compression: GrpcCompression,
+    /// Payload size limit options for this connection. Defaults to the standard warning thresholds;
+    /// disable an individual warning by setting its threshold to `0`.
+    #[builder(default)]
+    pub payload_limits: PayloadLimitsOptions,
 
     // Internal / Core-based SDK only options below =============================================
     /// If set true, get_system_info will not be called upon connection.
@@ -241,6 +245,26 @@ impl Default for DnsLoadBalancingOptions {
     fn default() -> Self {
         Self {
             resolution_interval: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Payload size limit options for a connection.
+#[derive(Clone, Debug)]
+pub struct PayloadLimitsOptions {
+    /// Warning threshold (bytes) for the size of an outbound payload-bearing field; over-threshold
+    /// fields are logged but still sent to server. Defaults to 512 KiB. Set to `0` to disable.
+    pub payloads_size_warn: u64,
+    /// Warning threshold (bytes) for outbound memo sizes; over-threshold memos are logged but still
+    /// sent to server. Defaults to 2 KiB. Set to `0` to disable.
+    pub memo_size_warn: u64,
+}
+
+impl Default for PayloadLimitsOptions {
+    fn default() -> Self {
+        Self {
+            payloads_size_warn: 512 * 1024,
+            memo_size_warn: 2 * 1024,
         }
     }
 }

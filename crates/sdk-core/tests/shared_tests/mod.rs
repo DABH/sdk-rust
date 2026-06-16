@@ -243,6 +243,7 @@ pub(crate) async fn grpc_message_too_large() {
         .await
         .unwrap();
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter.sdk_config.disable_payload_error_limit = true;
     starter
         .sdk_config
         .register_workflow_with_factory(move || OversizeGrpcMessageWf {

@@ -54,6 +54,12 @@ pub struct ConnectionOptions {
     /// default. Ignored when grpc_override_callback is set, since that transport cannot decode
     /// compressed request bodies.
     pub grpc_compression: ClientGrpcCompression,
+    /// Warning threshold (bytes) for the size of an outbound payload-bearing field.
+    /// Over-threshold fields are logged but still sent to server. 0 disables the warning.
+    pub payloads_size_warn: u64,
+    /// Warning threshold (bytes) for outbound memo size. Over-threshold memos are logged but still
+    /// sent to server. 0 disables the warning.
+    pub memo_size_warn: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -1454,6 +1460,10 @@ impl TryFrom<&ConnectionOptions> for temporalio_client::ConnectionOptions {
                     ClientGrpcCompression::Gzip => temporalio_client::GrpcCompression::Gzip,
                     ClientGrpcCompression::None => temporalio_client::GrpcCompression::None,
                 })
+                .payload_limits(temporalio_client::PayloadLimitsOptions {
+                    payloads_size_warn: opts.payloads_size_warn,
+                    memo_size_warn: opts.memo_size_warn,
+                })
                 .build(),
         )
     }
@@ -1566,6 +1576,8 @@ mod tests {
             grpc_override_callback_user_data: std::ptr::null_mut(),
             dns_load_balancing_options: std::ptr::null(),
             grpc_compression: ClientGrpcCompression::Gzip,
+            payloads_size_warn: 0,
+            memo_size_warn: 0,
         }
     }
 

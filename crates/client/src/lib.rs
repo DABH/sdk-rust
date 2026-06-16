@@ -29,6 +29,7 @@ pub mod worker;
 mod workflow_handle;
 
 pub use crate::{
+    grpc::{PayloadErrorLimits, PayloadLimitsClient},
     proxy::HttpConnectProxyOptions,
     retry::{CallType, RETRYABLE_ERROR_CODES},
 };
@@ -128,6 +129,14 @@ static TEMPORAL_NAMESPACE_HEADER_KEY: &str = "temporal-namespace";
 /// Key used to communicate when a GRPC message is too large
 pub static MESSAGE_TOO_LARGE_KEY: &str = "message-too-large";
 #[doc(hidden)]
+/// The violation, if `status` is the client proactively rejecting an outbound request for exceeding a
+/// payload/memo error size limit.
+pub fn payload_limit_violation_from(
+    status: &tonic::Status,
+) -> Option<&temporalio_common::payload_limits::PayloadLimitViolation> {
+    std::error::Error::source(status).and_then(|src| src.downcast_ref())
+}
+#[doc(hidden)]
 /// Key used to indicate a error was returned by the retryer because of the short-circuit predicate
 pub static ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT: &str = "short-circuit";
 
@@ -157,6 +166,28 @@ struct ConnectionInner {
     capabilities: Option<get_system_info_response::Capabilities>,
     workers: Arc<ClientWorkerSet>,
     _dns_task: Option<Arc<dns::DnsReresolutionHandle>>,
+    /// Configured payload/memo size warning thresholds (bytes); `None` disables that warning.
+    payloads_size_warn: Option<usize>,
+    memo_size_warn: Option<usize>,
+}
+
+/// Resolve a user-configured warning threshold (bytes) into the internal representation. `0`
+/// disables the warning (`None`); so does a value that doesn't fit in `usize` on this platform (a
+/// threshold larger than any addressable payload could never fire anyway), with a warning logged.
+/// `option` names the configured field, for diagnostics.
+fn resolve_warn_threshold(option: &'static str, bytes: u64) -> Option<usize> {
+    if bytes == 0 {
+        return None;
+    }
+    usize::try_from(bytes).ok().or_else(|| {
+        warn!(
+            option,
+            configured_bytes = bytes,
+            "Configured payload size warning threshold exceeds the maximum addressable size on this \
+             platform; disabling this warning"
+        );
+        None
+    })
 }
 
 impl Connection {
@@ -273,6 +304,14 @@ impl Connection {
                 capabilities,
                 workers: Arc::new(ClientWorkerSet::new()),
                 _dns_task: dns_task,
+                payloads_size_warn: resolve_warn_threshold(
+                    "payloads_size_warn",
+                    options.payload_limits.payloads_size_warn,
+                ),
+                memo_size_warn: resolve_warn_threshold(
+                    "memo_size_warn",
+                    options.payload_limits.memo_size_warn,
+                ),
             }),
         })
     }

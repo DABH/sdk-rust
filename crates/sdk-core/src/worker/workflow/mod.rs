@@ -58,8 +58,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use temporalio_client::MESSAGE_TOO_LARGE_KEY;
+use temporalio_client::{MESSAGE_TOO_LARGE_KEY, payload_limit_violation_from};
 use temporalio_common::{
+    payload_limits::PayloadLimitViolation,
     protos::{
         TaskToken,
         coresdk::{
@@ -339,6 +340,7 @@ impl Workflows {
         match report {
             ServerCommandsWithWorkflowInfo {
                 task_token,
+                workflow_type,
                 action:
                     ActivationAction::WftComplete {
                         mut commands,
@@ -351,6 +353,9 @@ impl Workflows {
                     },
                 metrics: run_metrics,
             } => {
+                let span = tracing::Span::current();
+                span.record("workflow_type", workflow_type.as_str());
+                span.record("attempt", attempt as i64);
                 let reserved_act_permits =
                     self.reserve_activity_slots_for_outgoing_commands(commands.as_mut_slice());
                 debug!(commands=%commands.display(), query_responses=%query_responses.display(),
@@ -424,6 +429,26 @@ impl Workflows {
                             run_metrics
                                 .with_new_attrs([metrics::failure_reason(
                                     FailureReason::GrpcMessageTooLarge,
+                                )])
+                                .wf_task_failed();
+                            return Err(e);
+                        }
+                        // Client layer rejected the completion for exceeding the worker's payload
+                        // error limit; proactively fail the WFT instead.
+                        Err(e) if payload_limit_violation_from(&e).is_some() => {
+                            let violation = payload_limit_violation_from(&e)
+                                .expect("violation present per guard");
+                            let failure = make_payloads_too_large_failure(violation);
+                            let new_outcome = FailedActivationWFTReport::Report(
+                                task_token,
+                                WorkflowTaskFailedCause::PayloadsTooLarge,
+                                failure,
+                            );
+                            self.handle_activation_failed(run_id, completion_time, new_outcome)
+                                .await;
+                            run_metrics
+                                .with_new_attrs([metrics::failure_reason(
+                                    FailureReason::PayloadsTooLarge,
                                 )])
                                 .wf_task_failed();
                             return Err(e);
@@ -1016,6 +1041,8 @@ enum FailedActivationWFTReport {
 
 struct ServerCommandsWithWorkflowInfo {
     task_token: TaskToken,
+    /// Kept for tracing context on the completion (the run's span lacks workflow type/attempt).
+    workflow_type: String,
     action: ActivationAction,
     metrics: MetricsContext,
 }
@@ -1725,11 +1752,54 @@ fn make_grpc_message_too_large_failure() -> Failure {
     }
 }
 
+fn make_payloads_too_large_failure(violation: &PayloadLimitViolation) -> Failure {
+    Failure {
+        failure: Some(
+            temporalio_common::protos::temporal::api::failure::v1::Failure {
+                message: violation.to_string(),
+                failure_info: Some(FailureInfo::ApplicationFailureInfo(
+                    ApplicationFailureInfo {
+                        r#type: crate::worker::PAYLOADS_TOO_LARGE_FAILURE_TYPE.to_string(),
+                        non_retryable: false,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            },
+        ),
+        force_cause: WorkflowTaskFailedCause::PayloadsTooLarge as i32,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use itertools::Itertools;
+    use temporalio_common::payload_limits::{LimitClass, LimitSeverity};
     use temporalio_common::protos::coresdk::workflow_activation::SignalWorkflow;
+
+    #[test]
+    fn payloads_too_large_wft_failure_is_retryable() {
+        let violation = PayloadLimitViolation {
+            path: "input".to_string(),
+            class: LimitClass::Blob,
+            severity: LimitSeverity::Error,
+            size: 1024,
+            limit: 10,
+        };
+        let failure = make_payloads_too_large_failure(&violation);
+        assert_eq!(
+            failure.force_cause,
+            WorkflowTaskFailedCause::PayloadsTooLarge as i32
+        );
+        let Some(FailureInfo::ApplicationFailureInfo(afi)) =
+            &failure.failure.as_ref().unwrap().failure_info
+        else {
+            panic!("expected application failure info");
+        };
+        assert_eq!(afi.r#type, crate::worker::PAYLOADS_TOO_LARGE_FAILURE_TYPE);
+        assert!(!afi.non_retryable);
+    }
 
     #[test]
     fn jobs_sort() {

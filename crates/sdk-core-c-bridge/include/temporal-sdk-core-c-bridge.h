@@ -197,6 +197,16 @@ typedef struct TemporalCoreConnectionOptions {
    * compressed request bodies.
    */
   enum TemporalCoreClientGrpcCompression grpc_compression;
+  /**
+   * Warning threshold (bytes) for the size of an outbound payload-bearing field.
+   * Over-threshold fields are logged but still sent to server. 0 disables the warning.
+   */
+  uint64_t payloads_size_warn;
+  /**
+   * Warning threshold (bytes) for outbound memo size. Over-threshold memos are logged but still
+   * sent to server. 0 disables the warning.
+   */
+  uint64_t memo_size_warn;
 } TemporalCoreConnectionOptions;
 
 typedef struct TemporalCoreByteArray {
@@ -821,6 +831,7 @@ typedef struct TemporalCoreWorkerOptions {
   struct TemporalCoreByteArrayRefArray nondeterminism_as_workflow_fail_for_types;
   struct TemporalCoreByteArrayRefArray plugins;
   struct TemporalCoreByteArrayRefArray storage_drivers;
+  bool disable_payload_error_limit;
 } TemporalCoreWorkerOptions;
 
 /**

@@ -52,6 +52,7 @@ pub struct WorkerOptions {
     pub nondeterminism_as_workflow_fail_for_types: ByteArrayRefArray,
     pub plugins: ByteArrayRefArray,
     pub storage_drivers: ByteArrayRefArray,
+    pub disable_payload_error_limit: bool,
 }
 
 #[repr(C)]
@@ -1287,6 +1288,7 @@ impl TryFrom<&WorkerOptions> for temporalio_sdk_core::WorkerConfig {
                     })
                     .collect::<HashSet<_>>(),
             )
+            .disable_payload_error_limit(opt.disable_payload_error_limit)
             .build()
             .map_err(|err| anyhow::anyhow!(err))
     }
@@ -1440,6 +1442,7 @@ mod tests {
             nondeterminism_as_workflow_fail_for_types: crate::ByteArrayRefArray::empty(),
             plugins: crate::ByteArrayRefArray::empty(),
             storage_drivers: crate::ByteArrayRefArray::empty(),
+            disable_payload_error_limit: false,
         }
     }
 
