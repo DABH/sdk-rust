@@ -800,6 +800,7 @@ where
             ),
         ),
         user_metadata: Default::default(),
+        event_group_markers: Default::default(),
     };
     ActivityMachineTransition::ok(
         vec![ActivityMachineCommand::RequestCancellation(cmd)],

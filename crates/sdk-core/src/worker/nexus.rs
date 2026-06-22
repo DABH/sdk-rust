@@ -212,6 +212,29 @@ impl NexusManager {
                                 });
                             }
                         }
+                        Some(response::Variant::Completion(comp)) => {
+                            if task_info.request_kind != RequestKind::Completion {
+                                return Err(CompleteNexusError::MalformedNexusCompletion {
+                                    reason: "Nexus response was Completion but request was not"
+                                        .to_string(),
+                                });
+                            }
+                            // A set failure means the handler failed to process the
+                            // completion. An unset failure acknowledges it successfully.
+                            if let Some(f) = comp.failure.as_ref() {
+                                let reason = match &f.failure_info {
+                                    Some(FailureInfo::NexusHandlerFailureInfo(info)) => {
+                                        info.r#type.clone()
+                                    }
+                                    _ => f.message.clone(),
+                                };
+                                self.metrics
+                                    .with_new_attrs([metrics::failure_reason(
+                                        FailureReason::NexusHandlerError(reason),
+                                    )])
+                                    .nexus_task_execution_failed();
+                            }
+                        }
                         None => {
                             return Err(CompleteNexusError::MalformedNexusCompletion {
                                 reason: "Nexus completion must contain a status variant "
@@ -436,6 +459,11 @@ where
                                         c.operation.to_owned(),
                                         RequestKind::Cancel,
                                     ),
+                                    Variant::Completion(c) => (
+                                        c.service.to_owned(),
+                                        c.operation.to_owned(),
+                                        RequestKind::Completion,
+                                    ),
                                 })
                                 .unwrap_or_default();
 
@@ -525,6 +553,7 @@ enum RequestKind {
     #[default]
     Start,
     Cancel,
+    Completion,
 }
 
 #[derive(derive_more::From)]
