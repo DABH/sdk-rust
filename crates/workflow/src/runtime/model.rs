@@ -3,11 +3,10 @@
 use crate::{
     runtime::types::ContinueAsNewRequest,
     workflow_context::{
-        ChildWfCommon, NexusUnblockData, PendingChildWorkflow, StartedNexusOperation,
+        ChildWfCommon, NexusUnblockData, StartChildWorkflowExecutionResult, StartedNexusOperation,
     },
 };
 use temporalio_common_wasm::{
-    WorkflowDefinition,
     error::{
         ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
         WorkflowSignalError,
@@ -87,7 +86,7 @@ impl Unblockable for ActivityResolution {
     }
 }
 
-impl<WD: WorkflowDefinition> Unblockable for PendingChildWorkflow<WD> {
+impl Unblockable for StartChildWorkflowExecutionResult {
     type OtherDat = ChildWfCommon;
 
     fn unblock(ue: UnblockEvent, od: Self::OtherDat) -> Self {
@@ -95,7 +94,6 @@ impl<WD: WorkflowDefinition> Unblockable for PendingChildWorkflow<WD> {
             UnblockEvent::WorkflowStart(_, result) => Self {
                 status: *result,
                 common: od,
-                _phantom: std::marker::PhantomData,
             },
             _ => panic!("Invalid unblock event for child workflow start"),
         }

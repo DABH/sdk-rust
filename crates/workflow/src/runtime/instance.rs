@@ -2,7 +2,9 @@
 
 use crate::{
     BaseWorkflowContext, WorkflowContext,
-    interceptors::{ExecuteInput, HandleQueryInput, HandleSignalInput, WorkflowValue},
+    interceptors::{
+        ExecuteInput, HandleQueryInput, HandleSignalInput, HandleUpdateInput, ValidateUpdateInput,
+    },
     runtime::{
         entry::{WorkflowError, WorkflowImplementation},
         guest::WorkflowInstance,
@@ -145,7 +147,7 @@ where
     ) -> Self {
         let input = ExecuteInput::new(
             W::name().to_string(),
-            WorkflowValue::new(input),
+            input,
             base_ctx.initial_headers(),
             base_ctx.workflow_interceptor_context(base_ctx.is_replaying()),
         );
@@ -157,8 +159,7 @@ where
             .workflow_interceptors()
             .execute(input, move |input| {
                 let typed = input
-                    .into_args()
-                    .into_typed::<<W::Run as WorkflowDefinition>::Input>()
+                    .into_args::<<W::Run as WorkflowDefinition>::Input>()
                     .unwrap_or_else(|_| {
                         panic!(
                             "execute interceptor must preserve workflow input type {}",
@@ -248,30 +249,32 @@ where
     }
 
     fn start_signal_routine(&mut self, signal: SignalWorkflow) -> ActivationJobResult {
-        let name = signal.signal_name.clone();
+        let name = signal.signal_name;
+        let payloads = Payloads {
+            payloads: signal.input,
+        };
         let converter = self.ctx.payload_converter();
-        let ctx = self.ctx.clone();
-        let input = HandleSignalInput::new(
-            signal.signal_name,
-            signal.input,
-            signal.headers,
-            self.base_ctx
-                .workflow_interceptor_context(self.base_ctx.is_replaying()),
-        );
-        let future = self
-            .base_ctx
-            .workflow_interceptors()
-            .handle_signal(input, |input| {
-                let (name, payloads, headers) = input.into_parts();
-                match W::decode_signal_input(&name, payloads, converter) {
-                    Ok(Some(decoded_input)) => {
+        let future = match W::decode_signal_input(&name, payloads, converter) {
+            Ok(Some(decoded_input)) => {
+                let ctx = self.ctx.clone();
+                let input = HandleSignalInput::new(
+                    name.clone(),
+                    decoded_input,
+                    signal.headers,
+                    self.base_ctx
+                        .workflow_interceptor_context(self.base_ctx.is_replaying()),
+                );
+                self.base_ctx
+                    .workflow_interceptors()
+                    .handle_signal(input, |input| {
+                        let (name, decoded_input, headers) = input.into_parts();
                         let ctx = ctx.with_headers(headers);
                         W::dispatch_signal(ctx, &name, decoded_input)
-                    }
-                    Err(err) => ready(Err(err)).boxed_local(),
-                    Ok(None) => ready(Ok(())).boxed_local(),
-                }
-            });
+                    })
+            }
+            Err(err) => ready(Err(err)).boxed_local(),
+            Ok(None) => return ActivationJobResult::None,
+        };
         let routine_id = self.next_routine_id();
         self.routines
             .insert(routine_id, GuestRoutine::Signal { future });
@@ -317,26 +320,56 @@ where
                     return self.rejection_for_missing_update_handler(name);
                 }
             };
-            let view = self.ctx.view();
-            let validation = self
-                .ctx
-                .state(|wf| wf.validate_update(view, &name, decoded_input));
+            let ctx = self.ctx.clone();
+            let validation_input = ValidateUpdateInput::new(
+                name.clone(),
+                decoded_input,
+                headers.clone(),
+                self.base_ctx
+                    .workflow_interceptor_context(self.base_ctx.is_replaying()),
+            );
+            let validation =
+                self.base_ctx
+                    .workflow_interceptors()
+                    .validate_update(validation_input, |input| {
+                        let (name, decoded_input, _headers) = input.into_parts();
+                        let view = ctx.view();
+                        Some(ctx.state(|wf| wf.validate_update(view, &name, decoded_input)))
+                    });
             match validation {
-                Ok(()) => {}
-                Err(e) => {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
                     return ActivationJobResult::UpdateRejected(Box::new(
                         self.workflow_error_to_failure(e),
                     ));
                 }
+                None => return self.rejection_for_missing_update_handler(name),
             }
         }
 
         let payloads = Payloads { payloads: input };
         let converter = self.ctx.payload_converter();
         let future = match W::decode_update_input(&name, payloads, converter) {
-            Ok(Some(input)) => {
-                let ctx = self.ctx.with_headers(headers);
-                W::dispatch_update(ctx, &name, input, converter)
+            Ok(Some(decoded_input)) => {
+                let ctx = self.ctx.clone();
+                let update_input = HandleUpdateInput::new(
+                    name.clone(),
+                    decoded_input,
+                    headers,
+                    self.base_ctx
+                        .workflow_interceptor_context(self.base_ctx.is_replaying()),
+                );
+                match self
+                    .base_ctx
+                    .workflow_interceptors()
+                    .handle_update(update_input, |input| {
+                        let (name, decoded_input, headers) = input.into_parts();
+                        let ctx = ctx.with_headers(headers);
+                        Some(W::dispatch_update(ctx, &name, decoded_input, converter))
+                    }) {
+                    Some(future) => future,
+                    None => return self.rejection_for_missing_update_handler(name),
+                }
             }
             Err(err) => ready(Err(err)).boxed_local(),
             Ok(None) => {
@@ -367,9 +400,28 @@ where
         }
 
         let converter = self.ctx.payload_converter();
+        let payloads = Payloads {
+            payloads: query.arguments,
+        };
+        let decoded_input = match W::decode_query_input(&query.query_type, &payloads, converter) {
+            Ok(Some(input)) => input,
+            Err(err) => {
+                return QueryResponse {
+                    result: Err(self.workflow_error_to_failure(err)),
+                };
+            }
+            Ok(None) => {
+                return QueryResponse {
+                    result: Err(self.message_to_failure(format!(
+                        "No query handler for '{}'",
+                        query.query_type
+                    ))),
+                };
+            }
+        };
         let input = HandleQueryInput::new(
             query.query_type.clone(),
-            query.arguments,
+            decoded_input,
             query.headers,
             self.base_ctx.workflow_interceptor_context(false),
         );
@@ -379,19 +431,9 @@ where
                 .base_ctx
                 .workflow_interceptors()
                 .handle_query(input, |input| {
-                    let (query_type, payloads, headers) = input.into_parts();
+                    let (query_type, decoded_input, headers) = input.into_parts();
                     let view = ctx.with_headers(headers).view();
-                    match W::decode_query_input(&query_type, &payloads, converter) {
-                        Ok(Some(decoded_input)) => {
-                            ctx.state(|wf| {
-                                wf.dispatch_query(view, &query_type, decoded_input, converter)
-                            })
-                        }
-                        Err(err) => Err(err),
-                        Ok(None) => Err(WorkflowError::Execution(Box::new(
-                            ApplicationFailure::new(format!("No query handler for '{query_type}'")),
-                        ))),
-                    }
+                    ctx.state(|wf| wf.dispatch_query(view, &query_type, decoded_input, converter))
                 })
                 .map_err(|err| self.workflow_error_to_failure(err)),
         }

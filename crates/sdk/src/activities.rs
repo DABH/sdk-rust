@@ -51,7 +51,7 @@ pub use temporalio_macros::activities;
 
 use crate::{
     OutgoingActivityError, OutgoingError,
-    interceptors::{
+    interceptors::activities::{
         ActivityExecutionValue, ActivityInboundInterceptor, ExecuteActivityInput,
         ExecuteActivityOutput, Next,
     },

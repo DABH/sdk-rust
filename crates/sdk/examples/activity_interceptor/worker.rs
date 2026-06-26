@@ -7,7 +7,9 @@ use temporalio_client::{
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk::{
     Worker, WorkerOptions,
-    interceptors::{ActivityInboundInterceptor, ExecuteActivityInput, ExecuteActivityOutput, Next},
+    interceptors::activities::{
+        ActivityInboundInterceptor, ExecuteActivityInput, ExecuteActivityOutput, Next,
+    },
 };
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions};
 use workflows::{

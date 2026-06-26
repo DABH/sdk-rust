@@ -79,12 +79,10 @@ Inbound methods:
 Outbound methods:
 
 - `sleep`
-- `execute_activity`
-- `execute_local_activity`
-- `start_child_workflow`
-- `signal_child_workflow`
-- `signal_external_workflow`
-- `cancel_external_workflow`
+- `schedule_activity`
+- `schedule_local_activity`
+- `signal_workflow`
+- `start_child_workflow_execution`
 - `initialize_continue_as_new_error`
 - `start_nexus_operation`
 
@@ -261,10 +259,10 @@ Worker-level but not workflow-context operations:
 
 ## 4. Start Narrower
 
-Do not implement every Ruby-equivalent hook in the first PR. The first slice should prove the
-architecture with the smallest useful set.
+The branch should land hooks in slices so review can separate the core chain shape from each
+runtime integration point.
 
-Recommended first slice:
+Implemented first slice:
 
 - inbound `execute`
 - inbound `handle_query`
@@ -279,23 +277,24 @@ Why this slice:
 - `sleep` proves outbound command interception without involving payload conversion or typed
   generic output.
 
-Recommended second slice:
+Implemented second slice:
 
-- outbound `execute_activity`
-- outbound `execute_local_activity`
-- outbound `start_child_workflow`
+- outbound `schedule_activity`
+- outbound `schedule_local_activity`
+- outbound `start_child_workflow_execution`
 
 These prove the typed/erased middleware boundary: outbound calls should carry SDK-owned erased
 typed arguments through the interceptor chain and serialize them only after the final `next`
 continuation reaches SDK command construction.
 
-Recommended third slice:
+Implemented third slice:
 
 - inbound `validate_update`
 - inbound `handle_update`
-- outbound `signal_child_workflow`
-- outbound `signal_external_workflow`
-- outbound `cancel_external_workflow`
+- outbound `signal_workflow`
+
+Still later:
+
 - outbound `initialize_continue_as_new_error`
 
 Do not implement:
@@ -434,68 +433,27 @@ inputs and serialize them inside `WorkflowContext` methods.
 
 The base interceptor traits should remain object-safe, but that does not require eagerly converting
 typed Rust values to `Payload`. For operations that start with typed Rust values and later emit
-history commands or responses, the SDK should carry an SDK-owned erased value through the
-interceptor chain and perform payload serialization only at the final SDK boundary.
+history commands or responses, mirror activity interceptors and carry an SDK-owned
+`Box<dyn Any>` through the workflow interceptor chain. Payload serialization should still happen
+only at the final SDK boundary.
 
-Proposed wrapper:
+The input structs should expose typed accessors, not a workflow-specific erased-value wrapper:
 
 ```rust
-pub struct WorkflowValue {
-    type_id: TypeId,
-    inner: Box<dyn TemporalSerializable>,
-}
-
-impl WorkflowValue {
-    pub(crate) fn new<T>(value: T) -> Self
-    where
-        T: TemporalSerializable + 'static
-    {
+impl ExecuteInput {
+    pub fn args_ref<T: Any>(&self) -> Option<&T> {
         // ...
     }
 
-    pub fn downcast_ref<T>(&self) -> Option<&T>
-    where
-        T: TemporalSerializable + 'static
-    {
-        // ...
-    }
-
-    pub fn downcast_mut<T>(&mut self) -> Option<&mut T>
-    where
-        T: TemporalSerializable + 'static
-    {
+    pub fn args_mut<T: Any>(&mut self) -> Option<&mut T> {
         // ...
     }
 }
 ```
 
-The exact name is open, but the wrapper should be owned by the SDK rather than exposing
-`Box<dyn TemporalSerializable>` directly. The wrapper captures `TypeId::of::<T>()` at construction
-time and uses that stored `TypeId` to implement downcast helpers without requiring
-`TemporalSerializable: Any`. This mirrors the shape of `std::error::Error` downcasting: the public
-downcast bound is the domain trait plus `'static`, while the implementation compares `TypeId`s and
-uses an unsafe cast guarded by that check. To keep this sound, the public constructor must set
-the stored `TypeId` from the same concrete value placed in `inner`, and users must not be able to
-construct an arbitrary `(TypeId, dyn TemporalSerializable)` pair.
-
-The wrapper deliberately does **not** expose a `replace<T>` API or any other way to swap the
-concrete type after construction. The SDK puts a `WorkflowValue<T>` into the chain expecting a
-`WorkflowValue<T>` to come back out (e.g. so it can downcast back to the workflow's input type
-before invoking `W::run`). Allowing interceptors to substitute a different concrete type would
-turn that expectation into a runtime panic for no real-world benefit — every legitimate "I want
-to change the args" case is covered by mutating in place through `downcast_mut`.
-
-To make this guarantee airtight, three things must hold together:
-
-- the public constructor is **crate-private** (`pub(crate) fn new<T>`), so user code cannot
-  construct a foreign-typed `WorkflowValue` to swap in;
-- input structs that carry a `WorkflowValue` do not expose builder methods that accept a fresh
-  `WorkflowValue` (no `with_args(WorkflowValue)`); only an in-place mutable accessor
-  (`args_mut() -> &mut WorkflowValue`);
-- there is no `replace<T>` on `WorkflowValue` itself.
-
-If any one of these were missing, a user could combine `std::mem::swap` with a hand-built
-`WorkflowValue` of a different concrete type to defeat the type-preservation contract.
+The SDK still expects the concrete argument type it put into the chain to come back out before it
+invokes `W::run` or `W::init`. Interceptors can mutate known argument types in place, but v1 should
+not expose a public argument replacement API that allows changing the concrete type.
 
 Argument lists should be represented as one erased value, usually the same tuple or `RawValue`
 already accepted by the typed SDK API. This mirrors TypeScript's `unknown[]` in spirit: most
@@ -612,12 +570,18 @@ interceptor APIs. `Next<'a, I, O>` is borrowed for `'a` and consumed by `run`, w
 prevents an interceptor method from awaiting before calling `next.run(input)` — the method body
 must call `run` synchronously and return either the result or a future composed from it.
 
+In the split workflow crate implementation this continuation is defined as
+`temporalio_workflow::interceptors::Next`. The SDK-facing API namespaces the continuations as
+`temporalio_sdk::interceptors::workflows::Next` and
+`temporalio_sdk::interceptors::activities::Next` so the interceptor shape is explicit at import
+sites.
+
 Sketch:
 
 ```rust
-pub type WorkflowExecuteOutput = LocalBoxFuture<'static, WorkflowResult<WorkflowValue>>;
-pub type WorkflowSignalOutput = LocalBoxFuture<'static, Result<(), WorkflowError>>;
-pub type WorkflowQueryOutput = Result<WorkflowValue, WorkflowError>;
+pub type ExecuteOutput = LocalBoxFuture<'static, WorkflowResult<Payload>>;
+pub type HandleSignalOutput = LocalBoxFuture<'static, Result<(), WorkflowError>>;
+pub type HandleQueryOutput = Result<Payload, WorkflowError>;
 pub type SleepOutput = BoxedCancellableFuture<TimerResult>;
 
 #[must_use = "workflow interceptor continuations must be run to continue the call chain"]
@@ -646,30 +610,42 @@ pub trait WorkflowInboundInterceptor: Send + Sync + 'static {
     fn execute<'a>(
         &'a self,
         input: ExecuteInput,
-        next: Next<'a, ExecuteInput, WorkflowExecuteOutput>,
-    ) -> WorkflowExecuteOutput {
+        next: Next<'a, ExecuteInput, ExecuteOutput>,
+    ) -> ExecuteOutput {
         next.run(input)
     }
 
     fn handle_signal<'a>(
         &'a self,
         input: HandleSignalInput,
-        next: Next<'a, HandleSignalInput, WorkflowSignalOutput>,
-    ) -> WorkflowSignalOutput {
+        next: Next<'a, HandleSignalInput, HandleSignalOutput>,
+    ) -> HandleSignalOutput {
         next.run(input)
     }
 
     fn handle_query<'a>(
         &'a self,
         input: HandleQueryInput,
-        next: Next<'a, HandleQueryInput, WorkflowQueryOutput>,
-    ) -> WorkflowQueryOutput {
+        next: Next<'a, HandleQueryInput, HandleQueryOutput>,
+    ) -> HandleQueryOutput {
         next.run(input)
     }
 
-    // Later slices:
-    // fn validate_update<'a>(..., next: Next<'a, ValidateUpdateInput, WorkflowUpdateValidationResult>) -> ...;
-    // fn handle_update<'a>(..., next: Next<'a, HandleUpdateInput, WorkflowUpdateResult>) -> ...;
+    fn validate_update<'a>(
+        &'a self,
+        input: ValidateUpdateInput,
+        next: Next<'a, ValidateUpdateInput, ValidateUpdateOutput>,
+    ) -> ValidateUpdateOutput {
+        next.run(input)
+    }
+
+    fn handle_update<'a>(
+        &'a self,
+        input: HandleUpdateInput,
+        next: Next<'a, HandleUpdateInput, HandleUpdateOutput>,
+    ) -> HandleUpdateOutput {
+        next.run(input)
+    }
 }
 
 pub trait WorkflowOutboundInterceptor: Send + Sync + 'static {
@@ -681,15 +657,37 @@ pub trait WorkflowOutboundInterceptor: Send + Sync + 'static {
         next.run(input)
     }
 
-    // Later slices:
-    // fn execute_activity<'a>(..., next: Next<'a, ExecuteActivityInput, ActivityOutput>) -> ...;
-    // fn execute_local_activity<'a>(..., next: Next<'a, ExecuteLocalActivityInput, ActivityOutput>) -> ...;
-    // fn start_child_workflow<'a>(..., next: Next<'a, StartChildWorkflowInput, ChildWorkflowStartOutput>) -> ...;
-    // fn signal_child_workflow<'a>(..., next: Next<'a, SignalChildWorkflowInput, SignalChildWorkflowOutput>) -> ...;
-    // fn signal_external_workflow<'a>(..., next: Next<'a, SignalExternalWorkflowInput, SignalExternalWorkflowOutput>) -> ...;
-    // fn cancel_external_workflow<'a>(..., next: Next<'a, CancelExternalWorkflowInput, CancelExternalWorkflowOutput>) -> ...;
-    // fn initialize_continue_as_new_error<'a>(..., next: Next<'a, InitializeContinueAsNewErrorInput, WorkflowTermination>) -> ...;
-    // fn start_nexus_operation<'a>(..., next: Next<'a, StartNexusOperationInput, NexusOperationOutput>) -> ...;
+    fn schedule_activity<'a>(
+        &'a self,
+        input: ScheduleActivityInput,
+        next: Next<'a, ScheduleActivityInput, ScheduleActivityOutput>,
+    ) -> ScheduleActivityOutput {
+        next.run(input)
+    }
+
+    fn schedule_local_activity<'a>(
+        &'a self,
+        input: ScheduleLocalActivityInput,
+        next: Next<'a, ScheduleLocalActivityInput, ScheduleLocalActivityOutput>,
+    ) -> ScheduleLocalActivityOutput {
+        next.run(input)
+    }
+
+    fn signal_workflow<'a>(
+        &'a self,
+        input: SignalWorkflowInput,
+        next: Next<'a, SignalWorkflowInput, SignalWorkflowOutput>,
+    ) -> SignalWorkflowOutput {
+        next.run(input)
+    }
+
+    fn start_child_workflow_execution<'a>(
+        &'a self,
+        input: StartChildWorkflowExecutionInput,
+        next: Next<'a, StartChildWorkflowExecutionInput, StartChildWorkflowExecutionOutput>,
+    ) -> StartChildWorkflowExecutionOutput {
+        next.run(input)
+    }
 }
 ```
 
@@ -761,7 +759,7 @@ First slice:
 #[non_exhaustive]
 pub struct ExecuteInput {
     workflow_type: String,
-    args: WorkflowValue,
+    args: Box<dyn Any>,
     headers: HashMap<String, Payload>,
     context: WorkflowInterceptorContext,
 }
@@ -769,7 +767,7 @@ pub struct ExecuteInput {
 #[non_exhaustive]
 pub struct HandleSignalInput {
     signal_name: String,
-    args: WorkflowValue,
+    args: Vec<Payload>,
     headers: HashMap<String, Payload>,
     context: WorkflowInterceptorContext,
 }
@@ -777,7 +775,7 @@ pub struct HandleSignalInput {
 #[non_exhaustive]
 pub struct HandleQueryInput {
     query_name: String,
-    args: WorkflowValue,
+    args: Vec<Payload>,
     headers: HashMap<String, Payload>,
     context: WorkflowInterceptorContext,
 }
@@ -794,18 +792,20 @@ Second slice examples:
 
 ```rust
 #[non_exhaustive]
-pub struct ExecuteActivityInput {
+pub struct ScheduleActivityInput {
     activity_type: String,
-    args: WorkflowValue,
+    args: Box<dyn Any>,
     options: ActivityOptions,
+    context: WorkflowInterceptorContext,
 }
 
 #[non_exhaustive]
-pub struct StartChildWorkflowInput {
+pub struct StartChildWorkflowExecutionInput {
     workflow_type: String,
     workflow_id: String,
-    args: WorkflowValue,
+    args: Box<dyn Any>,
     options: ChildWorkflowOptions,
+    context: WorkflowInterceptorContext,
 }
 ```
 
@@ -852,8 +852,8 @@ payloads, and options.
    scaffolding under `crates/sdk/src/interceptors.rs` or a new `crates/sdk/src/interceptors/`
    module.
 3. Define public opaque `Next<'a, I, O>` and its lifetime/single-use/input-forwarding semantics.
-4. Define an SDK-owned `WorkflowValue`/erased-serializable wrapper for typed middleware values,
-   including captured `TypeId`, downcast, replacement, and crate-private final serialization.
+4. Use `Any`-based argument access for decoded typed middleware values, matching activity
+   interceptors. Do not expose a public API that changes the concrete argument type in v1.
 5. Thread workflow interceptor configuration through `WorkerOptions`, not `ClientOptions`.
 6. Build inbound and outbound chains when a workflow instance is created.
 7. For each workflow instance, create/wrap an outbound interceptor chain and store it in worker/SDK
@@ -901,11 +901,9 @@ Integration tests must be run with `cargo integ-test <test_name>`.
   queries cannot be replayed as history events.
 - Interceptor methods should return the same operation result types as the wrapped SDK operation.
   Do not introduce a separate interceptor error channel in v1.
-- Do not expose `Box<dyn TemporalSerializable>` directly. Use an SDK wrapper so the SDK can pair
-  the trait object with a trustworthy `TypeId`, add downcasting/replacement, and control final
-  serialization without committing to trait-object construction details.
-- The payload converter path may need `?Sized` or wrapper-specific entry points so crate-private
-  final serialization can serialize a `dyn TemporalSerializable` value.
+- Do not expose `Box<dyn TemporalSerializable>` directly. Use `Any`-based typed accessors for
+  decoded arguments, matching activity interceptors, and keep final serialization in SDK-owned
+  terminal dispatch.
 - If an interceptor returns an error where the operation result type supports errors, treat it as
   if the intercepted call returned that error.
 - Panics from interceptor code should be caught and converted through the same user-code failure
@@ -942,13 +940,10 @@ Integration tests must be run with `cargo integ-test <test_name>`.
 - **Typed erasure footguns:** downcasting only works when the interceptor knows the exact concrete
   type, often the generated tuple input type. Documentation should make clear that this is an
   advanced middleware capability, not a general reflection system.
-- **TypeId soundness:** downcasting without an `Any` supertrait is sound only if the SDK controls
-  wrapper construction and always keeps the stored `TypeId` aligned with the concrete value in the
-  trait object.
 - **Wrong abstraction level:** hooking core activations directly would expose too much internal
   machinery. Hook SDK dispatch/context methods instead.
 - **Generic explosion:** typed outbound hooks for every activity/workflow type would not be
-  object-safe. Prefer SDK-owned erased typed values for the base trait, with downcasting for
+  object-safe. Prefer SDK-owned erased typed values for the base trait, with `Any` downcasting for
   interceptors that know the concrete type.
 - **Over-broad first slice:** implementing every Ruby-equivalent method at once will obscure
   whether inbound/outbound chaining works.

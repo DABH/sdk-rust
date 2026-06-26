@@ -54,7 +54,7 @@ use temporalio_sdk::{
     ActivityExecutionError, ActivityOptions, CancellableFuture, LocalActivityOptions,
     WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
-    interceptors::{
+    interceptors::activities::{
         ActivityInboundInterceptor, ExecuteActivityInput, ExecuteActivityOutput,
         ExecuteActivityResult, Next,
     },

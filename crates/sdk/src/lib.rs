@@ -90,11 +90,12 @@ pub use crate::error::{
 pub use temporalio_client::Namespace;
 pub use temporalio_workflow::{
     ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext, CancellableFuture,
-    ChildWorkflowOptions, ContinueAsNewOptions, ContinueAsNewVersioningBehavior,
-    ExternalWorkflowHandle, LocalActivityOptions, NexusOperationOptions, ParentWorkflowInfo,
-    RootWorkflowInfo, Signal, SignalData, StartChildWorkflowExecutionFailedCause,
-    StartedChildWorkflow, SyncWorkflowContext, TimerOptions, TimerResult, WorkflowContext,
-    WorkflowContextView, WorkflowResult, WorkflowTermination,
+    CancellableFutureWithReason, ChildWorkflowOptions, ContinueAsNewOptions,
+    ContinueAsNewVersioningBehavior, ExternalWorkflowHandle, LocalActivityOptions,
+    NexusOperationOptions, ParentWorkflowInfo, RootWorkflowInfo, Signal, SignalData,
+    StartChildWorkflowExecutionFailedCause, StartedChildWorkflow, SyncWorkflowContext,
+    TimerOptions, TimerResult, WorkflowContext, WorkflowContextView, WorkflowResult,
+    WorkflowTermination,
 };
 #[cfg(feature = "wasm-workflows")]
 pub use workflow_wasm::WasmWorkflowComponent;
@@ -104,7 +105,9 @@ use crate::{
         ActivityContext, ActivityDefinitions, ActivityImplementer, ExecutableActivity,
         activity_error_to_core_result,
     },
-    interceptors::{ActivityInboundInterceptor, WorkerInterceptor, WorkflowInterceptor},
+    interceptors::{
+        WorkerInterceptor, activities::ActivityInboundInterceptor, workflows::WorkflowInterceptor,
+    },
     workflow_executor::{TaskHandle, WorkflowExecutor},
     workflow_future::start_workflow,
     workflow_registry::WorkflowDefinitions,

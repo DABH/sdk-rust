@@ -9,7 +9,9 @@ pub use temporalio_common_wasm::protos::coresdk::child_workflow::StartChildWorkf
 
 use crate::{
     interceptors::{
-        BoxedCancellableFuture, SleepInput, SleepOutput, WorkflowInterceptor,
+        BoxedCancellableFuture, BoxedCancellableFutureWithReason, ScheduleActivityInput,
+        ScheduleLocalActivityInput, SignalWorkflowInput, SignalWorkflowTarget, SleepInput,
+        SleepOutput, StartChildWorkflowExecutionInput, WorkflowInterceptor,
         WorkflowInterceptorContext, WorkflowInterceptorInstance, WorkflowOperationContext,
     },
     runtime::{
@@ -47,9 +49,9 @@ use temporalio_common_wasm::{
     ActivityDefinition, SignalDefinition, WorkflowDefinition,
     data_converters::{
         ActivityExecutionDecodeHint, ChildWorkflowExecutionDecodeHint,
-        ChildWorkflowStartDecodeHint, DataConverter, GenericPayloadConverter, PayloadConverter,
-        SerializationContext, SerializationContextData, TemporalDeserializable,
-        WorkflowSignalDecodeHint,
+        ChildWorkflowStartDecodeHint, DataConverter, GenericPayloadConverter,
+        PayloadConversionError, PayloadConverter, SerializationContext, SerializationContextData,
+        TemporalDeserializable, WorkflowSignalDecodeHint,
     },
     error::{
         ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowStartError,
@@ -633,23 +635,44 @@ impl BaseWorkflowContext {
         &self,
         activity: AD,
         input: impl Into<AD::Input>,
-        mut opts: ActivityOptions,
+        opts: ActivityOptions,
     ) -> impl CancellableFuture<Result<AD::Output, ActivityExecutionError>>
     where
         AD::Output: TemporalDeserializable,
     {
         let input = input.into();
+        let interceptor_input = ScheduleActivityInput::new(
+            activity.name().to_string(),
+            input,
+            opts,
+            self.workflow_interceptor_context(self.is_replaying()),
+        );
+        let base = self.clone();
+        match self
+            .workflow_interceptors()
+            .schedule_activity(interceptor_input, move |input| {
+                base.schedule_activity_command::<AD>(input)
+            }) {
+            Ok(future) => ActivityFut::running(future, self.inner.data_converter.clone()),
+            Err(e) => ActivityFut::eager(*e),
+        }
+    }
+
+    fn schedule_activity_command<AD: ActivityDefinition>(
+        &self,
+        input: ScheduleActivityInput,
+    ) -> Result<BoxedCancellableFuture<ActivityResolution>, Box<ActivityExecutionError>> {
+        let (activity_type, input, mut opts) = input
+            .into_parts::<AD::Input>()
+            .unwrap_or_else(|_| panic!("activity interceptor input type did not match activity"));
         let payload_converter = self.inner.data_converter.payload_converter();
         let ctx = SerializationContext {
             data: &SerializationContextData::Workflow,
             converter: payload_converter,
         };
-        let payloads = match payload_converter.to_payloads(&ctx, &input) {
-            Ok(p) => p,
-            Err(e) => {
-                return ActivityFut::eager(e.into());
-            }
-        };
+        let payloads = payload_converter
+            .to_payloads(&ctx, &input)
+            .map_err(|e| Box::new(e.into()))?;
         let seq = self.inner.seq_nums.borrow_mut().next_activity_seq();
         let (cmd, unblocker) =
             CancellableWFCommandFut::new(CancellableID::Activity(seq), self.clone());
@@ -659,12 +682,11 @@ impl BaseWorkflowContext {
         if opts.task_queue.is_none() {
             opts.task_queue = Some(self.inner.task_queue.clone());
         }
-        self.inner.runtime.host.push_command(opts.into_command(
-            seq,
-            activity.name().to_string(),
-            payloads,
-        ));
-        ActivityFut::running(cmd, self.inner.data_converter.clone())
+        self.inner
+            .runtime
+            .host
+            .push_command(opts.into_command(seq, activity_type, payloads));
+        Ok(BoxedCancellableFuture::new(cmd))
     }
 
     /// Request to run a local activity
@@ -678,21 +700,44 @@ impl BaseWorkflowContext {
         AD::Output: TemporalDeserializable,
     {
         let input = input.into();
+        let interceptor_input = ScheduleLocalActivityInput::new(
+            activity.name().to_string(),
+            input,
+            opts,
+            self.workflow_interceptor_context(self.is_replaying()),
+        );
+        let base = self.clone();
+        match self
+            .workflow_interceptors()
+            .schedule_local_activity(interceptor_input, move |input| {
+                base.schedule_local_activity_command::<AD>(input)
+            }) {
+            Ok(future) => ActivityFut::running(future, self.inner.data_converter.clone()),
+            Err(e) => ActivityFut::eager(*e),
+        }
+    }
+
+    fn schedule_local_activity_command<AD: ActivityDefinition>(
+        &self,
+        input: ScheduleLocalActivityInput,
+    ) -> Result<BoxedCancellableFuture<ActivityResolution>, Box<ActivityExecutionError>> {
+        let (activity_type, input, opts) = input.into_parts::<AD::Input>().unwrap_or_else(|_| {
+            panic!("local activity interceptor input type did not match activity")
+        });
         let payload_converter = self.inner.data_converter.payload_converter();
         let ctx = SerializationContext {
             data: &SerializationContextData::Workflow,
             converter: payload_converter,
         };
-        let payloads = match payload_converter.to_payloads(&ctx, &input) {
-            Ok(p) => p,
-            Err(e) => {
-                return ActivityFut::eager(e.into());
-            }
-        };
-        ActivityFut::running(
-            LATimerBackoffFut::new(activity.name().to_string(), payloads, opts, self.clone()),
-            self.inner.data_converter.clone(),
-        )
+        let payloads = payload_converter
+            .to_payloads(&ctx, &input)
+            .map_err(|e| Box::new(e.into()))?;
+        Ok(BoxedCancellableFuture::new(LATimerBackoffFut::new(
+            activity_type,
+            payloads,
+            opts,
+            self.clone(),
+        )))
     }
 
     /// Start a child workflow with typed input/output.
@@ -706,18 +751,39 @@ impl BaseWorkflowContext {
         WD::Output: TemporalDeserializable,
     {
         let input = input.into();
+        let interceptor_input = StartChildWorkflowExecutionInput::new(
+            workflow.name().to_string(),
+            input,
+            opts,
+            self.workflow_interceptor_context(self.is_replaying()),
+        );
+        let base = self.clone();
+        match self
+            .workflow_interceptors()
+            .start_child_workflow_execution(interceptor_input, move |input| {
+                base.start_child_workflow_command::<WD>(input)
+            }) {
+            Ok(future) => ChildWorkflowStartFut::Running(future),
+            Err(e) => ChildWorkflowStartFut::eager(e),
+        }
+    }
+
+    fn start_child_workflow_command<WD: WorkflowDefinition>(
+        &self,
+        input: StartChildWorkflowExecutionInput,
+    ) -> Result<
+        BoxedCancellableFutureWithReason<StartChildWorkflowExecutionResult>,
+        ChildWorkflowStartError,
+    > {
+        let (workflow_type, input, opts) = input
+            .into_parts::<WD::Input>()
+            .unwrap_or_else(|_| panic!("child workflow interceptor input type did not match"));
         let payload_converter = self.inner.data_converter.payload_converter();
         let ctx = SerializationContext {
             data: &SerializationContextData::Workflow,
             converter: payload_converter,
         };
-        let payloads = match payload_converter.to_payloads(&ctx, &input) {
-            Ok(p) => p,
-            Err(e) => {
-                return ChildWorkflowStartFut::eager(e.into());
-            }
-        };
-        let workflow_type = workflow.name().to_string();
+        let payloads = payload_converter.to_payloads(&ctx, &input)?;
 
         let child_seq = self.inner.seq_nums.borrow_mut().next_child_workflow_seq();
         // Immediately create the command/future for the result, otherwise if the user does
@@ -759,7 +825,7 @@ impl BaseWorkflowContext {
             .host
             .push_command(opts.into_command(child_seq, workflow_type, payloads));
 
-        ChildWorkflowStartFut::Running(cmd)
+        Ok(BoxedCancellableFutureWithReason::new(cmd))
     }
 
     /// Request to run a local activity with no implementation of timer-backoff based retrying.
@@ -780,6 +846,51 @@ impl BaseWorkflowContext {
             .host
             .push_command(opts.into_command(seq, activity_type, arguments));
         cmd
+    }
+
+    fn signal_workflow<S: SignalDefinition>(
+        &self,
+        target: SignalWorkflowTarget,
+        signal: S,
+        input: S::Input,
+    ) -> Result<BoxedCancellableFuture<SignalExternalWfResult>, PayloadConversionError> {
+        let interceptor_input = SignalWorkflowInput::new(
+            target,
+            S::name(&signal).to_string(),
+            input,
+            HashMap::new(),
+            self.workflow_interceptor_context(self.is_replaying()),
+        );
+        let base = self.clone();
+        self.workflow_interceptors()
+            .signal_workflow(interceptor_input, move |input| {
+                base.signal_workflow_command::<S>(input)
+            })
+    }
+
+    fn signal_workflow_command<S: SignalDefinition>(
+        &self,
+        input: SignalWorkflowInput,
+    ) -> Result<BoxedCancellableFuture<SignalExternalWfResult>, PayloadConversionError> {
+        let (target, signal_name, input, headers) = input
+            .into_parts::<S::Input>()
+            .unwrap_or_else(|_| panic!("signal interceptor input type did not match signal"));
+        let payload_converter = self.inner.data_converter.payload_converter();
+        let ctx = SerializationContext {
+            data: &SerializationContextData::Workflow,
+            converter: payload_converter,
+        };
+        let payloads = payload_converter.to_payloads(&ctx, &input)?;
+        let signal = Signal {
+            signal_name,
+            data: SignalData {
+                input: payloads,
+                headers,
+            },
+        };
+        Ok(BoxedCancellableFuture::new(
+            self.clone().send_signal_wf(target.into_proto(), signal),
+        ))
     }
 
     fn send_signal_wf(
@@ -1895,15 +2006,12 @@ pub(crate) struct ChildWfCommon {
     data_converter: DataConverter,
 }
 
-/// Child workflow in pending state. Internal type used during the start handshake;
-/// `ChildWorkflowStartFut` converts this into `Result<StartedChildWorkflow, _>` before
-/// the caller sees it.
+/// Raw child workflow start result carried through workflow outbound interceptors.
 #[derive(derive_more::Debug)]
-pub(crate) struct PendingChildWorkflow<WD: WorkflowDefinition> {
+pub struct StartChildWorkflowExecutionResult {
     pub(crate) status: ChildWorkflowStartStatus,
     #[debug(skip)]
     pub(crate) common: ChildWfCommon,
-    pub(crate) _phantom: PhantomData<WD>,
 }
 
 /// Child workflow in started state.
@@ -2055,7 +2163,7 @@ impl<F, WD: WorkflowDefinition> Unpin for ChildWorkflowStartFut<F, WD> where F: 
 
 impl<F, WD> Future for ChildWorkflowStartFut<F, WD>
 where
-    F: Future<Output = PendingChildWorkflow<WD>> + Unpin,
+    F: Future<Output = StartChildWorkflowExecutionResult> + Unpin,
     WD: WorkflowDefinition,
 {
     type Output = Result<StartedChildWorkflow<WD>, ChildWorkflowStartError>;
@@ -2102,7 +2210,7 @@ where
 
 impl<F, WD> FusedFuture for ChildWorkflowStartFut<F, WD>
 where
-    F: Future<Output = PendingChildWorkflow<WD>> + Unpin,
+    F: Future<Output = StartChildWorkflowExecutionResult> + Unpin,
     WD: WorkflowDefinition,
 {
     fn is_terminated(&self) -> bool {
@@ -2113,7 +2221,7 @@ where
 impl<F, WD> CancellableFuture<Result<StartedChildWorkflow<WD>, ChildWorkflowStartError>>
     for ChildWorkflowStartFut<F, WD>
 where
-    F: CancellableFutureWithReason<PendingChildWorkflow<WD>> + Unpin,
+    F: CancellableFutureWithReason<StartChildWorkflowExecutionResult> + Unpin,
     WD: WorkflowDefinition,
 {
     fn cancel(&self) {
@@ -2126,7 +2234,7 @@ where
 impl<F, WD> CancellableFutureWithReason<Result<StartedChildWorkflow<WD>, ChildWorkflowStartError>>
     for ChildWorkflowStartFut<F, WD>
 where
-    F: CancellableFutureWithReason<PendingChildWorkflow<WD>> + Unpin,
+    F: CancellableFutureWithReason<StartChildWorkflowExecutionResult> + Unpin,
     WD: WorkflowDefinition,
 {
     fn cancel_with_reason(&self, reason: String) {
@@ -2244,24 +2352,15 @@ where
         signal: S,
         input: S::Input,
     ) -> impl CancellableFuture<Result<(), WorkflowSignalError>> + 'static {
-        let payload_converter = self.common.data_converter.payload_converter();
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: payload_converter,
+        let target = SignalWorkflowTarget::ChildWorkflow {
+            workflow_id: self.common.workflow_id.clone(),
         };
-        let payloads = match payload_converter.to_payloads(&ctx, &input) {
-            Ok(p) => p,
-            Err(e) => {
-                return SignalChildFut::eager(e.into());
-            }
-        };
-        let signal = Signal::new(S::name(&signal), payloads);
-        let target = signal_external_workflow_execution::Target::ChildWorkflowId(
-            self.common.workflow_id.clone(),
-        );
-        SignalChildFut::Running {
-            inner: self.common.base_ctx.clone().send_signal_wf(target, signal),
-            data_converter: self.common.data_converter.clone(),
+        match self.common.base_ctx.signal_workflow(target, signal, input) {
+            Ok(inner) => SignalChildFut::Running {
+                inner,
+                data_converter: self.common.data_converter.clone(),
+            },
+            Err(e) => SignalChildFut::eager(e.into()),
         }
     }
 }
@@ -2296,28 +2395,17 @@ impl ExternalWorkflowHandle {
         signal: S,
         input: S::Input,
     ) -> impl CancellableFuture<Result<(), WorkflowSignalError>> + 'static {
-        let payload_converter = self.base_ctx.data_converter().payload_converter();
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: payload_converter,
+        let target = SignalWorkflowTarget::ExternalWorkflow {
+            namespace: self.namespace.clone(),
+            workflow_id: self.workflow_id.clone(),
+            run_id: self.run_id.clone(),
         };
-        let payloads = match payload_converter.to_payloads(&ctx, &input) {
-            Ok(p) => p,
-            Err(e) => {
-                return SignalChildFut::eager(e.into());
-            }
-        };
-        let signal = Signal::new(S::name(&signal), payloads);
-        let target = signal_external_workflow_execution::Target::WorkflowExecution(
-            NamespacedWorkflowExecution {
-                namespace: self.namespace.clone(),
-                workflow_id: self.workflow_id.clone(),
-                run_id: self.run_id.clone().unwrap_or_default(),
+        match self.base_ctx.signal_workflow(target, signal, input) {
+            Ok(inner) => SignalChildFut::Running {
+                inner,
+                data_converter: self.base_ctx.data_converter().clone(),
             },
-        );
-        SignalChildFut::Running {
-            inner: self.base_ctx.clone().send_signal_wf(target, signal),
-            data_converter: self.base_ctx.data_converter().clone(),
+            Err(e) => SignalChildFut::eager(e.into()),
         }
     }
 
