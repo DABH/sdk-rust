@@ -25,109 +25,59 @@ use temporalio_sdk::{
 type SharedEvents = Arc<Mutex<Vec<InterceptorEvent>>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum InterceptorEvent {
-    Execute {
-        workflow_type: String,
-        is_replaying: bool,
-        is_replaying_history_events: bool,
-    },
-    Signal {
-        signal_name: String,
-        is_replaying: bool,
-        is_replaying_history_events: bool,
-    },
-    Query {
-        query_name: String,
-        is_replaying: bool,
-        is_replaying_history_events: bool,
-    },
-    ValidateUpdate {
-        update_name: String,
-        is_replaying: bool,
-        is_replaying_history_events: bool,
-    },
-    Update {
-        update_name: String,
-        is_replaying: bool,
-        is_replaying_history_events: bool,
-    },
-    Sleep {
-        duration: Duration,
-        summary: Option<String>,
-        is_replaying: bool,
-        is_replaying_history_events: bool,
-    },
-    ScheduleActivity {
-        activity_type: String,
-        input: Option<String>,
-        is_replaying: bool,
-        is_replaying_history_events: bool,
-    },
-    ScheduleLocalActivity {
-        activity_type: String,
-        input: Option<String>,
-        is_replaying: bool,
-        is_replaying_history_events: bool,
-    },
-    SignalWorkflow {
-        signal_name: String,
-        target: SignalWorkflowTarget,
-        input: Option<String>,
-        is_replaying: bool,
-        is_replaying_history_events: bool,
-    },
-    StartChildWorkflowExecution {
-        workflow_type: String,
-        input: Option<String>,
-        is_replaying: bool,
-        is_replaying_history_events: bool,
-    },
+struct InterceptorEvent {
+    name: &'static str,
+    details: String,
+    is_replaying: bool,
+    is_replaying_history_events: bool,
 }
 
 impl InterceptorEvent {
-    fn is_replaying_history_events(&self) -> bool {
-        match self {
-            InterceptorEvent::Execute {
-                is_replaying_history_events,
-                ..
-            }
-            | InterceptorEvent::Signal {
-                is_replaying_history_events,
-                ..
-            }
-            | InterceptorEvent::Query {
-                is_replaying_history_events,
-                ..
-            }
-            | InterceptorEvent::ValidateUpdate {
-                is_replaying_history_events,
-                ..
-            }
-            | InterceptorEvent::Update {
-                is_replaying_history_events,
-                ..
-            }
-            | InterceptorEvent::Sleep {
-                is_replaying_history_events,
-                ..
-            }
-            | InterceptorEvent::ScheduleActivity {
-                is_replaying_history_events,
-                ..
-            }
-            | InterceptorEvent::ScheduleLocalActivity {
-                is_replaying_history_events,
-                ..
-            }
-            | InterceptorEvent::SignalWorkflow {
-                is_replaying_history_events,
-                ..
-            }
-            | InterceptorEvent::StartChildWorkflowExecution {
-                is_replaying_history_events,
-                ..
-            } => *is_replaying_history_events,
+    fn new(
+        name: &'static str,
+        details: impl Into<String>,
+        context: &WorkflowInterceptorContext,
+    ) -> Self {
+        Self {
+            name,
+            details: details.into(),
+            is_replaying: context.operation.is_replaying,
+            is_replaying_history_events: context.operation.is_replaying_history_events,
         }
+    }
+}
+
+fn string_arg(arg: Option<&String>) -> &str {
+    arg.map(String::as_str).unwrap_or("<none>")
+}
+
+fn signal_target_details(target: &SignalWorkflowTarget) -> String {
+    match target {
+        SignalWorkflowTarget::ChildWorkflow { workflow_id } => {
+            format!("child:{workflow_id}")
+        }
+        SignalWorkflowTarget::ExternalWorkflow {
+            namespace,
+            workflow_id,
+            run_id,
+        } => format!(
+            "external:{namespace}/{workflow_id}:{}",
+            run_id.as_deref().unwrap_or("<latest>")
+        ),
+        _ => "<unknown>".to_string(),
+    }
+}
+
+fn expected_event(
+    name: &'static str,
+    details: impl Into<String>,
+    is_replaying: bool,
+) -> InterceptorEvent {
+    InterceptorEvent {
+        name,
+        details: details.into(),
+        is_replaying,
+        is_replaying_history_events: false,
     }
 }
 
@@ -153,11 +103,16 @@ struct RecordingInboundInterceptor {
 }
 
 impl RecordingInboundInterceptor {
-    fn record(&self, event: InterceptorEvent) {
+    fn record(
+        &self,
+        name: &'static str,
+        details: impl Into<String>,
+        context: &WorkflowInterceptorContext,
+    ) {
         self.events
             .lock()
             .expect("events mutex is not poisoned")
-            .push(event);
+            .push(InterceptorEvent::new(name, details, context));
     }
 }
 
@@ -167,11 +122,11 @@ impl WorkflowInboundInterceptor for RecordingInboundInterceptor {
         input: ExecuteInput,
         next: Next<'a, ExecuteInput, ExecuteOutput>,
     ) -> ExecuteOutput {
-        self.record(InterceptorEvent::Execute {
-            workflow_type: input.workflow_type().to_string(),
-            is_replaying: input.context().operation.is_replaying,
-            is_replaying_history_events: input.context().operation.is_replaying_history_events,
-        });
+        self.record(
+            "execute",
+            format!("workflow_type={}", input.workflow_type()),
+            input.context(),
+        );
         next.run(input)
     }
 
@@ -180,11 +135,11 @@ impl WorkflowInboundInterceptor for RecordingInboundInterceptor {
         input: HandleSignalInput,
         next: Next<'a, HandleSignalInput, HandleSignalOutput>,
     ) -> HandleSignalOutput {
-        self.record(InterceptorEvent::Signal {
-            signal_name: input.signal_name().to_string(),
-            is_replaying: input.context().operation.is_replaying,
-            is_replaying_history_events: input.context().operation.is_replaying_history_events,
-        });
+        self.record(
+            "signal",
+            format!("signal_name={}", input.signal_name()),
+            input.context(),
+        );
         next.run(input)
     }
 
@@ -193,11 +148,11 @@ impl WorkflowInboundInterceptor for RecordingInboundInterceptor {
         input: HandleQueryInput,
         next: Next<'a, HandleQueryInput, HandleQueryOutput>,
     ) -> HandleQueryOutput {
-        self.record(InterceptorEvent::Query {
-            query_name: input.query_name().to_string(),
-            is_replaying: input.context().operation.is_replaying,
-            is_replaying_history_events: input.context().operation.is_replaying_history_events,
-        });
+        self.record(
+            "query",
+            format!("query_name={}", input.query_name()),
+            input.context(),
+        );
         next.run(input)
     }
 
@@ -206,11 +161,11 @@ impl WorkflowInboundInterceptor for RecordingInboundInterceptor {
         input: ValidateUpdateInput,
         next: Next<'a, ValidateUpdateInput, ValidateUpdateOutput>,
     ) -> ValidateUpdateOutput {
-        self.record(InterceptorEvent::ValidateUpdate {
-            update_name: input.update_name().to_string(),
-            is_replaying: input.context().operation.is_replaying,
-            is_replaying_history_events: input.context().operation.is_replaying_history_events,
-        });
+        self.record(
+            "validate_update",
+            format!("update_name={}", input.update_name()),
+            input.context(),
+        );
         next.run(input)
     }
 
@@ -219,11 +174,11 @@ impl WorkflowInboundInterceptor for RecordingInboundInterceptor {
         input: HandleUpdateInput,
         next: Next<'a, HandleUpdateInput, HandleUpdateOutput>,
     ) -> HandleUpdateOutput {
-        self.record(InterceptorEvent::Update {
-            update_name: input.update_name().to_string(),
-            is_replaying: input.context().operation.is_replaying,
-            is_replaying_history_events: input.context().operation.is_replaying_history_events,
-        });
+        self.record(
+            "update",
+            format!("update_name={}", input.update_name()),
+            input.context(),
+        );
         next.run(input)
     }
 }
@@ -233,11 +188,16 @@ struct RecordingOutboundInterceptor {
 }
 
 impl RecordingOutboundInterceptor {
-    fn record(&self, event: InterceptorEvent) {
+    fn record(
+        &self,
+        name: &'static str,
+        details: impl Into<String>,
+        context: &WorkflowInterceptorContext,
+    ) {
         self.events
             .lock()
             .expect("events mutex is not poisoned")
-            .push(event);
+            .push(InterceptorEvent::new(name, details, context));
     }
 }
 
@@ -247,12 +207,15 @@ impl WorkflowOutboundInterceptor for RecordingOutboundInterceptor {
         input: SleepInput,
         next: Next<'a, SleepInput, SleepOutput>,
     ) -> SleepOutput {
-        self.record(InterceptorEvent::Sleep {
-            duration: input.duration(),
-            summary: input.summary().map(ToString::to_string),
-            is_replaying: input.context().operation.is_replaying,
-            is_replaying_history_events: input.context().operation.is_replaying_history_events,
-        });
+        self.record(
+            "sleep",
+            format!(
+                "duration={:?} summary={}",
+                input.duration(),
+                input.summary().unwrap_or("<none>")
+            ),
+            input.context(),
+        );
         next.run(input)
     }
 
@@ -261,12 +224,15 @@ impl WorkflowOutboundInterceptor for RecordingOutboundInterceptor {
         input: ScheduleActivityInput,
         next: Next<'a, ScheduleActivityInput, ScheduleActivityOutput>,
     ) -> ScheduleActivityOutput {
-        self.record(InterceptorEvent::ScheduleActivity {
-            activity_type: input.activity_type().to_string(),
-            input: input.args_ref::<String>().cloned(),
-            is_replaying: input.context().operation.is_replaying,
-            is_replaying_history_events: input.context().operation.is_replaying_history_events,
-        });
+        self.record(
+            "schedule_activity",
+            format!(
+                "activity_type={} input={}",
+                input.activity_type(),
+                string_arg(input.args_ref::<String>())
+            ),
+            input.context(),
+        );
         next.run(input)
     }
 
@@ -275,12 +241,15 @@ impl WorkflowOutboundInterceptor for RecordingOutboundInterceptor {
         input: ScheduleLocalActivityInput,
         next: Next<'a, ScheduleLocalActivityInput, ScheduleLocalActivityOutput>,
     ) -> ScheduleLocalActivityOutput {
-        self.record(InterceptorEvent::ScheduleLocalActivity {
-            activity_type: input.activity_type().to_string(),
-            input: input.args_ref::<String>().cloned(),
-            is_replaying: input.context().operation.is_replaying,
-            is_replaying_history_events: input.context().operation.is_replaying_history_events,
-        });
+        self.record(
+            "schedule_local_activity",
+            format!(
+                "activity_type={} input={}",
+                input.activity_type(),
+                string_arg(input.args_ref::<String>())
+            ),
+            input.context(),
+        );
         next.run(input)
     }
 
@@ -289,13 +258,16 @@ impl WorkflowOutboundInterceptor for RecordingOutboundInterceptor {
         input: SignalWorkflowInput,
         next: Next<'a, SignalWorkflowInput, SignalWorkflowOutput>,
     ) -> SignalWorkflowOutput {
-        self.record(InterceptorEvent::SignalWorkflow {
-            signal_name: input.signal_name().to_string(),
-            target: input.target().clone(),
-            input: input.args_ref::<String>().cloned(),
-            is_replaying: input.context().operation.is_replaying,
-            is_replaying_history_events: input.context().operation.is_replaying_history_events,
-        });
+        self.record(
+            "signal_workflow",
+            format!(
+                "signal_name={} target={} input={}",
+                input.signal_name(),
+                signal_target_details(input.target()),
+                string_arg(input.args_ref::<String>())
+            ),
+            input.context(),
+        );
         next.run(input)
     }
 
@@ -304,12 +276,15 @@ impl WorkflowOutboundInterceptor for RecordingOutboundInterceptor {
         input: StartChildWorkflowExecutionInput,
         next: Next<'a, StartChildWorkflowExecutionInput, StartChildWorkflowExecutionOutput>,
     ) -> StartChildWorkflowExecutionOutput {
-        self.record(InterceptorEvent::StartChildWorkflowExecution {
-            workflow_type: input.workflow_type().to_string(),
-            input: input.args_ref::<String>().cloned(),
-            is_replaying: input.context().operation.is_replaying,
-            is_replaying_history_events: input.context().operation.is_replaying_history_events,
-        });
+        self.record(
+            "start_child_workflow_execution",
+            format!(
+                "workflow_type={} input={}",
+                input.workflow_type(),
+                string_arg(input.args_ref::<String>())
+            ),
+            input.context(),
+        );
         next.run(input)
     }
 }
@@ -429,77 +404,16 @@ async fn workflow_interceptor_records_execute_signal_query_and_sleep() {
     assert_eq!(result, 7);
 
     let events = events.lock().expect("events mutex is not poisoned").clone();
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            InterceptorEvent::Execute {
-                workflow_type,
-                is_replaying: false,
-                is_replaying_history_events: false,
-            } if workflow_type == wf_name
-        )),
-        "missing execute event: {events:?}"
-    );
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            InterceptorEvent::Sleep {
-                duration,
-                summary,
-                is_replaying: false,
-                is_replaying_history_events: false,
-            } if *duration == Duration::from_millis(10)
-                && summary.as_deref() == Some("intercepted timer")
-        )),
-        "missing sleep event: {events:?}"
-    );
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            InterceptorEvent::Query {
-                query_name,
-                is_replaying: _,
-                is_replaying_history_events: false,
-            } if query_name == "get_counter"
-        )),
-        "missing query event: {events:?}"
-    );
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            InterceptorEvent::Signal {
-                signal_name,
-                is_replaying: false,
-                is_replaying_history_events: false,
-            } if signal_name == "increment"
-        )),
-        "missing signal event: {events:?}"
-    );
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            InterceptorEvent::ValidateUpdate {
-                update_name,
-                is_replaying: false,
-                is_replaying_history_events: false,
-            } if update_name == "set_counter"
-        )),
-        "missing update validation event: {events:?}"
-    );
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            InterceptorEvent::Update {
-                update_name,
-                is_replaying: false,
-                is_replaying_history_events: false,
-            } if update_name == "set_counter"
-        )),
-        "missing update event: {events:?}"
-    );
-    assert!(
-        events.iter().all(|e| !e.is_replaying_history_events()),
-        "live workflow operations should not be marked as replaying history events: {events:?}"
+    assert_eq!(
+        events.as_slice(),
+        &[
+            expected_event("execute", format!("workflow_type={wf_name}"), false),
+            expected_event("sleep", "duration=10ms summary=intercepted timer", false),
+            expected_event("query", "query_name=get_counter", true),
+            expected_event("signal", "signal_name=increment", false),
+            expected_event("validate_update", "update_name=set_counter", false),
+            expected_event("update", "update_name=set_counter", false),
+        ]
     );
 }
 
@@ -638,11 +552,16 @@ struct MutatingOutboundInterceptor {
 }
 
 impl MutatingOutboundInterceptor {
-    fn record(&self, event: InterceptorEvent) {
+    fn record(
+        &self,
+        name: &'static str,
+        details: impl Into<String>,
+        context: &WorkflowInterceptorContext,
+    ) {
         self.events
             .lock()
             .expect("events mutex is not poisoned")
-            .push(event);
+            .push(InterceptorEvent::new(name, details, context));
     }
 }
 
@@ -652,12 +571,15 @@ impl WorkflowOutboundInterceptor for MutatingOutboundInterceptor {
         mut input: ScheduleActivityInput,
         next: Next<'a, ScheduleActivityInput, ScheduleActivityOutput>,
     ) -> ScheduleActivityOutput {
-        self.record(InterceptorEvent::ScheduleActivity {
-            activity_type: input.activity_type().to_string(),
-            input: input.args_ref::<String>().cloned(),
-            is_replaying: input.context().operation.is_replaying,
-            is_replaying_history_events: input.context().operation.is_replaying_history_events,
-        });
+        self.record(
+            "schedule_activity",
+            format!(
+                "activity_type={} input={}",
+                input.activity_type(),
+                string_arg(input.args_ref::<String>())
+            ),
+            input.context(),
+        );
         if let Some(value) = input.args_mut::<String>()
             && value == "activity-original"
         {
@@ -671,12 +593,15 @@ impl WorkflowOutboundInterceptor for MutatingOutboundInterceptor {
         mut input: ScheduleLocalActivityInput,
         next: Next<'a, ScheduleLocalActivityInput, ScheduleLocalActivityOutput>,
     ) -> ScheduleLocalActivityOutput {
-        self.record(InterceptorEvent::ScheduleLocalActivity {
-            activity_type: input.activity_type().to_string(),
-            input: input.args_ref::<String>().cloned(),
-            is_replaying: input.context().operation.is_replaying,
-            is_replaying_history_events: input.context().operation.is_replaying_history_events,
-        });
+        self.record(
+            "schedule_local_activity",
+            format!(
+                "activity_type={} input={}",
+                input.activity_type(),
+                string_arg(input.args_ref::<String>())
+            ),
+            input.context(),
+        );
         if let Some(value) = input.args_mut::<String>()
             && value == "local-original"
         {
@@ -690,13 +615,16 @@ impl WorkflowOutboundInterceptor for MutatingOutboundInterceptor {
         mut input: SignalWorkflowInput,
         next: Next<'a, SignalWorkflowInput, SignalWorkflowOutput>,
     ) -> SignalWorkflowOutput {
-        self.record(InterceptorEvent::SignalWorkflow {
-            signal_name: input.signal_name().to_string(),
-            target: input.target().clone(),
-            input: input.args_ref::<String>().cloned(),
-            is_replaying: input.context().operation.is_replaying,
-            is_replaying_history_events: input.context().operation.is_replaying_history_events,
-        });
+        self.record(
+            "signal_workflow",
+            format!(
+                "signal_name={} target={} input={}",
+                input.signal_name(),
+                signal_target_details(input.target()),
+                string_arg(input.args_ref::<String>())
+            ),
+            input.context(),
+        );
         if let Some(value) = input.args_mut::<String>()
             && value == "signal-original"
         {
@@ -710,12 +638,15 @@ impl WorkflowOutboundInterceptor for MutatingOutboundInterceptor {
         mut input: StartChildWorkflowExecutionInput,
         next: Next<'a, StartChildWorkflowExecutionInput, StartChildWorkflowExecutionOutput>,
     ) -> StartChildWorkflowExecutionOutput {
-        self.record(InterceptorEvent::StartChildWorkflowExecution {
-            workflow_type: input.workflow_type().to_string(),
-            input: input.args_ref::<String>().cloned(),
-            is_replaying: input.context().operation.is_replaying,
-            is_replaying_history_events: input.context().operation.is_replaying_history_events,
-        });
+        self.record(
+            "start_child_workflow_execution",
+            format!(
+                "workflow_type={} input={}",
+                input.workflow_type(),
+                string_arg(input.args_ref::<String>())
+            ),
+            input.context(),
+        );
         if let Some(value) = input.args_mut::<String>()
             && value == "child-original"
         {
@@ -872,55 +803,36 @@ async fn workflow_outbound_interceptors_can_mutate_scheduled_operations() {
     assert_eq!(signal_result, "signal-mutated");
 
     let events = events.lock().expect("events mutex is not poisoned").clone();
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            InterceptorEvent::ScheduleActivity {
-                input: Some(input),
-                is_replaying_history_events: false,
-                ..
-            } if input == "activity-original"
-        )),
-        "missing activity schedule event: {events:?}"
-    );
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            InterceptorEvent::ScheduleLocalActivity {
-                input: Some(input),
-                is_replaying_history_events: false,
-                ..
-            } if input == "local-original"
-        )),
-        "missing local activity schedule event: {events:?}"
-    );
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            InterceptorEvent::StartChildWorkflowExecution {
-                workflow_type,
-                input: Some(input),
-                is_replaying_history_events: false,
-                ..
-            } if workflow_type == OutboundChildWorkflow::name()
-                && input == "child-original"
-        )),
-        "missing child workflow start event: {events:?}"
-    );
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            InterceptorEvent::SignalWorkflow {
-                signal_name,
-                target: SignalWorkflowTarget::ExternalWorkflow { workflow_id, .. },
-                input: Some(input),
-                is_replaying_history_events: false,
-                ..
-            } if signal_name == "capture"
-                && workflow_id == &target_workflow_id
-                && input == "signal-original"
-        )),
-        "missing signal workflow event: {events:?}"
+    assert_eq!(
+        events.as_slice(),
+        &[
+            expected_event(
+                "schedule_activity",
+                "activity_type=StdActivities::echo input=activity-original",
+                false,
+            ),
+            expected_event(
+                "schedule_local_activity",
+                "activity_type=StdActivities::echo input=local-original",
+                false,
+            ),
+            expected_event(
+                "start_child_workflow_execution",
+                format!(
+                    "workflow_type={} input=child-original",
+                    OutboundChildWorkflow::name()
+                ),
+                false,
+            ),
+            expected_event(
+                "signal_workflow",
+                format!(
+                    "signal_name=capture target=external:default/{target_workflow_id}:<latest> \
+                     input=signal-original"
+                ),
+                false,
+            ),
+        ]
     );
 }
 
