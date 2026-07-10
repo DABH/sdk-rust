@@ -414,7 +414,9 @@ impl Workflows {
                             );
                         }
                         Err(e) => {
-                            let cause_reason_failure = if e.metadata().contains_key(MESSAGE_TOO_LARGE_KEY)
+                            let cause_reason_failure = if e
+                                .metadata()
+                                .contains_key(MESSAGE_TOO_LARGE_KEY)
                                 && attempt < 2
                             {
                                 // gRPC message too large from server; skip on nonfirst attempts to
