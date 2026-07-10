@@ -5,7 +5,7 @@
 //! or making raw gRPC calls not covered by the higher-level API.
 
 use crate::{
-    Client, Connection, LONG_POLL_TIMEOUT, RequestExt, SharedReplaceableClient,
+    Client, Connection, LONG_POLL_TIMEOUT, PayloadErrorLimits, RequestExt, SharedReplaceableClient,
     TEMPORAL_NAMESPACE_HEADER_KEY, TemporalServiceClient,
     metrics::namespace_kv,
     retry::make_future_retry,
@@ -189,16 +189,6 @@ fn req_cloner<T: Clone>(cloneme: &Request<T>) -> Request<T> {
     }
     *new_req.extensions_mut() = cloneme.extensions().clone();
     new_req
-}
-
-/// Per-call payload/memo size error limits, attached to a request's extensions by a caller that
-/// wants error-level enforcement on this call.
-#[derive(Debug, Clone, Copy)]
-pub struct PayloadErrorLimits {
-    /// Blob (payload) size error threshold, in bytes.
-    pub blob: usize,
-    /// Memo size error threshold, in bytes.
-    pub memo: usize,
 }
 
 /// `*_warn` are the connection's configured warn thresholds; per-call error limits ride a

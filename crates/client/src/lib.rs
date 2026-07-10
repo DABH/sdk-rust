@@ -29,8 +29,9 @@ pub mod worker;
 mod workflow_handle;
 
 pub use crate::{
-    grpc::{PayloadErrorLimits, PayloadLimitsClient},
+    grpc::PayloadLimitsClient,
     proxy::HttpConnectProxyOptions,
+    request_extensions::PayloadErrorLimits,
     retry::{CallType, RETRYABLE_ERROR_CODES},
 };
 pub use async_activity_handle::{
