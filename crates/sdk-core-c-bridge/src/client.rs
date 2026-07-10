@@ -56,10 +56,10 @@ pub struct ConnectionOptions {
     pub grpc_compression: ClientGrpcCompression,
     /// Warning threshold (bytes) for the size of an outbound payload-bearing field.
     /// Over-threshold fields are logged but still sent to server. 0 disables the warning.
-    pub payloads_size_warn: u64,
+    pub payloads_warn_size: u64,
     /// Warning threshold (bytes) for outbound memo size. Over-threshold memos are logged but still
     /// sent to server. 0 disables the warning.
-    pub memo_size_warn: u64,
+    pub memo_warn_size: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -1462,8 +1462,8 @@ impl TryFrom<&ConnectionOptions> for temporalio_client::ConnectionOptions {
                     ClientGrpcCompression::None => temporalio_client::GrpcCompression::None,
                 })
                 .payload_limits(temporalio_client::PayloadLimitsOptions {
-                    payloads_size_warn: opts.payloads_size_warn,
-                    memo_size_warn: opts.memo_size_warn,
+                    payloads_warn_size: opts.payloads_warn_size,
+                    memo_warn_size: opts.memo_warn_size,
                 })
                 .build(),
         )
@@ -1577,8 +1577,8 @@ mod tests {
             grpc_override_callback_user_data: std::ptr::null_mut(),
             dns_load_balancing_options: std::ptr::null(),
             grpc_compression: ClientGrpcCompression::Gzip,
-            payloads_size_warn: 0,
-            memo_size_warn: 0,
+            payloads_warn_size: 0,
+            memo_warn_size: 0,
         }
     }
 

@@ -201,12 +201,12 @@ typedef struct TemporalCoreConnectionOptions {
    * Warning threshold (bytes) for the size of an outbound payload-bearing field.
    * Over-threshold fields are logged but still sent to server. 0 disables the warning.
    */
-  uint64_t payloads_size_warn;
+  uint64_t payloads_warn_size;
   /**
    * Warning threshold (bytes) for outbound memo size. Over-threshold memos are logged but still
    * sent to server. 0 disables the warning.
    */
-  uint64_t memo_size_warn;
+  uint64_t memo_warn_size;
 } TemporalCoreConnectionOptions;
 
 typedef struct TemporalCoreByteArray {

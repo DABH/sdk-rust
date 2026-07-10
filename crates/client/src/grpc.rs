@@ -149,8 +149,8 @@ impl RawGrpcCaller for Connection {
         // Validate payload sizes after any request mutation but before encoding/metrics.
         validate_request_payload_limits(
             &req,
-            self.inner.payloads_size_warn,
-            self.inner.memo_size_warn,
+            self.inner.payloads_warn_size,
+            self.inner.memo_warn_size,
         )?;
 
         let info = self

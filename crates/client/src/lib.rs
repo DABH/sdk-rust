@@ -168,8 +168,8 @@ struct ConnectionInner {
     workers: Arc<ClientWorkerSet>,
     _dns_task: Option<Arc<dns::DnsReresolutionHandle>>,
     /// Configured payload/memo size warning thresholds (bytes); `None` disables that warning.
-    payloads_size_warn: Option<usize>,
-    memo_size_warn: Option<usize>,
+    payloads_warn_size: Option<usize>,
+    memo_warn_size: Option<usize>,
 }
 
 /// Resolve a user-configured warning threshold (bytes) into the internal representation. `0`
@@ -332,13 +332,13 @@ impl Connection {
                 capabilities,
                 workers: Arc::new(ClientWorkerSet::new()),
                 _dns_task: dns_task,
-                payloads_size_warn: resolve_warn_threshold(
-                    "payloads_size_warn",
-                    options.payload_limits.payloads_size_warn,
+                payloads_warn_size: resolve_warn_threshold(
+                    "payloads_warn_size",
+                    options.payload_limits.payloads_warn_size,
                 ),
-                memo_size_warn: resolve_warn_threshold(
-                    "memo_size_warn",
-                    options.payload_limits.memo_size_warn,
+                memo_warn_size: resolve_warn_threshold(
+                    "memo_warn_size",
+                    options.payload_limits.memo_warn_size,
                 ),
             }),
         })

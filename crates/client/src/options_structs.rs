@@ -254,17 +254,17 @@ impl Default for DnsLoadBalancingOptions {
 pub struct PayloadLimitsOptions {
     /// Warning threshold (bytes) for the size of an outbound payload-bearing field; over-threshold
     /// fields are logged but still sent to server. Defaults to 512 KiB. Set to `0` to disable.
-    pub payloads_size_warn: u64,
+    pub payloads_warn_size: u64,
     /// Warning threshold (bytes) for outbound memo sizes; over-threshold memos are logged but still
     /// sent to server. Defaults to 2 KiB. Set to `0` to disable.
-    pub memo_size_warn: u64,
+    pub memo_warn_size: u64,
 }
 
 impl Default for PayloadLimitsOptions {
     fn default() -> Self {
         Self {
-            payloads_size_warn: 512 * 1024,
-            memo_size_warn: 2 * 1024,
+            payloads_warn_size: 512 * 1024,
+            memo_warn_size: 2 * 1024,
         }
     }
 }
