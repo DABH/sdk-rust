@@ -413,48 +413,38 @@ impl Workflows {
                                 response.activity_tasks,
                             );
                         }
-                        // Reply with a task failure if we got grpc too large from server, but
-                        // not if this is a nonfirst attempt to avoid spamming.
-                        Err(e)
-                            if e.metadata().contains_key(MESSAGE_TOO_LARGE_KEY) && attempt < 2 =>
-                        {
-                            let failure = make_grpc_message_too_large_failure();
-                            let new_outcome = FailedActivationWFTReport::Report(
-                                task_token,
-                                WorkflowTaskFailedCause::GrpcMessageTooLarge,
-                                failure,
-                            );
-                            self.handle_activation_failed(run_id, completion_time, new_outcome)
-                                .await;
-                            run_metrics
-                                .with_new_attrs([metrics::failure_reason(
+                        Err(e) => {
+                            let cause_reason_failure = if e.metadata().contains_key(MESSAGE_TOO_LARGE_KEY)
+                                && attempt < 2
+                            {
+                                // gRPC message too large from server; skip on nonfirst attempts to
+                                // avoid spamming.
+                                Some((
+                                    WorkflowTaskFailedCause::GrpcMessageTooLarge,
                                     FailureReason::GrpcMessageTooLarge,
-                                )])
-                                .wf_task_failed();
+                                    make_grpc_message_too_large_failure(),
+                                ))
+                            } else {
+                                // Client layer rejected the completion for exceeding the worker's
+                                // payload error limit.
+                                payload_limit_violation_from(&e).map(|violation| {
+                                    (
+                                        WorkflowTaskFailedCause::PayloadsTooLarge,
+                                        FailureReason::PayloadsTooLarge,
+                                        make_payloads_too_large_failure(violation),
+                                    )
+                                })
+                            };
+                            if let Some((cause, reason, failure)) = cause_reason_failure {
+                                let new_outcome =
+                                    FailedActivationWFTReport::Report(task_token, cause, failure);
+                                self.handle_activation_failed(run_id, completion_time, new_outcome)
+                                    .await;
+                                run_metrics
+                                    .with_new_attrs([metrics::failure_reason(reason)])
+                                    .wf_task_failed();
+                            }
                             return Err(e);
-                        }
-                        // Client layer rejected the completion for exceeding the worker's payload
-                        // error limit; proactively fail the WFT instead.
-                        Err(e) if payload_limit_violation_from(&e).is_some() => {
-                            let violation = payload_limit_violation_from(&e)
-                                .expect("violation present per guard");
-                            let failure = make_payloads_too_large_failure(violation);
-                            let new_outcome = FailedActivationWFTReport::Report(
-                                task_token,
-                                WorkflowTaskFailedCause::PayloadsTooLarge,
-                                failure,
-                            );
-                            self.handle_activation_failed(run_id, completion_time, new_outcome)
-                                .await;
-                            run_metrics
-                                .with_new_attrs([metrics::failure_reason(
-                                    FailureReason::PayloadsTooLarge,
-                                )])
-                                .wf_task_failed();
-                            return Err(e);
-                        }
-                        e => {
-                            e?;
                         }
                     };
 
