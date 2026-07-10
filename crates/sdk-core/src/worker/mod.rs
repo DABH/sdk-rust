@@ -281,6 +281,7 @@ pub struct WorkerConfig {
     /// If set, the worker won't enforce server payload/memo error limits on outbound completions —
     /// oversized payloads are still warned about, and the server still rejects them. When unset, an
     /// oversized completion is proactively failed as a WFT/activity rather than sent.
+    /// NOTE: Experimental
     #[builder(default = false)]
     pub disable_payload_error_limit: bool,
 }

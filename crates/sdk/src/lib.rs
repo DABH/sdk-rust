@@ -262,6 +262,7 @@ pub struct WorkerOptions {
     /// If set true, the worker will not proactively fail workflow/activity tasks whose payloads
     /// exceed the namespace error limits; oversized payloads are sent to server, which enforces the
     /// limit. Defaults to false.
+    /// NOTE: Experimental
     #[builder(default = false)]
     pub disable_payload_error_limit: bool,
 }

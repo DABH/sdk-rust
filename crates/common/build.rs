@@ -988,6 +988,7 @@ fn generate_payload_limits_validator(
     root_names.dedup();
     output.push_str(
         "\n/// Validate `req` if it is a known payload-bearing request type; otherwise return `None`.\n\
+         #[doc(hidden)]\n\
          pub fn validate_known_payload_limits(\n    \
              req: &dyn ::std::any::Any,\n    \
              limits: &PayloadLimits,\n\

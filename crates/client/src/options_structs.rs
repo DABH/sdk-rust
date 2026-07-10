@@ -87,6 +87,7 @@ pub struct ConnectionOptions {
     pub grpc_compression: GrpcCompression,
     /// Payload size limit options for this connection. Defaults to the standard warning thresholds;
     /// disable an individual warning by setting its threshold to `0`.
+    /// NOTE: Experimental
     #[builder(default)]
     pub payload_limits: PayloadLimitsOptions,
 
@@ -250,6 +251,7 @@ impl Default for DnsLoadBalancingOptions {
 }
 
 /// Payload size limit options for a connection.
+/// NOTE: Experimental
 #[derive(Clone, Debug)]
 pub struct PayloadLimitsOptions {
     /// Warning threshold (bytes) for the size of an outbound payload-bearing field; over-threshold

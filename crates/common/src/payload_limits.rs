@@ -16,6 +16,7 @@ use prost::Message;
 
 /// Which server-enforced size limit a payload field is subject to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
 pub enum LimitClass {
     /// Subject to the blob (payload) size limit.
     Blob,
@@ -25,7 +26,7 @@ pub enum LimitClass {
 
 /// How a nested field is addressed within its parent.
 #[derive(Debug, Clone, Copy)]
-pub enum FieldIndexer<'a> {
+pub(crate) enum FieldIndexer<'a> {
     /// A singular field.
     None,
     /// The `n`-th element of a repeated field.
@@ -67,7 +68,7 @@ impl PayloadPath {
 ///
 /// The generated traversal calls `enter`/`exit` around each nested message so the sink can track a
 /// field's location for `check`.
-pub trait PayloadLimitSink {
+pub(crate) trait PayloadLimitSink {
     /// Called for each validated payload field. `field_name` is the leaf field's proto name; `size`
     /// is the field's size in bytes for the given [`LimitClass`]. When `enforce_error` is `false`,
     /// the field may warn but must not produce an error-level violation.
@@ -88,35 +89,37 @@ pub trait PayloadLimitSink {
 
 /// Implemented via codegen for every outbound request message that transitively contains validated
 /// payload fields.
-pub trait PayloadLimitsValidatable {
+pub(crate) trait PayloadLimitsValidatable {
     /// Reports each validated payload field's size and class to `sink`.
     fn validate_payload_limits(&self, sink: &mut dyn PayloadLimitSink);
 }
 
 /// Serialized size of a [`Payloads`] message, as the server measures it.
-pub fn payloads_size(payloads: &Payloads) -> usize {
+pub(crate) fn payloads_size(payloads: &Payloads) -> usize {
     payloads.encoded_len()
 }
 
 /// Serialized size of a single [`Payload`], as the server measures it.
-pub fn payload_size(payload: &Payload) -> usize {
+pub(crate) fn payload_size(payload: &Payload) -> usize {
     payload.encoded_len()
 }
 
 /// Serialized size of a [`Memo`] message, as the server measures it.
-pub fn memo_size(memo: &Memo) -> usize {
+pub(crate) fn memo_size(memo: &Memo) -> usize {
     memo.encoded_len()
 }
 
 /// Serialized size of an arbitrary proto message, as the server measures it. Used for messages the
 /// server checks as a whole rather than per-payload-field (e.g. `Failure`).
-pub fn message_size<M: Message>(message: &M) -> usize {
+pub(crate) fn message_size<M: Message>(message: &M) -> usize {
     message.encoded_len()
 }
 
 /// Aggregate size of a marker-style `map<string, Payloads>`, mirroring the server's
 /// `sum(len(key) + payloads.Size())` accounting (e.g. `RecordMarkerCommandAttributes.details`).
-pub fn map_payloads_sum<'a, K>(entries: impl IntoIterator<Item = (&'a K, &'a Payloads)>) -> usize
+pub(crate) fn map_payloads_sum<'a, K>(
+    entries: impl IntoIterator<Item = (&'a K, &'a Payloads)>,
+) -> usize
 where
     K: AsRef<str> + 'a,
 {
@@ -129,7 +132,9 @@ where
 /// Aggregate size of a search-attribute-style `map<string, Payload>`, mirroring the server's
 /// `sum(len(key) + len(payload.data))` accounting — note the server counts the **raw data** length
 /// here, not the serialized payload size (e.g. `UpsertWorkflowSearchAttributes.indexed_fields`).
-pub fn map_payload_data_sum<'a, K>(entries: impl IntoIterator<Item = (&'a K, &'a Payload)>) -> usize
+pub(crate) fn map_payload_data_sum<'a, K>(
+    entries: impl IntoIterator<Item = (&'a K, &'a Payload)>,
+) -> usize
 where
     K: AsRef<str> + 'a,
 {
@@ -166,6 +171,7 @@ impl PayloadLimits {
 
 /// Whether a violation exceeded the warning threshold or the error threshold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
 pub enum LimitSeverity {
     /// Exceeded the warning threshold.
     Warning,
@@ -175,6 +181,7 @@ pub enum LimitSeverity {
 
 /// A payload field whose size exceeded one of its configured thresholds (warning or error).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
 pub struct PayloadLimitViolation {
     /// Path of proto field names from the root message
     /// (e.g. `commands[2].schedule_activity_task_command_attributes.input`).
@@ -214,18 +221,18 @@ impl std::error::Error for PayloadLimitViolation {}
 /// field over its error threshold (when `enforce_error` and an error threshold are set) is an error;
 /// otherwise a field over its warning threshold is a warning.
 #[derive(Debug, Clone, Default)]
-pub struct CollectingSink {
+struct CollectingSink {
     limits: PayloadLimits,
     path: PayloadPath,
     /// Fields that exceeded their warning threshold (but not an enforced error threshold).
-    pub warnings: Vec<PayloadLimitViolation>,
+    warnings: Vec<PayloadLimitViolation>,
     /// Fields that exceeded their enforced error threshold.
-    pub errors: Vec<PayloadLimitViolation>,
+    errors: Vec<PayloadLimitViolation>,
 }
 
 impl CollectingSink {
     /// A new collector that classifies fields against `limits`.
-    pub fn new(limits: PayloadLimits) -> Self {
+    fn new(limits: PayloadLimits) -> Self {
         Self {
             limits,
             ..Default::default()
@@ -274,7 +281,7 @@ impl PayloadLimitSink for CollectingSink {
 /// If any field exceeded its error threshold, logs the error(s) and returns the first one without
 /// logging warnings; otherwise logs each warning and returns `None`. With no error thresholds set,
 /// there are never errors, so this only warns and always returns `None`.
-pub fn validate_payload_limits<M: PayloadLimitsValidatable + ?Sized>(
+pub(crate) fn validate_payload_limits<M: PayloadLimitsValidatable + ?Sized>(
     msg: &M,
     limits: &PayloadLimits,
 ) -> Option<PayloadLimitViolation> {
