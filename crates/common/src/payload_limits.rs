@@ -139,23 +139,23 @@ where
         .sum()
 }
 
-/// Warn/error thresholds for both limit classes. A `None` threshold disables that check for that
-/// class: `None` warn = no warnings, `None` error = no error enforcement (warnings only).
+/// Warn/error thresholds (bytes) for both limit classes. A `0` threshold disables that check for
+/// that class: `0` warn = no warnings, `0` error = no error enforcement (warnings only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PayloadLimits {
-    /// Blob warning threshold (bytes), or `None` to disable blob warnings.
-    pub blob_warn: Option<usize>,
-    /// Blob error threshold (bytes), or `None` to disable blob error enforcement.
-    pub blob_error: Option<usize>,
-    /// Memo warning threshold (bytes), or `None` to disable memo warnings.
-    pub memo_warn: Option<usize>,
-    /// Memo error threshold (bytes), or `None` to disable memo error enforcement.
-    pub memo_error: Option<usize>,
+    /// Blob warning threshold (bytes); `0` disables blob warnings.
+    pub blob_warn: usize,
+    /// Blob error threshold (bytes); `0` disables blob error enforcement.
+    pub blob_error: usize,
+    /// Memo warning threshold (bytes); `0` disables memo warnings.
+    pub memo_warn: usize,
+    /// Memo error threshold (bytes); `0` disables memo error enforcement.
+    pub memo_error: usize,
 }
 
 impl PayloadLimits {
-    /// Returns the `(warn, error)` thresholds for a given class.
-    fn thresholds(&self, class: LimitClass) -> (Option<usize>, Option<usize>) {
+    /// Returns the `(warn, error)` thresholds for a given class; `0` means disabled.
+    fn thresholds(&self, class: LimitClass) -> (usize, usize) {
         match class {
             LimitClass::Blob => (self.blob_warn, self.blob_error),
             LimitClass::Memo => (self.memo_warn, self.memo_error),
@@ -241,10 +241,7 @@ impl PayloadLimitSink for CollectingSink {
         enforce_error: bool,
     ) {
         let (warn, error) = self.limits.thresholds(class);
-        if enforce_error
-            && let Some(error) = error
-            && size > error
-        {
+        if enforce_error && error > 0 && size > error {
             self.errors.push(PayloadLimitViolation {
                 path: self.path.leaf(field_name),
                 class,
@@ -252,9 +249,7 @@ impl PayloadLimitSink for CollectingSink {
                 size,
                 limit: error,
             });
-        } else if let Some(warn) = warn
-            && size > warn
-        {
+        } else if warn > 0 && size > warn {
             self.warnings.push(PayloadLimitViolation {
                 path: self.path.leaf(field_name),
                 class,
@@ -380,10 +375,10 @@ mod tests {
 
     fn worker_limits(blob_error: usize, memo_error: usize) -> PayloadLimits {
         PayloadLimits {
-            blob_warn: Some(10),
-            blob_error: Some(blob_error),
-            memo_warn: Some(10),
-            memo_error: Some(memo_error),
+            blob_warn: 10,
+            blob_error,
+            memo_warn: 10,
+            memo_error,
         }
     }
 
@@ -409,10 +404,10 @@ mod tests {
             ..Default::default()
         };
         let limits = PayloadLimits {
-            blob_warn: Some(10),
-            blob_error: Some(1_000_000),
-            memo_warn: Some(10),
-            memo_error: Some(20),
+            blob_warn: 10,
+            blob_error: 1_000_000,
+            memo_warn: 10,
+            memo_error: 20,
         };
         let violation = validate_payload_limits(&req, &limits).expect("memo should error");
         assert_eq!(violation.class, LimitClass::Memo);
@@ -443,29 +438,24 @@ mod tests {
     }
 
     #[test]
-    fn none_warn_threshold_disables_warnings() {
+    fn zero_warn_threshold_disables_warnings() {
         let req = StartWorkflowExecutionRequest {
             input: Some(payloads(1000)),
             ..Default::default()
         };
-        // A `Some` warn threshold below the field size produces a (non-error) warning.
+        // A nonzero warn threshold below the field size produces a (non-error) warning.
         let mut sink = CollectingSink::new(PayloadLimits {
-            blob_warn: Some(100),
-            blob_error: None,
-            memo_warn: None,
-            memo_error: None,
+            blob_warn: 100,
+            blob_error: 0,
+            memo_warn: 0,
+            memo_error: 0,
         });
         req.validate_payload_limits(&mut sink);
         assert_eq!(sink.warnings.len(), 1);
         assert!(sink.errors.is_empty());
 
-        // A `None` warn threshold disables the warning entirely.
-        let mut sink = CollectingSink::new(PayloadLimits {
-            blob_warn: None,
-            blob_error: None,
-            memo_warn: None,
-            memo_error: None,
-        });
+        // A `0` warn threshold disables the warning entirely.
+        let mut sink = CollectingSink::new(PayloadLimits::default());
         req.validate_payload_limits(&mut sink);
         assert!(sink.warnings.is_empty());
     }
@@ -564,10 +554,10 @@ mod tests {
         // Warn threshold set, no error threshold: an over-threshold field warns (never errors),
         // even with enforce_error = true.
         let mut sink = CollectingSink::new(PayloadLimits {
-            blob_warn: Some(100),
-            blob_error: None,
-            memo_warn: None,
-            memo_error: None,
+            blob_warn: 100,
+            blob_error: 0,
+            memo_warn: 0,
+            memo_error: 0,
         });
         sink.check("big", LimitClass::Blob, 101, true);
         assert!(sink.errors.is_empty());

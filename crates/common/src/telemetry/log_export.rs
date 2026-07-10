@@ -300,10 +300,10 @@ mod tests {
         };
         // Warn-only limits: logs a warning, returns None.
         let limits = PayloadLimits {
-            blob_warn: Some(1),
-            memo_warn: Some(1),
-            blob_error: None,
-            memo_error: None,
+            blob_warn: 1,
+            memo_warn: 1,
+            blob_error: 0,
+            memo_error: 0,
         };
         {
             let span = span!(
@@ -363,10 +363,10 @@ mod tests {
         };
         // Error limits set: the oversized input produces an error-level violation.
         let limits = PayloadLimits {
-            blob_warn: Some(1),
-            memo_warn: Some(1),
-            blob_error: Some(1),
-            memo_error: Some(1),
+            blob_warn: 1,
+            memo_warn: 1,
+            blob_error: 1,
+            memo_error: 1,
         };
         {
             let span = span!(

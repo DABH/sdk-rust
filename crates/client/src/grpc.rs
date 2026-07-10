@@ -196,23 +196,18 @@ fn req_cloner<T: Clone>(cloneme: &Request<T>) -> Request<T> {
 /// the [`PayloadLimitViolation`] as its source (extract via [crate::payload_limit_violation_from]).
 fn validate_request_payload_limits<Req: Any>(
     req: &Request<Req>,
-    blob_warn: Option<usize>,
-    memo_warn: Option<usize>,
+    blob_warn: usize,
+    memo_warn: usize,
 ) -> Result<(), Status> {
     let mut limits = PayloadLimits {
         blob_warn,
         memo_warn,
-        blob_error: None,
-        memo_error: None,
+        blob_error: 0,
+        memo_error: 0,
     };
     if let Some(error_limits) = req.extensions().get::<PayloadErrorLimits>() {
-        // A zero threshold means "no limit for this class" (how the server reports an unset limit).
-        if error_limits.blob > 0 {
-            limits.blob_error = Some(error_limits.blob);
-        }
-        if error_limits.memo > 0 {
-            limits.memo_error = Some(error_limits.memo);
-        }
+        limits.blob_error = error_limits.blob;
+        limits.memo_error = error_limits.memo;
     }
     if let Some(violation) = validate_known_payload_limits(req.get_ref(), &limits) {
         let mut status = Status::invalid_argument(violation.to_string());
@@ -2024,13 +2019,13 @@ mod tests {
         };
 
         // warn thresholds = 1 byte. No per-call error limits: over-warn is allowed (warn-only).
-        assert!(validate_request_payload_limits(&new_req(), Some(1), Some(1)).is_ok());
+        assert!(validate_request_payload_limits(&new_req(), 1, 1).is_ok());
 
         // With per-call error limits below the payload size: rejected, carrying the typed violation.
         let mut req = new_req();
         req.extensions_mut()
             .insert(PayloadErrorLimits { blob: 10, memo: 10 });
-        let err = validate_request_payload_limits(&req, Some(1), Some(1)).unwrap_err();
+        let err = validate_request_payload_limits(&req, 1, 1).unwrap_err();
         let violation =
             crate::payload_limit_violation_from(&err).expect("violation carried on status");
         assert_eq!(violation.path, "input");
@@ -2044,10 +2039,10 @@ mod tests {
         let mut req = new_req();
         req.extensions_mut()
             .insert(PayloadErrorLimits { blob: 0, memo: 0 });
-        assert!(validate_request_payload_limits(&req, Some(1), Some(1)).is_ok());
+        assert!(validate_request_payload_limits(&req, 1, 1).is_ok());
 
-        // `None` warn thresholds disable warnings (and there are no error limits): always ok.
-        assert!(validate_request_payload_limits(&new_req(), None, None).is_ok());
+        // Zero warn thresholds disable warnings (and there are no error limits): always ok.
+        assert!(validate_request_payload_limits(&new_req(), 0, 0).is_ok());
     }
 
     // Just to help make sure some stuff compiles. Not run.

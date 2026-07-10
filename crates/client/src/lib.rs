@@ -167,27 +167,24 @@ struct ConnectionInner {
     capabilities: Option<get_system_info_response::Capabilities>,
     workers: Arc<ClientWorkerSet>,
     _dns_task: Option<Arc<dns::DnsReresolutionHandle>>,
-    /// Configured payload/memo size warning thresholds (bytes); `None` disables that warning.
-    payloads_warn_size: Option<usize>,
-    memo_warn_size: Option<usize>,
+    /// Configured payload/memo size warning thresholds (bytes); `0` disables that warning.
+    payloads_warn_size: usize,
+    memo_warn_size: usize,
 }
 
 /// Resolve a user-configured warning threshold (bytes) into the internal representation. `0`
 /// disables the warning (`None`); so does a value that doesn't fit in `usize` on this platform (a
 /// threshold larger than any addressable payload could never fire anyway), with a warning logged.
 /// `option` names the configured field, for diagnostics.
-fn resolve_warn_threshold(option: &'static str, bytes: u64) -> Option<usize> {
-    if bytes == 0 {
-        return None;
-    }
-    usize::try_from(bytes).ok().or_else(|| {
+fn resolve_warn_threshold(option: &'static str, bytes: u64) -> usize {
+    usize::try_from(bytes).unwrap_or_else(|_| {
         warn!(
             option,
             configured_bytes = bytes,
             "Configured payload size warning threshold exceeds the maximum addressable size on this \
              platform; disabling this warning"
         );
-        None
+        0
     })
 }
 
