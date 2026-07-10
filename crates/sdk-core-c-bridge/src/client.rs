@@ -610,6 +610,7 @@ async fn call_workflow_service(
             )
         }
         "CountSchedules" => rpc_call_on_trait!(client, call, WorkflowService, count_schedules),
+        "CountWorkers" => rpc_call_on_trait!(client, call, WorkflowService, count_workers),
         "CountWorkflowExecutions" => {
             rpc_call_on_trait!(client, call, WorkflowService, count_workflow_executions)
         }

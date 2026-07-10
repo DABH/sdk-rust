@@ -652,7 +652,6 @@ impl Worker {
             sys_info = tuner_builder.get_sys_info();
             Arc::new(tuner_builder.build())
         });
-        let sys_info = sys_info.unwrap_or_else(|| Arc::new(RealSysInfo::new()));
 
         metrics.worker_registered();
         let shutdown_token = CancellationToken::new();
@@ -882,6 +881,8 @@ impl Worker {
 
         let sdk_name_and_ver = client.sdk_name_and_version();
         let worker_heartbeat = worker_heartbeat_interval.map(|hb_interval| {
+            let heartbeat_sys_info =
+                sys_info.unwrap_or_else(|| Arc::new(RealSysInfo::new(hb_interval)));
             let hb_metrics = HeartbeatMetrics {
                 in_mem_metrics: metrics.in_memory_meter(),
                 wft_slots: wft_slots.clone(),
@@ -893,7 +894,7 @@ impl Worker {
                 act_last_suc_poll_time,
                 nexus_last_suc_poll_time,
                 status: worker_status.clone(),
-                sys_info,
+                sys_info: heartbeat_sys_info,
             };
             WorkerHeartbeatManager::new(
                 config.clone(),

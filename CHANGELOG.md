@@ -17,7 +17,7 @@ to docs, or any other relevant information.
 
 # Changelog
 
-## [Unreleased]
+## [0.5.0]
 
 ### Added
 * `client()` and `workflow_handle()` helpers to `ActivityContext` for easily obtaining a Temporal client
@@ -30,6 +30,11 @@ to docs, or any other relevant information.
   dependency tree free of `ring`.
 
 ### Fixed
+* `GetSystemInfo` connection initialization now only falls back to empty server capabilities when
+  `UNIMPLEMENTED` indicates the RPC method is missing. Other `UNIMPLEMENTED` responses are
+  reported as connection errors.
+* Connection initialization now retries once with gRPC compression disabled if the eager
+  `GetSystemInfo` call fails because the server cannot decompress gzip.
 * Awaiting a Nexus operation's result (`StartedNexusOperation::result()`) no longer trips
   nondeterminism detection ("a waker was invoked by a non-SDK source", TMPRL1100) on replay. The
   result future is a `Shared`, whose internal waker machinery must be polled inside an `SdkWakeGuard`
@@ -43,3 +48,22 @@ to docs, or any other relevant information.
 
 - Rust SDK `ApplicationFailure` and `WorkflowError` APIs now use boxed `std::error::Error` values instead of
   `anyhow::Error`.
+
+## [Unreleased]
+
+### Added
+* Schedule descriptions now expose their configured action via `ScheduleDescription::action()`,
+  including start-workflow accessors for workflow type, task queue, workflow ID, raw argument
+  payloads, and typed argument decoding through the client's data converter.
+
+### Breaking Changes
+* `WorkflowExecution::search_attributes`, `WorkflowExecutionDescription::search_attributes`,
+  `ScheduleDescription::search_attributes`, and `ScheduleSummary::search_attributes` now return
+  typed `SearchAttributes` instead of raw proto search attributes. Missing search attributes are
+  returned as an empty collection instead of `None`.
+
+### Fixed
+* OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic
+  metric reader reports an export error.
+* Worker heartbeat now samples host CPU/memory at the heartbeat interval (only when enabled) rather
+  than every 100ms.

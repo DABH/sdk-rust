@@ -1566,6 +1566,15 @@ proxier! {
         }
     );
     (
+        count_workers,
+        CountWorkersRequest,
+        CountWorkersResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
         record_worker_heartbeat,
         RecordWorkerHeartbeatRequest,
         RecordWorkerHeartbeatResponse,
