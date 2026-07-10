@@ -26,6 +26,7 @@ pub struct RetryConfigForCall(pub RetryOptions);
 
 /// Per-call payload/memo size error limits, attached to a request's extensions by a caller that
 /// wants error-level enforcement on this call.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
 pub struct PayloadErrorLimits {
     /// Blob (payload) size error threshold, in bytes.

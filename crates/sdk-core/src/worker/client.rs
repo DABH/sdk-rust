@@ -13,9 +13,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_client::{
-    Connection, Namespace, NamespacedClient, PayloadErrorLimits, PayloadLimitsClient, RetryOptions,
+    Connection, Namespace, NamespacedClient, PayloadErrorLimits, RetryOptions,
     SharedReplaceableClient,
-    grpc::WorkflowService,
+    grpc::{PayloadLimitsClient, WorkflowService},
     request_extensions::{IsWorkerTaskLongPoll, NoRetryOnMatching, RetryConfigForCall},
     worker::ClientWorkerSet,
 };

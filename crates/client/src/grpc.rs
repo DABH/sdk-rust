@@ -415,6 +415,7 @@ where
 ///
 /// The limits are shared and may be updated after construction (e.g. once a worker learns the
 /// namespace limits) via [`set_error_limits`](Self::set_error_limits); clones observe the update.
+#[doc(hidden)]
 #[derive(Clone)]
 pub struct PayloadLimitsClient<C> {
     inner: C,
