@@ -142,6 +142,7 @@ where
 /// Warn/error thresholds (bytes) for both limit classes. A `0` threshold disables that check for
 /// that class: `0` warn = no warnings, `0` error = no error enforcement (warnings only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[doc(hidden)]
 pub struct PayloadLimits {
     /// Blob warning threshold (bytes); `0` disables blob warnings.
     pub blob_warn: usize,
