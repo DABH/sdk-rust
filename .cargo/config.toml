@@ -13,6 +13,8 @@ integ-test = [
     "--features",
     "ephemeral-server",
     "--features",
+    "temporalio-sdk/experimental",
+    "--features",
     "temporalio-sdk-core/otel",
     "--package",
     "temporalio-sdk-core",

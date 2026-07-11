@@ -1,6 +1,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use crate::runtime::types::ContinueAsNewRequest;
+#[cfg(feature = "experimental")]
+use temporalio_common_wasm::protos::temporal::api::enums::v1::ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior;
 use temporalio_common_wasm::{
     Priority,
     data_converters::{
@@ -20,10 +22,7 @@ use temporalio_common_wasm::{
         },
         temporal::api::{
             common::v1::{Payload, RetryPolicy},
-            enums::v1::{
-                ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior,
-                WorkflowIdReusePolicy,
-            },
+            enums::v1::WorkflowIdReusePolicy,
             sdk::v1::UserMetadata,
         },
     },
@@ -494,6 +493,7 @@ impl NexusOperationOptions {
 }
 
 /// Versioning behavior to use for the first workflow task of a new continue-as-new run.
+#[cfg(feature = "experimental")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum ContinueAsNewVersioningBehavior {
@@ -506,6 +506,7 @@ pub enum ContinueAsNewVersioningBehavior {
     UseRampingVersion,
 }
 
+#[cfg(feature = "experimental")]
 impl From<ContinueAsNewVersioningBehavior> for ProtoContinueAsNewVersioningBehavior {
     fn from(value: ContinueAsNewVersioningBehavior) -> Self {
         match value {
@@ -522,6 +523,7 @@ impl From<ContinueAsNewVersioningBehavior> for ProtoContinueAsNewVersioningBehav
     }
 }
 
+#[cfg(feature = "experimental")]
 impl From<ProtoContinueAsNewVersioningBehavior> for ContinueAsNewVersioningBehavior {
     fn from(value: ProtoContinueAsNewVersioningBehavior) -> Self {
         match value {
@@ -570,6 +572,7 @@ pub struct ContinueAsNewOptions {
     /// This experimental option is only meaningful for workers using worker deployment
     /// versioning. `AutoUpgrade` routes the new run to the current deployment version;
     /// `UseRampingVersion` routes it to the ramping deployment version when one is configured.
+    #[cfg(feature = "experimental")]
     pub initial_versioning_behavior: Option<ContinueAsNewVersioningBehavior>,
 }
 
@@ -579,6 +582,15 @@ impl ContinueAsNewOptions {
         workflow_type: String,
         arguments: Vec<Payload>,
     ) -> ContinueAsNewRequest {
+        #[cfg(feature = "experimental")]
+        let initial_versioning_behavior = ProtoContinueAsNewVersioningBehavior::from(
+            self.initial_versioning_behavior
+                .unwrap_or(ContinueAsNewVersioningBehavior::Unspecified),
+        )
+        .into();
+        #[cfg(not(feature = "experimental"))]
+        let initial_versioning_behavior = Default::default();
+
         ContinueAsNewWorkflowExecution {
             workflow_type: self.workflow_type.unwrap_or(workflow_type),
             task_queue: self.task_queue.unwrap_or_default(),
@@ -600,11 +612,7 @@ impl ContinueAsNewOptions {
                 .versioning_intent
                 .unwrap_or(VersioningIntent::Unspecified)
                 .into(),
-            initial_versioning_behavior: ProtoContinueAsNewVersioningBehavior::from(
-                self.initial_versioning_behavior
-                    .unwrap_or(ContinueAsNewVersioningBehavior::Unspecified),
-            )
-            .into(),
+            initial_versioning_behavior,
         }
     }
 }

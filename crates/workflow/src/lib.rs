@@ -30,12 +30,14 @@ pub use temporalio_common_wasm::error::{
     ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowStartError,
     WorkflowSignalError,
 };
+#[cfg(feature = "experimental")]
+pub use workflow_context::ContinueAsNewVersioningBehavior;
 pub use workflow_context::{
     ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext, CancellableFuture,
-    ChildWorkflowOptions, ContinueAsNewOptions, ContinueAsNewVersioningBehavior,
-    ExternalWorkflowHandle, LocalActivityOptions, NexusOperationOptions, ParentWorkflowInfo,
-    RootWorkflowInfo, Signal, SignalData, StartChildWorkflowExecutionFailedCause,
-    StartedChildWorkflow, SyncWorkflowContext, TimerOptions, WorkflowContext, WorkflowContextView,
+    ChildWorkflowOptions, ContinueAsNewOptions, ExternalWorkflowHandle, LocalActivityOptions,
+    NexusOperationOptions, ParentWorkflowInfo, RootWorkflowInfo, Signal, SignalData,
+    StartChildWorkflowExecutionFailedCause, StartedChildWorkflow, SyncWorkflowContext,
+    TimerOptions, WorkflowContext, WorkflowContextView,
 };
 pub use workflows::{join, join_all, select};
 

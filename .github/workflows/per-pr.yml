@@ -43,6 +43,7 @@ jobs:
       - run: cargo lint
       - run: cargo test-lint
       - run: cargo check
+      - run: cargo check --features experimental
       - run: git diff --exit-code
 
   test:
@@ -88,12 +89,12 @@ jobs:
         with:
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test -- --include-ignored --nocapture
+      - run: cargo test --features experimental -- --include-ignored --nocapture
       - name: Find test executable for cgroup tests
         id: find-cgroup-test
         if: runner.os == 'Linux' && runner.arch == 'X64'
         run: |
-          test_executable=$(cargo build --tests --message-format json | jq -r 'select(.profile?.test == true and .target?.name == "temporalio_sdk_core" and .executable) | .executable')
+          test_executable=$(cargo build --tests --features experimental --message-format json | jq -r 'select(.profile?.test == true and .target?.name == "temporalio_sdk_core" and .executable) | .executable')
           cp $test_executable ./core-tests
       - name: Upload cgroup test executable
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
@@ -248,7 +249,7 @@ jobs:
         with:
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test --features=test-utilities --test cloud_tests
+      - run: cargo test --features=test-utilities,temporalio-sdk/experimental --test cloud_tests
 
   docker-integ-tests:
     name: Docker integ tests

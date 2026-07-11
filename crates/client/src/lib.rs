@@ -1194,6 +1194,10 @@ where
             res.run_id
         } else {
             // Normal start workflow
+            #[cfg(feature = "experimental")]
+            let request_eager_execution = options.enable_eager_workflow_start;
+            #[cfg(not(feature = "experimental"))]
+            let request_eager_execution = false;
             let res = self
                 .clone()
                 .start_workflow_execution(
@@ -1219,7 +1223,7 @@ where
                         workflow_task_timeout: options.task_timeout.and_then(|d| d.try_into().ok()),
                         search_attributes: options.search_attributes.map(|t| t.into_proto()),
                         cron_schedule: options.cron_schedule.unwrap_or_default(),
-                        request_eager_execution: options.enable_eager_workflow_start,
+                        request_eager_execution,
                         retry_policy: options.retry_policy,
                         links: options.links,
                         completion_callbacks: options.completion_callbacks,
