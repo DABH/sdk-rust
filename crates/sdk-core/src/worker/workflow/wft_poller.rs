@@ -51,6 +51,7 @@ pub(crate) fn make_wft_poller(
         config.task_queue.clone(),
         None,
         poller_behavior,
+        config.workflow_task_poller_behavior_auto_enroll,
         wft_slots.clone(),
         shutdown_token.child_token(),
         Some(move |np| {
@@ -69,6 +70,7 @@ pub(crate) fn make_wft_poller(
             config.task_queue.clone(),
             Some(sqn.clone()),
             wft_poller_behavior(config, true),
+            config.workflow_task_poller_behavior_auto_enroll,
             wft_slots.clone().into_sticky(),
             shutdown_token.child_token(),
             Some(move |np| {

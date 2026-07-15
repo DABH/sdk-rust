@@ -147,6 +147,13 @@ pub struct WorkerConfig {
     /// If using SimpleMaximum, Must be at least 2 when `max_cached_workflows` > 0, or is an error.
     #[builder(default = PollerBehavior::SimpleMaximum(5))]
     pub workflow_task_poller_behavior: PollerBehavior,
+    /// True if [WorkerConfig::workflow_task_poller_behavior] was left at its default (the user
+    /// configured neither a fixed poller count nor an explicit behavior). Such pollers are eligible
+    /// for automatic enrollment into poller autoscaling when the namespace advertises the
+    /// `poller_autoscaling_auto_enroll` capability. Layers above core (the Rust SDK, the c-bridge)
+    /// set this; direct core users leave it `false`.
+    #[builder(default = false)]
+    pub workflow_task_poller_behavior_auto_enroll: bool,
     /// Only applies when using [PollerBehavior::SimpleMaximum]
     ///
     /// (max workflow task polls * this number) = the number of max pollers that will be allowed for
@@ -160,10 +167,18 @@ pub struct WorkerConfig {
     /// worker's task queue
     #[builder(default = PollerBehavior::SimpleMaximum(5))]
     pub activity_task_poller_behavior: PollerBehavior,
+    /// True if [WorkerConfig::activity_task_poller_behavior] was left at its default. See
+    /// [WorkerConfig::workflow_task_poller_behavior_auto_enroll].
+    #[builder(default = false)]
+    pub activity_task_poller_behavior_auto_enroll: bool,
     /// Maximum number of concurrent poll nexus task requests we will perform at a time on this
     /// worker's task queue
     #[builder(default = PollerBehavior::SimpleMaximum(5))]
     pub nexus_task_poller_behavior: PollerBehavior,
+    /// True if [WorkerConfig::nexus_task_poller_behavior] was left at its default. See
+    /// [WorkerConfig::workflow_task_poller_behavior_auto_enroll].
+    #[builder(default = false)]
+    pub nexus_task_poller_behavior_auto_enroll: bool,
     /// Specifies which task types this worker will poll for.
     ///
     /// Note: At least one task type must be specified or the worker will fail validation.
@@ -438,6 +453,7 @@ pub struct Worker {
 pub struct NamespaceCapabilities {
     pub(crate) graceful_poll_shutdown: AtomicBool,
     pub(crate) poller_autoscaling: AtomicBool,
+    pub(crate) poller_autoscaling_auto_enroll: AtomicBool,
     pub(crate) worker_commands: AtomicBool,
 }
 
@@ -452,6 +468,12 @@ impl NamespaceCapabilities {
     /// decision from the server.
     pub fn poller_autoscaling(&self) -> bool {
         self.poller_autoscaling.load(Ordering::Relaxed)
+    }
+
+    /// Returns true if the namespace opts workers into poller autoscaling by default. Poller types
+    /// left at their default are automatically enrolled into autoscaling when this is set.
+    pub fn poller_autoscaling_auto_enroll(&self) -> bool {
+        self.poller_autoscaling_auto_enroll.load(Ordering::Relaxed)
     }
 
     /// Returns true if worker commands are supported in this namespace.
@@ -538,6 +560,17 @@ impl Worker {
                             .store(true, Ordering::Relaxed);
                     }
                     if caps.poller_autoscaling {
+                        self.capabilities
+                            .poller_autoscaling
+                            .store(true, Ordering::Relaxed);
+                    }
+                    if caps.poller_autoscaling_auto_enroll {
+                        self.capabilities
+                            .poller_autoscaling_auto_enroll
+                            .store(true, Ordering::Relaxed);
+                        // Auto-enroll implies full autoscaling support (including scaling down on
+                        // empty polls before any server scaling decision), so enable the
+                        // poller_autoscaling capability too. See `can_scale_down`.
                         self.capabilities
                             .poller_autoscaling
                             .store(true, Ordering::Relaxed);
@@ -670,6 +703,7 @@ impl Worker {
         let capabilities = Arc::new(NamespaceCapabilities {
             graceful_poll_shutdown: AtomicBool::new(false),
             poller_autoscaling: AtomicBool::new(false),
+            poller_autoscaling_auto_enroll: AtomicBool::new(false),
             worker_commands: AtomicBool::new(false),
         });
 
@@ -714,6 +748,7 @@ impl Worker {
                         client.clone(),
                         config.task_queue.clone(),
                         config.activity_task_poller_behavior,
+                        config.activity_task_poller_behavior_auto_enroll,
                         act_slots.clone(),
                         shutdown_token.child_token(),
                         Some(move |np| act_metrics.record_num_pollers(np)),
@@ -735,6 +770,7 @@ impl Worker {
                         client.clone(),
                         config.task_queue.clone(),
                         config.nexus_task_poller_behavior,
+                        config.nexus_task_poller_behavior_auto_enroll,
                         nexus_slots.clone(),
                         shutdown_token.child_token(),
                         Some(move |np| np_metrics.record_num_pollers(np)),

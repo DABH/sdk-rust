@@ -115,6 +115,30 @@ impl TryFrom<&PollerBehavior> for temporalio_sdk_core::PollerBehavior {
     }
 }
 
+/// Converts an FFI poller behavior into an optional core poller behavior. Both fields null means
+/// the poller was left unset by lang: the caller should apply the default behavior and treat the
+/// poller as eligible for automatic enrollment into poller autoscaling.
+fn ffi_poller_behavior_opt(
+    value: &PollerBehavior,
+) -> anyhow::Result<Option<temporalio_sdk_core::PollerBehavior>> {
+    if !value.simple_maximum.is_null() && !value.autoscaling.is_null() {
+        bail!("simple_maximum and autoscaling cannot both be non-null values");
+    }
+    if let Some(sm) = unsafe { value.simple_maximum.as_ref() } {
+        Ok(Some(temporalio_sdk_core::PollerBehavior::SimpleMaximum(
+            sm.simple_maximum,
+        )))
+    } else if let Some(a) = unsafe { value.autoscaling.as_ref() } {
+        Ok(Some(temporalio_sdk_core::PollerBehavior::Autoscaling {
+            minimum: a.minimum,
+            maximum: a.maximum,
+            initial: a.initial,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
 #[repr(C)]
 pub enum WorkerVersioningStrategy {
     None(WorkerVersioningNone),
@@ -1235,16 +1259,28 @@ impl TryFrom<&WorkerOptions> for temporalio_sdk_core::WorkerConfig {
             // auto-cancel-activity behavior or shutdown will not occur, so we
             // always set it even if 0.
             .graceful_shutdown_period(Duration::from_millis(opt.graceful_shutdown_period_millis))
-            .workflow_task_poller_behavior(temporalio_sdk_core::PollerBehavior::try_from(
-                &opt.workflow_task_poller_behavior,
-            )?)
+            .workflow_task_poller_behavior(
+                ffi_poller_behavior_opt(&opt.workflow_task_poller_behavior)?
+                    .unwrap_or(temporalio_sdk_core::PollerBehavior::SimpleMaximum(5)),
+            )
+            .workflow_task_poller_behavior_auto_enroll(
+                ffi_poller_behavior_opt(&opt.workflow_task_poller_behavior)?.is_none(),
+            )
             .nonsticky_to_sticky_poll_ratio(opt.nonsticky_to_sticky_poll_ratio)
-            .activity_task_poller_behavior(temporalio_sdk_core::PollerBehavior::try_from(
-                &opt.activity_task_poller_behavior,
-            )?)
-            .nexus_task_poller_behavior(temporalio_sdk_core::PollerBehavior::try_from(
-                &opt.nexus_task_poller_behavior,
-            )?)
+            .activity_task_poller_behavior(
+                ffi_poller_behavior_opt(&opt.activity_task_poller_behavior)?
+                    .unwrap_or(temporalio_sdk_core::PollerBehavior::SimpleMaximum(5)),
+            )
+            .activity_task_poller_behavior_auto_enroll(
+                ffi_poller_behavior_opt(&opt.activity_task_poller_behavior)?.is_none(),
+            )
+            .nexus_task_poller_behavior(
+                ffi_poller_behavior_opt(&opt.nexus_task_poller_behavior)?
+                    .unwrap_or(temporalio_sdk_core::PollerBehavior::SimpleMaximum(5)),
+            )
+            .nexus_task_poller_behavior_auto_enroll(
+                ffi_poller_behavior_opt(&opt.nexus_task_poller_behavior)?.is_none(),
+            )
             .workflow_failure_errors(if opt.nondeterminism_as_workflow_fail {
                 HashSet::from([WorkflowErrorType::Nondeterminism])
             } else {
@@ -1403,6 +1439,55 @@ mod tests {
             simple_maximum: simple as *const _,
             autoscaling: std::ptr::null(),
         }
+    }
+
+    #[test]
+    fn ffi_poller_behavior_opt_maps_unset_to_none() {
+        let unset = PollerBehavior {
+            simple_maximum: std::ptr::null(),
+            autoscaling: std::ptr::null(),
+        };
+        assert!(ffi_poller_behavior_opt(&unset).unwrap().is_none());
+    }
+
+    #[test]
+    fn ffi_poller_behavior_opt_maps_configured_behaviors() {
+        assert_eq!(
+            ffi_poller_behavior_opt(&simple_poller_behavior(3)).unwrap(),
+            Some(temporalio_sdk_core::PollerBehavior::SimpleMaximum(3)),
+        );
+        let autoscaling = Box::leak(Box::new(PollerBehaviorAutoscaling {
+            minimum: 2,
+            maximum: 20,
+            initial: 4,
+        }));
+        let pb = PollerBehavior {
+            simple_maximum: std::ptr::null(),
+            autoscaling: autoscaling as *const _,
+        };
+        assert_eq!(
+            ffi_poller_behavior_opt(&pb).unwrap(),
+            Some(temporalio_sdk_core::PollerBehavior::Autoscaling {
+                minimum: 2,
+                maximum: 20,
+                initial: 4,
+            }),
+        );
+    }
+
+    #[test]
+    fn ffi_poller_behavior_opt_rejects_both_set() {
+        let simple = Box::leak(Box::new(PollerBehaviorSimpleMaximum { simple_maximum: 1 }));
+        let autoscaling = Box::leak(Box::new(PollerBehaviorAutoscaling {
+            minimum: 1,
+            maximum: 2,
+            initial: 1,
+        }));
+        let pb = PollerBehavior {
+            simple_maximum: simple as *const _,
+            autoscaling: autoscaling as *const _,
+        };
+        assert!(ffi_poller_behavior_opt(&pb).is_err());
     }
 
     fn base_worker_options(

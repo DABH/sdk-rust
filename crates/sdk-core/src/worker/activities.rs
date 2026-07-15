@@ -868,6 +868,7 @@ mod tests {
             mock_client.clone(),
             "tq".to_string(),
             PollerBehavior::SimpleMaximum(1),
+            false,
             sem.clone(),
             shutdown_token,
             None::<fn(usize)>,
@@ -955,6 +956,7 @@ mod tests {
             "tq".to_string(),
             // Lots of concurrent pollers, to ensure we don't poll to much when that's the case
             PollerBehavior::SimpleMaximum(5),
+            false,
             sem.clone(),
             shutdown_token.clone(),
             None::<fn(usize)>,

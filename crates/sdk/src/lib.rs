@@ -196,8 +196,10 @@ pub struct WorkerOptions {
     /// Controls how polling for Workflow tasks will happen on this worker's task queue. See also
     /// [WorkerConfig::nonsticky_to_sticky_poll_ratio]. If using SimpleMaximum, Must be at least 2
     /// when `max_cached_workflows` > 0, or is an error.
-    #[builder(default = PollerBehavior::SimpleMaximum(5))]
-    pub workflow_task_poller_behavior: PollerBehavior,
+    ///
+    /// If left unset, the worker uses `SimpleMaximum(5)` and becomes eligible for automatic
+    /// enrollment into poller autoscaling when the namespace advertises support for it.
+    pub workflow_task_poller_behavior: Option<PollerBehavior>,
     /// Only applies when using [PollerBehavior::SimpleMaximum]
     ///
     /// (max workflow task polls * this number) = the number of max pollers that will be allowed for
@@ -208,11 +210,15 @@ pub struct WorkerOptions {
     #[builder(default = 0.2)]
     pub nonsticky_to_sticky_poll_ratio: f32,
     /// Controls how polling for Activity tasks will happen on this worker's task queue.
-    #[builder(default = PollerBehavior::SimpleMaximum(5))]
-    pub activity_task_poller_behavior: PollerBehavior,
+    ///
+    /// If left unset, the worker uses `SimpleMaximum(5)` and becomes eligible for automatic
+    /// enrollment into poller autoscaling when the namespace advertises support for it.
+    pub activity_task_poller_behavior: Option<PollerBehavior>,
     /// Controls how polling for Nexus tasks will happen on this worker's task queue.
-    #[builder(default = PollerBehavior::SimpleMaximum(5))]
-    pub nexus_task_poller_behavior: PollerBehavior,
+    ///
+    /// If left unset, the worker uses `SimpleMaximum(5)` and becomes eligible for automatic
+    /// enrollment into poller autoscaling when the namespace advertises support for it.
+    pub nexus_task_poller_behavior: Option<PollerBehavior>,
     // TODO [rust-sdk-branch]: Will go away once workflow registration can only happen in here.
     //   Then it can be auto-determined.
     /// Specifies which task types this worker will poll for.
@@ -415,9 +421,21 @@ impl WorkerOptions {
             }))
             .max_cached_workflows(self.max_cached_workflows)
             .tuner(self.tuner.clone())
-            .workflow_task_poller_behavior(self.workflow_task_poller_behavior)
-            .activity_task_poller_behavior(self.activity_task_poller_behavior)
-            .nexus_task_poller_behavior(self.nexus_task_poller_behavior)
+            .workflow_task_poller_behavior(
+                self.workflow_task_poller_behavior
+                    .unwrap_or(PollerBehavior::SimpleMaximum(5)),
+            )
+            .workflow_task_poller_behavior_auto_enroll(self.workflow_task_poller_behavior.is_none())
+            .activity_task_poller_behavior(
+                self.activity_task_poller_behavior
+                    .unwrap_or(PollerBehavior::SimpleMaximum(5)),
+            )
+            .activity_task_poller_behavior_auto_enroll(self.activity_task_poller_behavior.is_none())
+            .nexus_task_poller_behavior(
+                self.nexus_task_poller_behavior
+                    .unwrap_or(PollerBehavior::SimpleMaximum(5)),
+            )
+            .nexus_task_poller_behavior_auto_enroll(self.nexus_task_poller_behavior.is_none())
             .task_types(self.task_types)
             .sticky_queue_schedule_to_start_timeout(self.sticky_queue_schedule_to_start_timeout)
             .max_heartbeat_throttle_interval(self.max_heartbeat_throttle_interval)

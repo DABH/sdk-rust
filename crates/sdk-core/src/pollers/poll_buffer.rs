@@ -99,6 +99,7 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
         task_queue: String,
         sticky_queue: Option<String>,
         poller_behavior: PollerBehavior,
+        auto_enroll_eligible: bool,
         permit_dealer: MeteredPermitDealer<WorkflowSlotKind>,
         shutdown: CancellationToken,
         num_pollers_handler: Option<impl Fn(usize) + Send + Sync + 'static>,
@@ -107,12 +108,15 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
         capabilities: Arc<NamespaceCapabilities>,
     ) -> Self {
         let is_sticky = sticky_queue.is_some();
+        let autoscaling_active = Arc::new(AtomicBool::new(false));
         let poll_scaler = PollScaler::new(
             poller_behavior,
+            auto_enroll_eligible,
             num_pollers_handler,
             shutdown.clone(),
             last_successful_poll_time,
             capabilities.clone(),
+            autoscaling_active.clone(),
         );
         if let Some(wftps) = options.wft_poller_shared.as_ref() {
             if is_sticky {
@@ -137,17 +141,18 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
                 }
             }
         });
-        let no_retry = if matches!(poller_behavior, PollerBehavior::Autoscaling { .. }) {
-            Some(NoRetryOnMatching {
-                predicate: poll_scaling_error_matcher,
-            })
-        } else {
-            None
-        };
         let poll_fn = move |timeout_override: Option<Duration>| {
             let client = client.clone();
             let task_queue = task_queue.clone();
             let sticky_queue_name = sticky_queue.clone();
+            // Resolved by `PollScaler::activate` before the first poll; recomputed per call so a
+            // default poller auto-enrolled into autoscaling gets the poller-managed backoff.
+            let no_retry =
+                autoscaling_active
+                    .load(Ordering::Relaxed)
+                    .then_some(NoRetryOnMatching {
+                        predicate: poll_scaling_error_matcher,
+                    });
             async move {
                 client
                     .poll_workflow_task(
@@ -179,6 +184,7 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
         client: Arc<dyn WorkerClient>,
         task_queue: String,
         poller_behavior: PollerBehavior,
+        auto_enroll_eligible: bool,
         permit_dealer: MeteredPermitDealer<ActivitySlotKind>,
         shutdown: CancellationToken,
         num_pollers_handler: Option<impl Fn(usize) + Send + Sync + 'static>,
@@ -195,38 +201,44 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
                     async move { rl.wait().await }.boxed()
                 }
             });
-        let no_retry = if matches!(poller_behavior, PollerBehavior::Autoscaling { .. }) {
-            Some(NoRetryOnMatching {
-                predicate: poll_scaling_error_matcher,
-            })
-        } else {
-            None
-        };
-        let poll_fn = move |timeout_override: Option<Duration>| {
-            let client = client.clone();
-            let task_queue = task_queue.clone();
-            async move {
-                client
-                    .poll_activity_task(
-                        PollOptions {
-                            task_queue,
-                            no_retry,
-                            timeout_override,
-                        },
-                        PollActivityOptions {
-                            max_tasks_per_sec: options.max_tps,
-                        },
-                    )
-                    .await
+        let autoscaling_active = Arc::new(AtomicBool::new(false));
+        let poll_fn = {
+            let autoscaling_active = autoscaling_active.clone();
+            move |timeout_override: Option<Duration>| {
+                let client = client.clone();
+                let task_queue = task_queue.clone();
+                // Resolved by `PollScaler::activate` before the first poll; recomputed per call.
+                let no_retry =
+                    autoscaling_active
+                        .load(Ordering::Relaxed)
+                        .then_some(NoRetryOnMatching {
+                            predicate: poll_scaling_error_matcher,
+                        });
+                async move {
+                    client
+                        .poll_activity_task(
+                            PollOptions {
+                                task_queue,
+                                no_retry,
+                                timeout_override,
+                            },
+                            PollActivityOptions {
+                                max_tasks_per_sec: options.max_tps,
+                            },
+                        )
+                        .await
+                }
             }
         };
 
         let poll_scaler = PollScaler::new(
             poller_behavior,
+            auto_enroll_eligible,
             num_pollers_handler,
             shutdown.clone(),
             last_successful_poll_time,
             capabilities.clone(),
+            autoscaling_active,
         );
         Self::new(
             poll_fn,
@@ -246,6 +258,7 @@ impl LongPollBuffer<PollNexusTaskQueueResponse, NexusSlotKind> {
         client: Arc<dyn WorkerClient>,
         task_queue: String,
         poller_behavior: PollerBehavior,
+        auto_enroll_eligible: bool,
         permit_dealer: MeteredPermitDealer<NexusSlotKind>,
         shutdown: CancellationToken,
         num_pollers_handler: Option<impl Fn(usize) + Send + Sync + 'static>,
@@ -253,29 +266,33 @@ impl LongPollBuffer<PollNexusTaskQueueResponse, NexusSlotKind> {
         capabilities: Arc<NamespaceCapabilities>,
         worker_commands_queue: bool,
     ) -> Self {
-        let no_retry = if matches!(poller_behavior, PollerBehavior::Autoscaling { .. }) {
-            Some(NoRetryOnMatching {
-                predicate: poll_scaling_error_matcher,
-            })
-        } else {
-            None
-        };
-        let poll_fn = move |timeout_override: Option<Duration>| {
-            let client = client.clone();
-            let task_queue = task_queue.clone();
-            async move {
-                client
-                    .poll_nexus_task(
-                        PollOptions {
-                            task_queue,
-                            no_retry,
-                            timeout_override,
-                        },
-                        PollNexusOptions {
-                            worker_commands_queue,
-                        },
-                    )
-                    .await
+        let autoscaling_active = Arc::new(AtomicBool::new(false));
+        let poll_fn = {
+            let autoscaling_active = autoscaling_active.clone();
+            move |timeout_override: Option<Duration>| {
+                let client = client.clone();
+                let task_queue = task_queue.clone();
+                // Resolved by `PollScaler::activate` before the first poll; recomputed per call.
+                let no_retry =
+                    autoscaling_active
+                        .load(Ordering::Relaxed)
+                        .then_some(NoRetryOnMatching {
+                            predicate: poll_scaling_error_matcher,
+                        });
+                async move {
+                    client
+                        .poll_nexus_task(
+                            PollOptions {
+                                task_queue,
+                                no_retry,
+                                timeout_override,
+                            },
+                            PollNexusOptions {
+                                worker_commands_queue,
+                            },
+                        )
+                        .await
+                }
             }
         };
         Self::new(
@@ -284,10 +301,12 @@ impl LongPollBuffer<PollNexusTaskQueueResponse, NexusSlotKind> {
             shutdown.clone(),
             PollScaler::new(
                 poller_behavior,
+                auto_enroll_eligible,
                 num_pollers_handler,
                 shutdown,
                 last_successful_poll_time,
                 capabilities.clone(),
+                autoscaling_active,
             ),
             None::<fn() -> BoxFuture<'static, ()>>,
             None::<fn(&PollNexusTaskQueueResponse)>,
@@ -345,6 +364,12 @@ where
                     _ = shutdown_clone.cancelled() => return,
                 }
                 drop(wait_for_start);
+
+                // At this point the worker has started polling, which lang only does after
+                // `Worker::validate` has populated the namespace capabilities. Resolve the
+                // effective poller behavior now (this may auto-enroll a default poller into
+                // autoscaling) before issuing any poll.
+                poll_scaler.activate();
 
                 let (spawned_tx, spawned_rx) = unbounded_channel();
                 // This is needed to ensure we don't exit this task before all received polls have
@@ -494,11 +519,44 @@ async fn handle_task_panic(t: JoinHandle<()>) {
 /// always respect scale down decisions (until the number of pollers reaches the minimum), but may
 /// choose to ignore scale up decisions if it appears that adding more pollers is not contributing
 /// to increased task throughput. See more detailed comments in the implementation.
+/// Resolves the effective poller behavior for a poller, applying automatic enrollment into
+/// autoscaling when the poller was left at its default and the namespace advertises the
+/// `poller_autoscaling_auto_enroll` capability. Otherwise the configured behavior is used as-is.
+fn resolve_effective_behavior(
+    configured: PollerBehavior,
+    auto_enroll_eligible: bool,
+    capabilities: &NamespaceCapabilities,
+) -> PollerBehavior {
+    if auto_enroll_eligible && capabilities.poller_autoscaling_auto_enroll() {
+        // Mirrors the Go SDK's auto-enroll autoscaling defaults.
+        PollerBehavior::Autoscaling {
+            minimum: 1,
+            maximum: 100,
+            initial: 5,
+        }
+    } else {
+        configured
+    }
+}
+
 struct PollScaler<F> {
-    report_handle: Arc<PollScalerReportHandle>,
+    // The watch channel is created eagerly because `WFTPollerShared` needs `active_rx` before the
+    // poller task starts.
     active_tx: watch::Sender<usize>,
     active_rx: watch::Receiver<usize>,
     num_pollers_handler: Option<Arc<F>>,
+    // Inputs captured so the effective behavior can be resolved lazily in `activate`, once the
+    // namespace capabilities discovered by `Worker::validate` are known (which is guaranteed to be
+    // before polling begins).
+    configured_behavior: PollerBehavior,
+    auto_enroll_eligible: bool,
+    capabilities: Arc<NamespaceCapabilities>,
+    last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
+    shutdown: CancellationToken,
+    /// Shared with the poll function so `no_retry` tracks the resolved (post-`activate`) behavior.
+    autoscaling_active: Arc<AtomicBool>,
+    // Resolved by `activate`, before the poll loop issues any poll.
+    report_handle: Option<Arc<PollScalerReportHandle>>,
     ingestor_task: Option<JoinHandle<()>>,
 }
 
@@ -507,14 +565,43 @@ where
     F: Fn(usize),
 {
     fn new(
-        behavior: PollerBehavior,
+        configured_behavior: PollerBehavior,
+        auto_enroll_eligible: bool,
         num_pollers_handler: Option<F>,
         shutdown: CancellationToken,
         last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
         capabilities: Arc<NamespaceCapabilities>,
+        autoscaling_active: Arc<AtomicBool>,
     ) -> Self {
         let (active_tx, active_rx) = watch::channel(0);
         let num_pollers_handler = num_pollers_handler.map(Arc::new);
+        Self {
+            active_tx,
+            active_rx,
+            num_pollers_handler,
+            configured_behavior,
+            auto_enroll_eligible,
+            capabilities,
+            last_successful_poll_time,
+            shutdown,
+            autoscaling_active,
+            report_handle: None,
+            ingestor_task: None,
+        }
+    }
+
+    /// Resolves the effective poller behavior and builds the (immutable) report handle plus, when
+    /// autoscaling, the ingestor task. Must be called from within the poller task, after the start
+    /// signal is received (so `Worker::validate` has populated the namespace capabilities) and
+    /// before the poll loop issues any poll.
+    fn activate(&mut self) {
+        let behavior = resolve_effective_behavior(
+            self.configured_behavior,
+            self.auto_enroll_eligible,
+            &self.capabilities,
+        );
+        self.autoscaling_active
+            .store(behavior.is_autoscaling(), Ordering::Relaxed);
         let (min, max, target) = match behavior {
             PollerBehavior::SimpleMaximum(m) => (1, m, m),
             PollerBehavior::Autoscaling {
@@ -523,6 +610,8 @@ where
                 initial,
             } => (minimum, maximum, initial),
         };
+        let capabilities = self.capabilities.clone();
+        let last_successful_poll_time = self.last_successful_poll_time.clone();
         let report_handle = Arc::new(PollScalerReportHandle {
             max,
             min,
@@ -558,14 +647,15 @@ where
             }),
         });
         let rhc = report_handle.clone();
-        let ingestor_task = if behavior.is_autoscaling() {
+        let shutdown = self.shutdown.clone();
+        self.ingestor_task = behavior.is_autoscaling().then(|| {
             // Here we spawn a task to periodically check if we should permit increasing the
             // poller count further. We do this by comparing the number of ingested items in the
             // current period with the number of ingested items in the previous period. If we
             // are successfully ingesting more items, then it makes sense to allow scaling up.
             // If we aren't, then we're probably limited by how fast we can process the tasks
             // and it's not worth increasing the poller count further.
-            Some(tokio::task::spawn(async move {
+            tokio::task::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(100));
                 loop {
                     tokio::select! {
@@ -579,24 +669,19 @@ where
                         Ordering::Relaxed,
                     );
                 }
-            }))
-        } else {
-            None
-        };
-        Self {
-            report_handle,
-            active_tx,
-            active_rx,
-            num_pollers_handler,
-            ingestor_task,
-        }
+            })
+        });
+        self.report_handle = Some(report_handle);
     }
 
     async fn wait_until_allowed(&mut self) -> ActiveCounter<impl Fn(usize) + use<F>> {
+        let report_handle = self
+            .report_handle
+            .clone()
+            .expect("PollScaler must be activated before polling");
         self.active_rx
             .wait_for(|v| {
-                *v < self.report_handle.max
-                    && *v < self.report_handle.target.load(Ordering::Relaxed)
+                *v < report_handle.max && *v < report_handle.target.load(Ordering::Relaxed)
             })
             .await
             .expect("Poll allow does not panic");
@@ -604,7 +689,9 @@ where
     }
 
     fn get_report_handle(&self) -> Arc<PollScalerReportHandle> {
-        self.report_handle.clone()
+        self.report_handle
+            .clone()
+            .expect("PollScaler must be activated before polling")
     }
 }
 
@@ -862,6 +949,61 @@ mod tests {
     use std::time::Duration;
     use tokio::{select, sync::Notify};
 
+    fn caps(auto_enroll: bool) -> NamespaceCapabilities {
+        let caps = NamespaceCapabilities::default();
+        caps.poller_autoscaling_auto_enroll
+            .store(auto_enroll, Ordering::Relaxed);
+        caps
+    }
+
+    const AUTO_ENROLLED: PollerBehavior = PollerBehavior::Autoscaling {
+        minimum: 1,
+        maximum: 100,
+        initial: 5,
+    };
+
+    #[test]
+    fn auto_enroll_switches_eligible_default_poller_to_autoscaling() {
+        assert_eq!(
+            resolve_effective_behavior(PollerBehavior::SimpleMaximum(5), true, &caps(true)),
+            AUTO_ENROLLED,
+        );
+    }
+
+    #[test]
+    fn no_auto_enroll_capability_leaves_eligible_poller_at_configured() {
+        assert_eq!(
+            resolve_effective_behavior(PollerBehavior::SimpleMaximum(5), true, &caps(false)),
+            PollerBehavior::SimpleMaximum(5),
+        );
+    }
+
+    #[test]
+    fn explicitly_configured_poller_is_never_auto_enrolled() {
+        // Not eligible: user explicitly set the behavior, so it is left unchanged even when the
+        // namespace advertises auto-enroll.
+        assert_eq!(
+            resolve_effective_behavior(PollerBehavior::SimpleMaximum(3), false, &caps(true)),
+            PollerBehavior::SimpleMaximum(3),
+        );
+        assert_eq!(
+            resolve_effective_behavior(
+                PollerBehavior::Autoscaling {
+                    minimum: 2,
+                    maximum: 20,
+                    initial: 4,
+                },
+                false,
+                &caps(true),
+            ),
+            PollerBehavior::Autoscaling {
+                minimum: 2,
+                maximum: 20,
+                initial: 4,
+            },
+        );
+    }
+
     #[tokio::test]
     async fn only_polls_once_with_1_poller() {
         let mut mock_client = mock_manual_worker_client();
@@ -881,6 +1023,7 @@ mod tests {
             "sometq".to_string(),
             None,
             PollerBehavior::SimpleMaximum(1),
+            false,
             fixed_size_permit_dealer(10),
             CancellationToken::new(),
             None::<fn(usize)>,
@@ -938,6 +1081,7 @@ mod tests {
                 maximum: 1,
                 initial: 1,
             },
+            false,
             fixed_size_permit_dealer(1),
             CancellationToken::new(),
             None::<fn(usize)>,
@@ -1015,6 +1159,7 @@ mod tests {
             "sometq".to_string(),
             None,
             PollerBehavior::SimpleMaximum(3),
+            false,
             fixed_size_permit_dealer(10),
             shutdown_token.clone(),
             None::<fn(usize)>,
@@ -1121,6 +1266,7 @@ mod tests {
                 maximum: 100,
                 initial: 10,
             },
+            false,
             fixed_size_permit_dealer(10),
             CancellationToken::new(),
             None::<fn(usize)>,
@@ -1202,6 +1348,7 @@ mod tests {
             "sometq".to_string(),
             None,
             PollerBehavior::SimpleMaximum(1),
+            false,
             fixed_size_permit_dealer(10),
             shutdown_token.clone(),
             None::<fn(usize)>,
