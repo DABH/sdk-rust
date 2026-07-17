@@ -248,6 +248,15 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --features=test-utilities --test cloud_tests
 
+  skipped-cloud-tests:
+    if: github.event.pull_request.head.repo.full_name != '' && github.event.pull_request.head.repo.full_name != 'temporalio/sdk-rust'
+    name: Cloud tests
+    permissions: {}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip Cloud tests for external pull requests
+        run: echo 'Cloud tests are not run for external pull requests.'
+
   docker-integ-tests:
     name: Docker integ tests
     env:
