@@ -1,4 +1,5 @@
 mod poll_buffer;
+mod poller_groups;
 
 pub(crate) use poll_buffer::{
     ActivityTaskOptions, LongPollBuffer, WorkflowTaskOptions, WorkflowTaskPoller,

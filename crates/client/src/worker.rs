@@ -14,7 +14,8 @@ use temporalio_common::{
     protos::{
         TaskToken,
         temporal::api::{
-            worker::v1::WorkerHeartbeat, workflowservice::v1::PollWorkflowTaskQueueResponse,
+            taskqueue::v1::PollerGroupsInfo, worker::v1::WorkerHeartbeat,
+            workflowservice::v1::PollWorkflowTaskQueueResponse,
         },
     },
     worker::{WorkerDeploymentOptions, WorkerTaskTypes},
@@ -83,6 +84,8 @@ struct ClientWorkerSetImpl {
     all_workers: HashMap<Uuid, Arc<dyn ClientWorker + Send + Sync>>,
     /// Maps namespace to shared worker for worker heartbeating
     shared_worker: HashMap<String, Box<dyn SharedNamespaceWorkerTrait + Send + Sync>>,
+    /// Maps namespace to poller group info store
+    poller_group_info_stores: HashMap<String, Arc<PollerGroupInfoStore>>,
 }
 
 impl ClientWorkerSetImpl {
@@ -92,6 +95,7 @@ impl ClientWorkerSetImpl {
             slot_providers: Default::default(),
             all_workers: Default::default(),
             shared_worker: Default::default(),
+            poller_group_info_stores: Default::default(),
         }
     }
 
@@ -286,6 +290,63 @@ impl ClientWorkerSetImpl {
     }
 }
 
+/// Maintains the latest versioned poller-group weights for one namespace on a connection.
+#[derive(Default)]
+pub struct PollerGroupInfoStore {
+    state: RwLock<PollerGroupInfoStoreState>,
+}
+
+impl PollerGroupInfoStore {
+    /// Replaces the weights when `info` has a newer version.
+    ///
+    /// Returns whether the update was applied.
+    pub fn update(&self, info: Option<&PollerGroupsInfo>) -> bool {
+        let Some(info) = info else {
+            return false;
+        };
+        let weights = Arc::new(
+            info.poller_groups
+                .iter()
+                .filter(|group| !group.id.is_empty())
+                .map(|group| (group.id.clone(), group.weight))
+                .collect(),
+        );
+
+        let mut state = self.state.write();
+        if state.version_set && info.version <= state.version {
+            return false;
+        }
+
+        state.weights = weights;
+        state.version = info.version;
+        state.version_set = true;
+        true
+    }
+
+    /// Returns the current poller-group weights.
+    pub fn weights(&self) -> Arc<HashMap<String, f32>> {
+        Arc::clone(&self.state.read().weights)
+    }
+
+    /// Returns the number of groups with current weights.
+    pub fn len(&self) -> usize {
+        (*self.state.read()).weights.len()
+    }
+
+    /// Returns whether there are no groups with current weights.
+    pub fn is_empty(&self) -> bool {
+        self.state.read().weights.is_empty()
+    }
+}
+
+#[derive(Default)]
+struct PollerGroupInfoStoreState {
+    weights: Arc<HashMap<String, f32>>,
+    version: i64,
+    // Required because version zero is valid for the first update.
+    version_set: bool,
+}
+
 /// This trait represents a shared namespace worker that sends worker heartbeats and
 /// receives worker commands.
 pub trait SharedNamespaceWorkerTrait {
@@ -377,6 +438,26 @@ impl ClientWorkerSet {
         self.worker_grouping_key
     }
 
+    /// Returns the poller-group weight store shared by this connection and namespace.
+    pub fn poller_group_info_store(&self, namespace: &str) -> Arc<PollerGroupInfoStore> {
+        if let Some(store) = self
+            .worker_manager
+            .read()
+            .poller_group_info_stores
+            .get(namespace)
+            .cloned()
+        {
+            return store;
+        }
+
+        self.worker_manager
+            .write()
+            .poller_group_info_stores
+            .entry(namespace.to_owned())
+            .or_default()
+            .clone()
+    }
+
     #[cfg(test)]
     /// Returns (num_providers, num_buckets), where a bucket key is namespace+task_queue.
     /// There is only one provider per bucket so `num_providers` should be equal to `num_buckets`.
@@ -458,6 +539,25 @@ pub trait ClientWorker: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{sync::Barrier, thread};
+    use temporalio_common::protos::temporal::api::taskqueue::v1::PollerGroupInfo;
+
+    fn poller_groups_info<I, S>(version: i64, groups: I) -> PollerGroupsInfo
+    where
+        I: IntoIterator<Item = (S, f32)>,
+        S: Into<String>,
+    {
+        PollerGroupsInfo {
+            version,
+            poller_groups: groups
+                .into_iter()
+                .map(|(id, weight)| PollerGroupInfo {
+                    id: id.into(),
+                    weight,
+                })
+                .collect(),
+        }
+    }
 
     fn new_mock_slot(with_error: bool) -> Box<MockSlot> {
         let mut mock_slot = MockSlot::new();
@@ -506,6 +606,152 @@ mod tests {
                 enable_nexus: true,
             });
         mock_provider
+    }
+
+    #[test]
+    fn poller_group_store_ignores_missing_info() {
+        let store = PollerGroupInfoStore::default();
+        let initial_weights = store.weights();
+
+        assert!(!store.update(None));
+        assert!(Arc::ptr_eq(&initial_weights, &store.weights()));
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn poller_group_store_accepts_initial_version_zero_and_rejects_stale_versions() {
+        let store = PollerGroupInfoStore::default();
+        assert!(store.update(Some(&poller_groups_info(0, [("group-a", 1.0)]))));
+        let accepted_weights = store.weights();
+
+        assert!(!store.update(Some(&poller_groups_info(0, [("group-a", 2.0)]))));
+        assert!(!store.update(Some(&poller_groups_info(-1, [("group-a", 3.0)]))));
+        assert!(Arc::ptr_eq(&accepted_weights, &store.weights()));
+        assert_eq!(store.weights().get("group-a"), Some(&1.0));
+    }
+
+    #[test]
+    fn poller_group_store_replaces_and_clears_weights() {
+        let store = PollerGroupInfoStore::default();
+        assert!(store.update(Some(&poller_groups_info(
+            1,
+            [("group-a", 1.0), ("group-b", 2.0)]
+        ))));
+        let original_weights = store.weights();
+
+        assert!(store.update(Some(&poller_groups_info(2, [("group-c", 3.0)]))));
+        let replacement_weights = store.weights();
+        assert_eq!(replacement_weights.len(), 1);
+        assert_eq!(replacement_weights.get("group-c"), Some(&3.0));
+        assert!(!replacement_weights.contains_key("group-a"));
+        assert!(!Arc::ptr_eq(&original_weights, &replacement_weights));
+        assert_eq!(original_weights.get("group-a"), Some(&1.0));
+        assert_eq!(original_weights.get("group-b"), Some(&2.0));
+
+        assert!(store.update(Some(&poller_groups_info(
+            3,
+            std::iter::empty::<(&str, f32)>(),
+        ))));
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn poller_group_store_ignores_empty_ids_and_uses_last_duplicate() {
+        let store = PollerGroupInfoStore::default();
+        assert!(store.update(Some(&poller_groups_info(
+            1,
+            [
+                ("", 100.0),
+                ("duplicate", 1.0),
+                ("other", 2.0),
+                ("duplicate", 3.0),
+            ],
+        ))));
+
+        let weights = store.weights();
+        assert_eq!(weights.len(), 2);
+        assert!(!weights.contains_key(""));
+        assert_eq!(weights.get("duplicate"), Some(&3.0));
+        assert_eq!(weights.get("other"), Some(&2.0));
+    }
+
+    #[test]
+    fn poller_group_store_concurrent_readers_only_observe_complete_weights() {
+        const GROUP_COUNT: usize = 64;
+        const READER_COUNT: usize = 4;
+        const UPDATE_COUNT: i64 = 100;
+
+        let first_groups: Vec<_> = (0..GROUP_COUNT)
+            .map(|index| (format!("first-{index}"), 1.0))
+            .collect();
+        let second_groups: Vec<_> = (0..GROUP_COUNT)
+            .map(|index| (format!("second-{index}"), 2.0))
+            .collect();
+        let expected_first = Arc::new(first_groups.iter().cloned().collect::<HashMap<_, _>>());
+        let expected_second = Arc::new(second_groups.iter().cloned().collect::<HashMap<_, _>>());
+        let first_info = poller_groups_info(0, first_groups);
+        let second_info = poller_groups_info(0, second_groups);
+        let store = Arc::new(PollerGroupInfoStore::default());
+        assert!(store.update(Some(&first_info)));
+
+        let phase = Arc::new(Barrier::new(READER_COUNT + 1));
+        thread::scope(|scope| {
+            for _ in 0..READER_COUNT {
+                let store = Arc::clone(&store);
+                let phase = Arc::clone(&phase);
+                let expected_first = Arc::clone(&expected_first);
+                let expected_second = Arc::clone(&expected_second);
+                scope.spawn(move || {
+                    let mut observed_incomplete_weights = false;
+                    for _ in 0..UPDATE_COUNT {
+                        phase.wait();
+                        let weights = store.weights();
+                        observed_incomplete_weights |= weights.as_ref() != expected_first.as_ref()
+                            && weights.as_ref() != expected_second.as_ref();
+                        phase.wait();
+                    }
+                    assert!(!observed_incomplete_weights);
+                });
+            }
+
+            let mut every_update_applied = true;
+            for version in 1..=UPDATE_COUNT {
+                let mut info = if version % 2 == 0 {
+                    first_info.clone()
+                } else {
+                    second_info.clone()
+                };
+                info.version = version;
+
+                phase.wait();
+                every_update_applied &= store.update(Some(&info));
+                phase.wait();
+            }
+            assert!(every_update_applied);
+        });
+    }
+
+    #[test]
+    fn poller_group_store_is_stable_for_a_namespace() {
+        let workers = ClientWorkerSet::new();
+
+        let first = workers.poller_group_info_store("namespace");
+        let second = workers.poller_group_info_store("namespace");
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn poller_group_stores_are_independent_between_namespaces() {
+        let workers = ClientWorkerSet::new();
+        let first = workers.poller_group_info_store("first");
+        let second = workers.poller_group_info_store("second");
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(first.update(Some(&poller_groups_info(0, [("group-a", 1.0)]))));
+        assert_eq!(first.weights().get("group-a"), Some(&1.0));
+        assert!(second.is_empty());
     }
 
     #[test]
