@@ -253,6 +253,18 @@ impl LongPollBuffer<PollNexusTaskQueueResponse, NexusSlotKind> {
         capabilities: Arc<NamespaceCapabilities>,
         worker_commands_queue: bool,
     ) -> Self {
+        let worker_command_error_backoff = worker_commands_queue.then(|| {
+            Arc::new(parking_lot::Mutex::new(ExponentialBackoff {
+                current_interval: Duration::from_secs(1),
+                initial_interval: Duration::from_secs(1),
+                randomization_factor: 0.2,
+                multiplier: 2.0,
+                max_interval: Duration::from_secs(60),
+                max_elapsed_time: None,
+                clock: SystemClock::default(),
+                start_time: std::time::Instant::now(),
+            }))
+        });
         let no_retry = if matches!(poller_behavior, PollerBehavior::Autoscaling { .. }) {
             Some(NoRetryOnMatching {
                 predicate: poll_scaling_error_matcher,
@@ -260,11 +272,14 @@ impl LongPollBuffer<PollNexusTaskQueueResponse, NexusSlotKind> {
         } else {
             None
         };
+        let poll_shutdown = shutdown.clone();
         let poll_fn = move |timeout_override: Option<Duration>| {
             let client = client.clone();
             let task_queue = task_queue.clone();
+            let worker_command_error_backoff = worker_command_error_backoff.clone();
+            let poll_shutdown = poll_shutdown.clone();
             async move {
-                client
+                let result = client
                     .poll_nexus_task(
                         PollOptions {
                             task_queue,
@@ -275,7 +290,23 @@ impl LongPollBuffer<PollNexusTaskQueueResponse, NexusSlotKind> {
                             worker_commands_queue,
                         },
                     )
-                    .await
+                    .await;
+                let backoff_duration = worker_command_error_backoff.as_ref().and_then(|backoff| {
+                    let mut backoff = backoff.lock();
+                    if result.is_ok() {
+                        backoff.reset();
+                        None
+                    } else {
+                        backoff.next_backoff()
+                    }
+                });
+                if let Some(duration) = backoff_duration {
+                    tokio::select! {
+                        _ = tokio::time::sleep(duration) => (),
+                        _ = poll_shutdown.cancelled() => (),
+                    }
+                }
+                result
             }
         };
         Self::new(
@@ -860,7 +891,10 @@ mod tests {
     use futures_util::FutureExt;
     use rstest::rstest;
     use std::time::Duration;
-    use tokio::{select, sync::Notify};
+    use tokio::{
+        select,
+        sync::{Notify, mpsc},
+    };
 
     #[tokio::test]
     async fn only_polls_once_with_1_poller() {
@@ -908,6 +942,52 @@ mod tests {
         // therefore we will have only polled twice.
         pb.poll().await.unwrap().unwrap();
         pb.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn worker_command_poll_errors_are_backed_off() {
+        let (poll_events_tx, mut poll_events_rx) = mpsc::unbounded_channel();
+        let mut mock_client = mock_manual_worker_client();
+        mock_client
+            .expect_poll_nexus_task()
+            .returning(move |_, nexus_options| {
+                assert!(nexus_options.worker_commands_queue);
+                poll_events_tx.send(()).unwrap();
+                async { Err(tonic::Status::invalid_argument("fatal poll error")) }.boxed()
+            });
+
+        let shutdown = CancellationToken::new();
+        let pb = Arc::new(LongPollBuffer::new_nexus_task(
+            Arc::new(mock_client),
+            "worker-command-queue".to_string(),
+            PollerBehavior::SimpleMaximum(1),
+            fixed_size_permit_dealer(1),
+            shutdown.clone(),
+            None::<fn(usize)>,
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(NamespaceCapabilities::default()),
+            true,
+        ));
+        let pb_clone = pb.clone();
+        let consumer = tokio::spawn(async move { while pb_clone.poll().await.is_some() {} });
+
+        poll_events_rx.recv().await.unwrap();
+        tokio::time::advance(Duration::from_millis(700)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            poll_events_rx.try_recv().is_err(),
+            "worker-command poll retried before its initial backoff elapsed"
+        );
+
+        tokio::time::advance(Duration::from_millis(600)).await;
+        poll_events_rx.recv().await.unwrap();
+
+        shutdown.cancel();
+        consumer.await.unwrap();
+        Arc::try_unwrap(pb)
+            .unwrap_or_else(|_| panic!("Failed to unwrap Arc"))
+            .shutdown()
+            .await;
     }
 
     #[tokio::test]
