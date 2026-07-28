@@ -64,6 +64,7 @@ use temporalio_common::{
     protos::{
         TaskToken,
         coresdk::{
+            common::ExternalStorageMetrics,
             workflow_activation::{
                 QueryWorkflow, WorkflowActivation, WorkflowActivationJob,
                 remove_from_cache::EvictionReason, workflow_activation_job,
@@ -302,6 +303,7 @@ impl Workflows {
                                 status: Some(
                                     workflow_completion::Success::from_variants(vec![]).into(),
                                 ),
+                                ..Default::default()
                             },
                             true,
                             // We need to say a type, but the type is irrelevant, so imagine some
@@ -322,6 +324,7 @@ impl Workflows {
                             WorkflowActivationCompletion {
                                 run_id,
                                 status: Some(machines_err.as_failure().into()),
+                                ..Default::default()
                             },
                             true,
                             Option::<Box<dyn Fn(PostActivateHookData) + Send>>::None,
@@ -546,6 +549,10 @@ impl Workflows {
         post_activate_hook: Option<impl Fn(PostActivateHookData)>,
     ) -> Result<(), CompleteWfError> {
         let is_empty_completion = completion.is_empty();
+        let task_storage_metrics = TaskStorageMetrics {
+            download: completion.payload_download_metrics.clone(),
+            upload: completion.payload_upload_metrics.clone(),
+        };
         let completion = validate_completion(completion, is_autocomplete)?;
         let run_id = completion.run_id().to_string();
         let (tx, rx) = oneshot::channel();
@@ -615,6 +622,7 @@ impl Workflows {
             wft_report_status,
             wft_from_complete: maybe_pwft,
             is_autocomplete,
+            task_storage_metrics,
         });
 
         Ok(())
@@ -1131,7 +1139,15 @@ struct PostActivationMsg {
     wft_report_status: WFTReportStatus,
     wft_from_complete: Option<WFTWithPaginator>,
     is_autocomplete: bool,
+    task_storage_metrics: TaskStorageMetrics,
 }
+
+#[derive(Debug, Default, Clone)]
+struct TaskStorageMetrics {
+    download: Option<ExternalStorageMetrics>,
+    upload: Option<ExternalStorageMetrics>,
+}
+
 #[derive(Debug, Clone)]
 struct RequestEvictMsg {
     run_id: String,
