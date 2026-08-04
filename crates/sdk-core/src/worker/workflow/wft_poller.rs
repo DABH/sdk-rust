@@ -217,6 +217,10 @@ fn new_wft_poller(
                     if let Some(dur) = wft.sched_to_start() {
                         metrics.wf_task_sched_to_start_latency(dur);
                     }
+                    debug!(
+                        workflow_task = ?wft,
+                        "Received workflow task from server"
+                    );
                     let work = match validate_wft(wft) {
                         Ok(w) => w,
                         Err(e) => {
