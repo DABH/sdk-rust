@@ -27,6 +27,8 @@ to docs, or any other relevant information.
 * Update result RPC timeouts now report `DeadlineExceeded` instead of `Cancelled`.
 * Starting an update at the Admitted stage now returns after server admission and allows the
   update to follow a Continue-As-New run.
+* Panics from update validators now reject the update instead of repeatedly failing workflow
+  tasks.
 
 ## [0.6.0] - 2026-08-04
 

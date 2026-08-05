@@ -76,6 +76,20 @@ enum GuestRoutine {
     },
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Update validator panicked: {0}")]
+struct UpdateValidatorPanic(String);
+
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_owned()
+    }
+}
+
 struct InterceptedFuture<T> {
     inner: Fuse<LocalBoxFuture<'static, T>>,
     status: InterceptedFutureStatus,
@@ -603,12 +617,19 @@ where
                 let view = workflow_ctx.view();
                 workflow_ctx.state(|wf| wf.validate_update(view, &name, input))
             });
-            let validation = call_validate_update(
-                &self.interceptors,
-                validation_ctx,
-                validation_input,
-                validation_next,
-            );
+            let validation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                call_validate_update(
+                    &self.interceptors,
+                    validation_ctx,
+                    validation_input,
+                    validation_next,
+                )
+            }))
+            .unwrap_or_else(|payload| {
+                Err(WorkflowError::Execution(Box::new(UpdateValidatorPanic(
+                    panic_message(payload.as_ref()),
+                ))))
+            });
             match validation {
                 Ok(()) => {}
                 Err(e) => {
