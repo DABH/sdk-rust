@@ -1,11 +1,8 @@
 use crate::common::{CoreWfStarter, build_fake_sdk};
 use temporalio_client::WorkflowStartOptions;
-use temporalio_common::{
-    protos::{
-        coresdk::common::NamespacedWorkflowExecution,
-        temporal::api::enums::v1::{CommandType, EventType},
-    },
-    worker::WorkerTaskTypes,
+use temporalio_common::protos::{
+    coresdk::common::NamespacedWorkflowExecution,
+    temporal::api::enums::v1::{CommandType, EventType},
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{WorkflowContext, WorkflowResult};
@@ -47,7 +44,6 @@ impl CancelReceiver {
 #[tokio::test]
 async fn sends_cancel_to_other_wf() {
     let mut starter = CoreWfStarter::new("sends_cancel_to_other_wf");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     worker.register_workflow::<CancelSender>().unwrap();
     worker.register_workflow::<CancelReceiver>().unwrap();

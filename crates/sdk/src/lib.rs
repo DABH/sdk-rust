@@ -11,9 +11,7 @@
 //! ```no_run
 //! use std::str::FromStr;
 //! use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions, Url};
-//! use temporalio_common::worker::{
-//!     WorkerDeploymentOptions, WorkerDeploymentVersion, WorkerTaskTypes,
-//! };
+//! use temporalio_common::worker::{WorkerDeploymentOptions, WorkerDeploymentVersion};
 //! use temporalio_macros::activities;
 //! use temporalio_sdk::{
 //!     Runtime, Worker, WorkerOptions,
@@ -42,7 +40,6 @@
 //!     let client = Client::new(connection, ClientOptions::new("my_namespace").build())?;
 //!
 //!     let worker_options = WorkerOptions::new("task_queue")
-//!         .task_types(WorkerTaskTypes::activity_only())
 //!         .deployment_options(WorkerDeploymentOptions {
 //!             version: WorkerDeploymentVersion {
 //!                 deployment_name: "my_deployment".to_owned(),
@@ -174,6 +171,9 @@ use crate::runtime::{
 };
 
 /// Contains options for configuring a worker.
+///
+/// The worker polls task types according to its registered workflows and activities. At least one
+/// workflow or activity must be registered.
 #[derive(bon::Builder, Clone)]
 #[builder(start_fn = new, on(String, into), state_mod(vis = "pub"))]
 #[non_exhaustive]
@@ -241,13 +241,6 @@ pub struct WorkerOptions {
     /// If left unset, the worker uses `SimpleMaximum(5)` and becomes eligible for automatic
     /// enrollment into poller autoscaling when the namespace advertises support for it.
     pub nexus_task_poller_behavior: Option<PollerBehavior>,
-    // TODO [rust-sdk-branch]: Will go away once workflow registration can only happen in here.
-    //   Then it can be auto-determined.
-    /// Specifies which task types this worker will poll for.
-    ///
-    /// Note: At least one task type must be specified or the worker will fail validation.
-    #[builder(default = WorkerTaskTypes::all())]
-    pub task_types: WorkerTaskTypes,
     /// How long a workflow task is allowed to sit on the sticky queue before it is timed out
     /// and moved to the non-sticky queue where it may be picked up by any worker.
     #[builder(default = Duration::from_secs(10))]
@@ -476,6 +469,15 @@ impl WorkerOptions {
         namespace: String,
         connection_identity: String,
     ) -> Result<WorkerConfig, String> {
+        let workflows_registered = !self.workflows.is_empty();
+        #[cfg(feature = "wasm-workflows")]
+        let workflows_registered =
+            workflows_registered || !self.wasm_workflow_components.is_empty();
+        let activities_registered = !self.activities.is_empty();
+        if !workflows_registered && !activities_registered {
+            return Err("At least one workflow or activity must be registered".to_owned());
+        }
+
         WorkerConfig::builder()
             .namespace(namespace)
             .task_queue(self.task_queue.clone())
@@ -493,7 +495,12 @@ impl WorkerOptions {
             .maybe_workflow_task_poller_behavior(self.workflow_task_poller_behavior)
             .maybe_activity_task_poller_behavior(self.activity_task_poller_behavior)
             .maybe_nexus_task_poller_behavior(self.nexus_task_poller_behavior)
-            .task_types(self.task_types)
+            .task_types(WorkerTaskTypes {
+                enable_workflows: workflows_registered,
+                enable_local_activities: workflows_registered && activities_registered,
+                enable_remote_activities: activities_registered,
+                enable_nexus: false,
+            })
             .sticky_queue_schedule_to_start_timeout(self.sticky_queue_schedule_to_start_timeout)
             .max_heartbeat_throttle_interval(self.max_heartbeat_throttle_interval)
             .default_heartbeat_throttle_interval(self.default_heartbeat_throttle_interval)
@@ -1596,6 +1603,49 @@ mod tests {
     }
 
     #[test]
+    fn task_types_are_derived_from_registrations() {
+        let workflow_config = WorkerOptions::new("task_q")
+            .register_workflow::<MyWorkflow>()
+            .unwrap()
+            .build()
+            .to_core_options("ns".into(), String::new())
+            .unwrap();
+        assert_eq!(workflow_config.task_types, WorkerTaskTypes::workflow_only());
+
+        let activity_config = WorkerOptions::new("task_q")
+            .register_activities(MyActivities {})
+            .build()
+            .to_core_options("ns".into(), String::new())
+            .unwrap();
+        assert_eq!(activity_config.task_types, WorkerTaskTypes::activity_only());
+
+        let combined_config = WorkerOptions::new("task_q")
+            .register_workflow::<MyWorkflow>()
+            .unwrap()
+            .register_activities(MyActivities {})
+            .build()
+            .to_core_options("ns".into(), String::new())
+            .unwrap();
+        assert_eq!(
+            combined_config.task_types,
+            WorkerTaskTypes {
+                enable_workflows: true,
+                enable_local_activities: true,
+                enable_remote_activities: true,
+                enable_nexus: false,
+            }
+        );
+
+        let empty_result = WorkerOptions::new("task_q")
+            .build()
+            .to_core_options("ns".into(), String::new());
+        assert_eq!(
+            empty_result.err().as_deref(),
+            Some("At least one workflow or activity must be registered")
+        );
+    }
+
+    #[test]
     fn workflow_interceptor_registration_replaces_previous_constructors() {
         let mut options = WorkerOptions::new("task_q").build();
         options.register_workflow_interceptors(vec![
@@ -1674,7 +1724,7 @@ mod tests {
         #[case] expected: Option<String>,
     ) {
         let opts = WorkerOptions::new("task_q")
-            .task_types(WorkerTaskTypes::activity_only())
+            .register_activities(MyActivities {})
             .maybe_client_identity_override(worker_override.map(|s| s.to_owned()))
             .build();
         let config = opts
@@ -1693,7 +1743,7 @@ mod tests {
         #[case] expected: bool,
     ) {
         let config = WorkerOptions::new("task_q")
-            .task_types(WorkerTaskTypes::activity_only())
+            .register_activities(MyActivities {})
             .maybe_disable_payload_error_limit(override_value)
             .build()
             .to_core_options("ns".into(), String::new())
@@ -1704,7 +1754,7 @@ mod tests {
     #[test]
     fn max_eager_activity_reservations_per_workflow_task_propagates() {
         let config = WorkerOptions::new("task_q")
-            .task_types(WorkerTaskTypes::activity_only())
+            .register_activities(MyActivities {})
             .max_eager_activity_reservations_per_workflow_task(7)
             .build()
             .to_core_options("ns".into(), String::new())

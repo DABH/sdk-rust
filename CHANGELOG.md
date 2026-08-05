@@ -29,6 +29,9 @@ to docs, or any other relevant information.
   update to follow a Continue-As-New run.
 * Panics from update validators now reject the update instead of repeatedly failing workflow
   tasks.
+* Rust SDK workers now derive enabled task types from registered workflows and activities. The
+  task types can no longer be configured separately, preventing mismatched poll loops from hanging
+  worker shutdown.
 
 ## [0.6.0] - 2026-08-04
 

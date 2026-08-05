@@ -97,7 +97,6 @@ impl ParallelWorkflowsWf {
 async fn parallel_workflows_same_queue() {
     let wf_name = "parallel_workflows_same_queue";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut core = starter.worker().await;
 
     core.register_workflow::<ParallelWorkflowsWf>().unwrap();
@@ -520,9 +519,8 @@ async fn slow_completes_with_small_cache() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 10, 1, 1));
     starter.sdk_config.max_cached_workflows = 5_usize;
+    starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
-
-    worker.register_activities(StdActivities);
 
     worker.register_workflow::<SlowCompletesWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
@@ -576,7 +574,7 @@ async fn deployment_version_correct_in_wf_info(#[values(true, false)] use_only_b
             default_versioning_behavior: None,
         }
     };
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter.set_core_task_types(WorkerTaskTypes::workflow_only());
     let core = starter.get_worker().await;
     starter.start_wf().await;
     let client = starter.get_client().await;
@@ -814,7 +812,6 @@ async fn nondeterminism_errors_fail_workflow_when_configured_to(
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let wf_name = NONDETERMINISM_WF_NAME;
     let mut starter = CoreWfStarter::new_with_runtime(wf_name, rt);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let typeset = HashSet::from([WorkflowErrorType::Nondeterminism]);
     if whole_worker {
         starter.sdk_config.workflow_failure_errors = typeset;
@@ -933,6 +930,7 @@ async fn history_out_of_order_on_restart() {
     let wf_name = HISTORY_OUT_OF_ORDER_WF_NAME;
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.workflow_failure_errors = HashSet::from([WorkflowErrorType::Nondeterminism]);
+    starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
     let mut starter2 = starter.clone_no_worker();
     let mut worker2 = starter2.worker().await;
@@ -1001,8 +999,6 @@ async fn history_out_of_order_on_restart() {
         }
     }
 
-    worker.register_activities(StdActivities);
-    worker2.register_activities(StdActivities);
     worker
         .register_workflow_with_factory(move || HistoryOutOfOrderWf1 {
             hit_sleep: hit_sleep_clone1.clone(),

@@ -21,7 +21,6 @@ use temporalio_common::{
             history::v1::history_event::Attributes::WorkflowTaskFailedEventAttributes,
         },
     },
-    worker::WorkerTaskTypes,
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
@@ -69,7 +68,6 @@ impl TimerWfNondeterministic {
 async fn test_determinism_error_then_recovers() {
     let wf_name = "test_determinism_error_then_recovers";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     let run_ct = Arc::new(AtomicUsize::new(1));
@@ -167,7 +165,6 @@ impl RandomReplayWf {
 async fn random_workflow_replays() {
     let wf_name = "random_workflow_replays";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     worker.register_workflow::<RandomReplayWf>().unwrap();
 
@@ -531,7 +528,6 @@ impl TokioSleepWf {
 async fn nondeterministic_future_detection_fails_wft() {
     let wf_name = "nondeterministic_future_detection_fails_wft";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     let attempt = Arc::new(AtomicUsize::new(0));

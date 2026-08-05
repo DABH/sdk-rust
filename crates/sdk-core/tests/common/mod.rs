@@ -269,6 +269,7 @@ pub(crate) struct CoreWfStarter {
     /// Run when initializing, allows for altering the config used to init the core worker
     #[allow(clippy::type_complexity)] // It's not tho
     core_config_mutator: Option<Arc<dyn Fn(&mut WorkerConfig)>>,
+    core_task_types: Option<WorkerTaskTypes>,
 }
 struct InitializedWorker {
     worker: Arc<CoreWorker>,
@@ -345,6 +346,7 @@ impl CoreWfStarter {
             client_override,
             min_local_server_version: None,
             core_config_mutator: None,
+            core_task_types: None,
         }
     }
 
@@ -360,10 +362,22 @@ impl CoreWfStarter {
             min_local_server_version: self.min_local_server_version.clone(),
             initted_worker: Default::default(),
             core_config_mutator: self.core_config_mutator.clone(),
+            core_task_types: self.core_task_types,
         }
     }
 
     pub(crate) async fn worker(&mut self) -> TestWorker {
+        if self.core_task_types.is_none() {
+            let activities_registered = !self.sdk_config.activities().is_empty();
+            // Tests historically register workflows on TestWorker after Core is initialized, so
+            // its Core worker must be ready to poll workflows even when options are still empty.
+            self.core_task_types = Some(WorkerTaskTypes {
+                enable_workflows: true,
+                enable_local_activities: activities_registered,
+                enable_remote_activities: activities_registered,
+                enable_nexus: false,
+            });
+        }
         let worker = self.get_worker().await;
         worker
             .validate()
@@ -384,6 +398,10 @@ impl CoreWfStarter {
 
     pub(crate) fn set_core_cfg_mutator(&mut self, mutator: impl Fn(&mut WorkerConfig) + 'static) {
         self.core_config_mutator = Some(Arc::new(mutator))
+    }
+
+    pub(crate) fn set_core_task_types(&mut self, task_types: WorkerTaskTypes) {
+        self.core_task_types = Some(task_types);
     }
 
     pub(crate) async fn shutdown(&mut self) {
@@ -504,10 +522,19 @@ impl CoreWfStarter {
                     let client = Client::new(connection.clone(), client_opts).unwrap();
                     (connection, client)
                 };
-                let mut core_config = self
-                    .sdk_config
+                let mut sdk_config = self.sdk_config.clone();
+                // CoreWfStarter predates options-based registration, so many tests register their
+                // workflows after Core is initialized. Seed only the conversion clone; the actual
+                // SDK worker still receives exactly the definitions configured by the test.
+                if sdk_config.workflows().is_empty() && sdk_config.activities().is_empty() {
+                    sdk_config
+                        .register_workflow::<workflows::LaProblemWorkflow>()
+                        .expect("placeholder workflow registers");
+                }
+                let mut core_config = sdk_config
                     .to_core_options(client.namespace(), client.identity())
                     .expect("sdk config converts to core config");
+                core_config.task_types = self.core_task_types.unwrap_or_else(WorkerTaskTypes::all);
                 if let Some(ref ccm) = self.core_config_mutator {
                     ccm(&mut core_config);
                 }

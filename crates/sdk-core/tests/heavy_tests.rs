@@ -31,12 +31,9 @@ use temporalio_common::{
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 
-use temporalio_common::{
-    protos::{
-        coresdk::workflow_commands::ActivityCancellationType,
-        temporal::api::enums::v1::WorkflowIdReusePolicy,
-    },
-    worker::WorkerTaskTypes,
+use temporalio_common::protos::{
+    coresdk::workflow_commands::ActivityCancellationType,
+    temporal::api::enums::v1::WorkflowIdReusePolicy,
 };
 use temporalio_sdk::{
     ActivityCloseTimeouts, ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,
@@ -371,7 +368,6 @@ impl ManyParallelTimersLonghistWf {
 async fn can_paginate_long_history() {
     let wf_name = "can_paginate_long_history";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.max_cached_workflows = 0;
 
     let mut worker = starter.worker().await;

@@ -36,7 +36,6 @@ use temporalio_common::{
     },
 };
 
-use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_macros::{activity_definitions, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, PatchActivationCallback, SyncWorkflowContext, WorkflowContext, WorkflowResult,
@@ -78,7 +77,6 @@ impl ChangesWf {
 async fn writes_change_markers() {
     let wf_name = "writes_change_markers";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     worker.register_workflow::<ChangesWf>().unwrap();
 
@@ -119,7 +117,6 @@ impl NoChangeThenChangeWf {
 async fn can_add_change_markers() {
     let wf_name = "can_add_change_markers";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     let did_die = Arc::new(AtomicBool::new(false));
     worker
@@ -155,7 +152,6 @@ impl ReplayWithChangeMarkerWf {
 async fn replaying_with_patch_marker() {
     let wf_name = "replaying_with_patch_marker";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     let did_die = Arc::new(AtomicBool::new(false));
     worker
@@ -187,7 +183,6 @@ impl PatchActivationTwiceWf {
 async fn patch_activation_callback_is_memoized_across_replay() {
     let wf_name = "patch_activation_callback_is_memoized_across_replay";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.max_cached_workflows = 0;
     let callback_calls = Arc::new(AtomicUsize::new(0));
     let callback_calls_clone = callback_calls.clone();
@@ -272,7 +267,6 @@ impl PatchActivationOldRolloutWf {
 async fn declined_patch_can_roll_out_to_old_worker() {
     let wf_name = "declined_patch_can_roll_out_to_old_worker";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let callback_calls = Arc::new(AtomicUsize::new(0));
     let callback_calls_clone = callback_calls.clone();
     let workflow_id = starter.get_task_queue().to_string();
@@ -339,7 +333,6 @@ async fn declined_patch_can_roll_out_to_old_worker() {
 async fn activated_patch_replays_without_consulting_declining_callback() {
     let wf_name = "activated_patch_replays_without_consulting_declining_callback";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let activated_calls = Arc::new(AtomicUsize::new(0));
     let activated_calls_clone = activated_calls.clone();
     starter.sdk_config.patch_activation_callback = Some(Arc::new(move |_| {
@@ -436,7 +429,6 @@ async fn patched_on_second_workflow_task_is_deterministic() {
     let mut starter = CoreWfStarter::new(wf_name);
     // Disable caching to force replay from beginning
     starter.sdk_config.max_cached_workflows = 0_usize;
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     let fail_once = Arc::new(AtomicBool::new(true));
     worker
@@ -479,7 +471,6 @@ impl RemoveDeprecatedPatchNearOtherPatchWf {
 async fn can_remove_deprecated_patch_near_other_patch() {
     let wf_name = "can_add_change_markers";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     let did_die = Arc::new(AtomicBool::new(false));
     worker
@@ -528,7 +519,6 @@ impl DeprecatedPatchRemovalWf {
 async fn deprecated_patch_removal() {
     let wf_name = "deprecated_patch_removal";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     let wf_id = starter.get_task_queue().to_string();
     let did_die = Arc::new(AtomicBool::new(false));
@@ -1158,7 +1148,6 @@ impl ManyPatchesInOneWftWf {
 async fn patch_marker_size_overflow_replay_is_deterministic() {
     let wf_name = "patch_marker_size_overflow_replay_is_deterministic";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     worker.register_workflow::<ManyPatchesInOneWftWf>().unwrap();
 

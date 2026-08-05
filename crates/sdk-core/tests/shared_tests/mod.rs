@@ -37,7 +37,6 @@ use temporalio_common::{
             workflowservice::v1::{DescribeNamespaceRequest, ListWorkflowExecutionsRequest},
         },
     },
-    worker::WorkerTaskTypes,
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
@@ -242,7 +241,6 @@ pub(crate) async fn grpc_message_too_large() {
     let mut starter = CoreWfStarter::new_cloud_or_local(wf_name, "")
         .await
         .unwrap();
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.disable_payload_error_limit = true;
     starter
         .sdk_config

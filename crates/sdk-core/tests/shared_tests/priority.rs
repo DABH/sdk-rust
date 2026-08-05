@@ -24,7 +24,6 @@ pub(crate) async fn priority_values_sent_to_server() {
         fairness_key: Some("fair-wf".to_string()),
         fairness_weight: Some(4.2),
     };
-    let mut worker = starter.worker().await;
     let child_type = "child-wf";
 
     struct PriorityActivities;
@@ -107,7 +106,8 @@ pub(crate) async fn priority_values_sent_to_server() {
         }
     }
 
-    worker.register_activities(PriorityActivities);
+    starter.sdk_config.register_activities(PriorityActivities);
+    let mut worker = starter.worker().await;
     worker
         .register_workflow_with_factory::<ParentWf, _>(move || ParentWf {
             child_type: child_type.to_owned(),

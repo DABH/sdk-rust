@@ -16,7 +16,6 @@ use temporalio_common::protos::{
 };
 use temporalio_sdk_core::replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder};
 
-use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
     CancellableFuture, ChildWorkflowOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,
@@ -55,7 +54,6 @@ impl SignalSender {
 async fn sends_signal_to_missing_wf() {
     let wf_name = "sends_signal_to_missing_wf";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     worker.register_workflow::<SignalSender>().unwrap();
 
@@ -121,7 +119,6 @@ impl SignalWithCreateWfReceiver {
 #[tokio::test]
 async fn sends_signal_to_other_wf() {
     let mut starter = CoreWfStarter::new("sends_signal_to_other_wf");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     worker.register_workflow::<SignalSender>().unwrap();
     worker.register_workflow::<SignalReceiver>().unwrap();
@@ -149,7 +146,6 @@ async fn sends_signal_to_other_wf() {
 #[tokio::test]
 async fn sends_signal_with_create_wf() {
     let mut starter = CoreWfStarter::new("sends_signal_with_create_wf");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     worker
         .register_workflow::<SignalWithCreateWfReceiver>()
@@ -225,7 +221,6 @@ impl ChildSignalReceiver {
 #[tokio::test]
 async fn sends_signal_to_child() {
     let mut starter = CoreWfStarter::new("sends_signal_to_child");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     worker.register_workflow::<SignalsChild>().unwrap();
     worker.register_workflow::<ChildSignalReceiver>().unwrap();
@@ -396,7 +391,6 @@ impl SignalSerializationFailure {
 async fn signal_serialization_failure() {
     let wf_name = "signal_serialization_failure";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     worker
         .register_workflow::<SignalSerializationFailure>()
@@ -464,7 +458,6 @@ impl CrossTypeSignalReceiver {
 #[tokio::test]
 async fn external_workflow_signal() {
     let mut starter = CoreWfStarter::new("cross_type_signal_sends_successfully");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     worker.register_workflow::<CrossTypeSignalSender>().unwrap();
     worker

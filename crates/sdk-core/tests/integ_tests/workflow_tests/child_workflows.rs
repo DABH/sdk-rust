@@ -30,7 +30,6 @@ use temporalio_common::{
             sdk::v1::UserMetadata,
         },
     },
-    worker::WorkerTaskTypes,
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
@@ -88,7 +87,6 @@ impl HappyParent {
 #[tokio::test]
 async fn child_workflow_happy_path() {
     let mut starter = CoreWfStarter::new("child-workflows");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     worker.register_workflow::<HappyParent>().unwrap();
@@ -157,7 +155,6 @@ impl AbandonedChildBugReproChild {
 #[tokio::test]
 async fn abandoned_child_bug_repro() {
     let mut starter = CoreWfStarter::new("child-workflow-abandon-bug");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     let barr = Arc::new(Barrier::new(2));
@@ -246,7 +243,6 @@ impl AbandonedChildResolvesPostCancelChild {
 #[tokio::test]
 async fn abandoned_child_resolves_post_cancel() {
     let mut starter = CoreWfStarter::new("child-workflow-resolves-post-cancel");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     let barr = Arc::new(Barrier::new(2));
@@ -349,7 +345,6 @@ impl CancelledChildGetsReasonChild {
 async fn cancelled_child_gets_reason() {
     let wf_name = "cancelled-child-gets-reason";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     worker
@@ -536,7 +531,6 @@ impl RuntimeParentCancelsChildWf {
 #[tokio::test]
 async fn cancel_child_workflow_runtime_shape() {
     let mut starter = CoreWfStarter::new("cancel-child-workflow-runtime-shape");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     worker
@@ -645,7 +639,6 @@ impl GrandchildCancellationWf {
 #[tokio::test]
 async fn child_workflow_cancellation_propigates() {
     let mut starter = CoreWfStarter::new("child-workflow-cancellation-propigates");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     worker
@@ -1177,7 +1170,6 @@ impl CancelChildBeforeStartedParent {
 #[tokio::test]
 async fn cancel_child_wf_before_started_event_real_server() {
     let mut starter = CoreWfStarter::new("child-wf-cancel-before-start");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     let barr = Arc::new(Notify::new());
@@ -1266,7 +1258,6 @@ impl UntypedHappyParent {
 #[tokio::test]
 async fn untyped_child_workflow_happy_path() {
     let mut starter = CoreWfStarter::new("untyped-child-workflows");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     worker.register_workflow::<UntypedHappyParent>().unwrap();
@@ -1357,7 +1348,6 @@ impl ChildStartSerializationFailParent {
 #[tokio::test]
 async fn child_workflow_start_serialization_failure_returns_error() {
     let mut starter = CoreWfStarter::new("child-wf-start-ser-fail");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     worker
@@ -1410,7 +1400,6 @@ impl ChildSignalSerializationFailParent {
 #[tokio::test]
 async fn child_workflow_signal_serialization_failure_returns_error() {
     let mut starter = CoreWfStarter::new("child-wf-signal-ser-fail");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     worker
@@ -1507,7 +1496,6 @@ impl CancelResultFutureParent {
 async fn cancel_child_result_future_does_not_fail_wft() {
     let wf_name = "cancel-child-result-future";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     worker
@@ -1593,7 +1581,6 @@ impl CancelExternalThenChildParent {
 async fn cancel_child_after_cancel_external_uses_correct_seq() {
     let wf_name = "cancel-child-after-cancel-external";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     worker

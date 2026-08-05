@@ -24,9 +24,7 @@ use temporalio_client::{
     NamespacedClient, UntypedSignal, UntypedWorkflow, WorkflowExecutionInfo,
     WorkflowGetResultOptions, WorkflowSignalOptions, WorkflowStartOptions,
 };
-use temporalio_common::{
-    data_converters::RawValue, telemetry::PrometheusExporterOptions, worker::WorkerTaskTypes,
-};
+use temporalio_common::{data_converters::RawValue, telemetry::PrometheusExporterOptions};
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,
@@ -146,10 +144,12 @@ async fn poller_load_spiky() {
         maximum: 200,
         initial: 5,
     });
+    starter
+        .sdk_config
+        .register_activities(JitteryEchoActivities);
     let mut worker = starter.worker().await;
     let submitter = worker.get_submitter_handle();
 
-    worker.register_activities(JitteryEchoActivities);
     worker.register_workflow::<PollerLoadSpikyWf>().unwrap();
     let client = starter.get_client().await;
     let tq = starter.get_task_queue().to_owned();
@@ -283,7 +283,6 @@ async fn poller_load_sustained() {
         maximum: 200,
         initial: 5,
     });
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     worker.register_workflow::<PollerLoadSustainedWf>().unwrap();
     let client = starter.get_client().await;
@@ -363,10 +362,12 @@ async fn poller_load_spike_then_sustained() {
         maximum: 200,
         initial: 5,
     });
+    starter
+        .sdk_config
+        .register_activities(JitteryEchoActivities);
     let mut worker = starter.worker().await;
     let submitter = worker.get_submitter_handle();
 
-    worker.register_activities(JitteryEchoActivities);
     worker
         .register_workflow::<PollerLoadSpikeThenSustainedWf>()
         .unwrap();

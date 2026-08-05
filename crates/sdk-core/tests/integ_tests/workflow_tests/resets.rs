@@ -14,7 +14,6 @@ use temporalio_common::protos::temporal::api::{
     common::v1::WorkflowExecution, workflowservice::v1::ResetWorkflowExecutionRequest,
 };
 
-use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{LocalActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult};
 use tokio::sync::Notify;
@@ -50,7 +49,6 @@ impl ResetMeWf {
 async fn reset_workflow() {
     let wf_name = "reset_me_wf";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     worker.fetch_results = false;
 
@@ -191,12 +189,7 @@ impl ResetRandomseedWf {
 async fn reset_randomseed() {
     let wf_name = "reset_randomseed";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes {
-        enable_workflows: true,
-        enable_local_activities: true,
-        enable_remote_activities: false,
-        enable_nexus: true,
-    };
+    starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
     worker.fetch_results = false;
 
@@ -219,8 +212,6 @@ async fn reset_randomseed() {
             post_reset_received: false,
         })
         .unwrap();
-    worker.register_activities(StdActivities);
-
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(

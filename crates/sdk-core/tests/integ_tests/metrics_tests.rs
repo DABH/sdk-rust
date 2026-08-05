@@ -1154,12 +1154,12 @@ async fn nexus_metrics() {
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let wf_name = "nexus_metrics";
     let mut starter = CoreWfStarter::new_with_runtime(wf_name, rt);
-    starter.sdk_config.task_types = WorkerTaskTypes {
+    starter.set_core_task_types(WorkerTaskTypes {
         enable_workflows: true,
         enable_local_activities: false,
         enable_remote_activities: false,
         enable_nexus: true,
-    };
+    });
     // Nexus operation handling involves internal async coordination that can
     // trigger false positives in nondeterminism detection.
     starter.sdk_config.detect_nondeterministic_futures = false;
@@ -1357,7 +1357,6 @@ async fn evict_on_complete_does_not_count_as_forced_eviction() {
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let wf_name = "evict_on_complete_does_not_count_as_forced_eviction";
     let mut starter = CoreWfStarter::new_with_runtime(wf_name, rt);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     #[workflow]
@@ -1449,7 +1448,6 @@ async fn metrics_available_from_custom_slot_supplier() {
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let mut starter =
         CoreWfStarter::new_with_runtime("metrics_available_from_custom_slot_supplier", rt);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut tb = TunerBuilder::default();
     tb.workflow_slot_supplier(Arc::new(MetricRecordingSlotSupplier::<WorkflowSlotKind> {
         inner: FixedSizeSlotSupplier::new(5),
@@ -1627,7 +1625,6 @@ async fn sticky_queue_label_strategy(
     let mut starter = CoreWfStarter::new_with_runtime(&wf_name, rt);
     // Enable sticky queues by setting a reasonable cache size
     starter.sdk_config.max_cached_workflows = 10_usize;
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     #[workflow]
@@ -1713,7 +1710,6 @@ async fn resource_based_tuner_metrics() {
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let wf_name = "resource_based_tuner_metrics";
     let mut starter = CoreWfStarter::new_with_runtime(wf_name, rt);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     // Create a resource-based tuner with reasonable thresholds
     let tuner = ResourceBasedTuner::new(0.8, 0.8);
     starter.sdk_config.tuner = Arc::new(tuner);

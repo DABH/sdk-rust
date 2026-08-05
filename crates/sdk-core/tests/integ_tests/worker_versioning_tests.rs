@@ -47,7 +47,7 @@ async fn sets_deployment_info_on_task_responses(#[values(true, false)] use_defau
         use_worker_versioning: true,
         default_versioning_behavior: Some(VersioningBehavior::AutoUpgrade),
     };
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter.set_core_task_types(WorkerTaskTypes::workflow_only());
     let core = starter.get_worker().await;
     let client = starter.get_client().await;
 
@@ -277,7 +277,7 @@ async fn versioning_off_with_custom_build_id() {
         use_worker_versioning: false,
         default_versioning_behavior: None,
     };
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter.set_core_task_types(WorkerTaskTypes::workflow_only());
     let core = starter.get_worker().await;
     starter.start_wf().await;
 
@@ -372,7 +372,6 @@ async fn continue_as_new_auto_upgrade_uses_current_deployment_version() {
         build_id: "2.0".to_string(),
     };
     starter.sdk_config.deployment_options = versioned_worker_options(v1.clone());
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker1 = starter.worker().await;
     worker1
         .register_workflow::<ContinueAsNewAutoUpgradeV1>()
@@ -380,7 +379,6 @@ async fn continue_as_new_auto_upgrade_uses_current_deployment_version() {
 
     let mut starter2 = starter.clone_no_worker();
     starter2.sdk_config.deployment_options = versioned_worker_options(v2.clone());
-    starter2.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker2 = starter2.worker().await;
     worker2
         .register_workflow::<ContinueAsNewAutoUpgradeV2>()
@@ -500,7 +498,6 @@ async fn continue_as_new_use_ramping_version_uses_ramping_deployment_version() {
         build_id: "2.0".to_string(),
     };
     starter.sdk_config.deployment_options = versioned_worker_options(v1.clone());
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker1 = starter.worker().await;
     worker1
         .register_workflow::<ContinueAsNewUseRampingVersionV1>()
@@ -508,7 +505,6 @@ async fn continue_as_new_use_ramping_version_uses_ramping_deployment_version() {
 
     let mut starter2 = starter.clone_no_worker();
     starter2.sdk_config.deployment_options = versioned_worker_options(v2.clone());
-    starter2.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker2 = starter2.worker().await;
     worker2
         .register_workflow::<ContinueAsNewUseRampingVersionV2>()

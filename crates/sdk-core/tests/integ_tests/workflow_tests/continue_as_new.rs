@@ -10,7 +10,6 @@ use temporalio_common::{
         history::v1::history_event,
     },
     search_attributes::{SearchAttributeKey, SearchAttributes},
-    worker::WorkerTaskTypes,
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{ContinueAsNewOptions, WorkflowContext, WorkflowResult, WorkflowTermination};
@@ -43,7 +42,6 @@ impl ContinueAsNewWf {
 async fn continue_as_new_happy_path() {
     let wf_name = "continue_as_new_happy_path";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     worker.register_workflow::<ContinueAsNewWf>().unwrap();
 
@@ -63,7 +61,6 @@ async fn continue_as_new_happy_path() {
 async fn continue_as_new_multiple_concurrent() {
     let wf_name = "continue_as_new_multiple_concurrent";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.max_cached_workflows = 5_usize;
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 1, 1, 1));
     let mut worker = starter.worker().await;
@@ -194,7 +191,6 @@ impl ClearSearchAttrsOnContinueAsNewWf {
 async fn clear_search_attributes_on_continue_as_new() {
     let wf_name = "clear_search_attrs_on_continue_as_new";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     worker
         .register_workflow::<ClearSearchAttrsOnContinueAsNewWf>()

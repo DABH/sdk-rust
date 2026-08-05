@@ -757,11 +757,6 @@ async fn schedule_to_close_timeout_across_timer_backoff(#[case] cached: bool) {
         }
     }
 
-    let mut worker = starter.worker().await;
-    worker
-        .register_workflow::<ScheduleToCloseTimeoutAcrossTimerBackoff>()
-        .unwrap();
-
     let num_attempts = Arc::new(AtomicU8::new(0));
 
     struct FailWithAtomicCounter {
@@ -776,9 +771,15 @@ async fn schedule_to_close_timeout_across_timer_backoff(#[case] cached: bool) {
         }
     }
 
-    worker.register_activities(FailWithAtomicCounter {
-        counter: num_attempts.clone(),
-    });
+    starter
+        .sdk_config
+        .register_activities(FailWithAtomicCounter {
+            counter: num_attempts.clone(),
+        });
+    let mut worker = starter.worker().await;
+    worker
+        .register_workflow::<ScheduleToCloseTimeoutAcrossTimerBackoff>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
