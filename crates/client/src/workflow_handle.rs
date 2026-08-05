@@ -817,7 +817,7 @@ where
         options: WorkflowExecuteUpdateOptions,
     ) -> Result<U::Output, WorkflowUpdateError>
     where
-        CT: WorkflowService + NamespacedClient + Clone,
+        CT: WorkflowService + NamespacedClient + Clone + Send + 'static,
         U: UpdateDefinition<Workflow = W::Run>,
         U::Input: Send,
         U::Output: 'static,
@@ -847,7 +847,7 @@ where
         options: WorkflowStartUpdateOptions,
     ) -> Result<WorkflowUpdateHandle<CT, U::Output>, WorkflowUpdateError>
     where
-        CT: WorkflowService + NamespacedClient + Clone,
+        CT: WorkflowService + NamespacedClient + Clone + Send + 'static,
         U: UpdateDefinition<Workflow = W::Run>,
         U::Input: Send,
     {
@@ -882,11 +882,11 @@ where
                             .codec()
                             .encode(&SerializationContextData::Workflow, unencoded_payloads?)
                             .await?;
+                        let wait_for_admitted =
+                            options.wait_for_stage == WorkflowUpdateWaitStage::Admitted;
                         let lifecycle_stage = match options.wait_for_stage {
-                            WorkflowUpdateWaitStage::Admitted => {
-                                UpdateWorkflowExecutionLifecycleStage::Admitted
-                            }
-                            WorkflowUpdateWaitStage::Accepted => {
+                            WorkflowUpdateWaitStage::Admitted
+                            | WorkflowUpdateWaitStage::Accepted => {
                                 UpdateWorkflowExecutionLifecycleStage::Accepted
                             }
                             WorkflowUpdateWaitStage::Completed => {
@@ -896,11 +896,18 @@ where
                         let update_id = options
                             .update_id
                             .unwrap_or_else(|| Uuid::new_v4().to_string());
+                        // A runless request lets the server retry an admitted update on the next
+                        // run when the targeted workflow closes or continues as new.
+                        let target_run_id = if wait_for_admitted {
+                            String::new()
+                        } else {
+                            run_id
+                        };
                         let mut request = UpdateWorkflowExecutionRequest {
                             namespace: client.namespace(),
                             workflow_execution: Some(ProtoWorkflowExecution {
                                 workflow_id: workflow_id.clone(),
-                                run_id,
+                                run_id: target_run_id,
                             }),
                             wait_policy: Some(WaitPolicy {
                                 lifecycle_stage: lifecycle_stage.into(),
@@ -921,15 +928,82 @@ where
                         }
                         .into_request();
                         options.rpc_options.apply_to(&mut request);
-                        let response = WorkflowService::update_workflow_execution(
-                            &mut client,
-                            request,
-                        )
-                        .await
-                        .map_err(WorkflowUpdateError::from_status)?
-                        .into_inner();
-                        let run_id = response
-                            .update_ref
+                        let (update_ref, outcome, admitted_response) = if wait_for_admitted {
+                            // The service does not allow UpdateWorkflowExecution to wait for
+                            // Admitted, so keep an Accepted request alive while polling admission.
+                            let mut update_client = client.clone();
+                            let (response_tx, mut response_rx) = tokio::sync::watch::channel(None);
+                            tokio::spawn(async move {
+                                let response = WorkflowService::update_workflow_execution(
+                                    &mut update_client,
+                                    request,
+                                )
+                                .await
+                                .map(|response| response.into_inner());
+                                let _ = response_tx.send(Some(response));
+                            });
+                            loop {
+                                let mut poll_request = PollWorkflowExecutionUpdateRequest {
+                                    namespace: client.namespace(),
+                                    update_ref: Some(update::v1::UpdateRef {
+                                        workflow_execution: Some(ProtoWorkflowExecution {
+                                            workflow_id: workflow_id.clone(),
+                                            run_id: String::new(),
+                                        }),
+                                        update_id: update_id.clone(),
+                                    }),
+                                    identity: client.identity(),
+                                    wait_policy: Some(WaitPolicy {
+                                        lifecycle_stage:
+                                            UpdateWorkflowExecutionLifecycleStage::Admitted.into(),
+                                    }),
+                                }
+                                .into_request();
+                                options.rpc_options.apply_to(&mut poll_request);
+                                tokio::select! {
+                                    changed = response_rx.changed() => {
+                                        changed.map_err(|_| WorkflowUpdateError::Other(
+                                            "Update request task stopped before returning a response".into()
+                                        ))?;
+                                        let response = response_rx
+                                            .borrow()
+                                            .clone()
+                                            .expect("response sender must set a value before notifying")
+                                            .map_err(WorkflowUpdateError::from_status)?;
+                                        break (response.update_ref, response.outcome, None);
+                                    }
+                                    response = WorkflowService::poll_workflow_execution_update(
+                                        &mut client,
+                                        poll_request,
+                                    ) => {
+                                        match response {
+                                            Ok(response) => {
+                                                let response = response.into_inner();
+                                                if response.stage >= UpdateWorkflowExecutionLifecycleStage::Admitted as i32 {
+                                                    break (None, None, Some(response_rx));
+                                                }
+                                            }
+                                            Err(status) if status.code() == tonic::Code::NotFound => {
+                                                tokio::task::yield_now().await;
+                                            }
+                                            Err(status) => {
+                                                return Err(WorkflowUpdateError::from_status(status));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            let response = WorkflowService::update_workflow_execution(
+                                &mut client,
+                                request,
+                            )
+                            .await
+                            .map_err(WorkflowUpdateError::from_status)?
+                            .into_inner();
+                            (response.update_ref, response.outcome, None)
+                        };
+                        let run_id = update_ref
                             .as_ref()
                             .and_then(|reference| reference.workflow_execution.as_ref())
                             .map(|execution| execution.run_id.clone())
@@ -938,7 +1012,8 @@ where
                             update_id,
                             workflow_id,
                             run_id,
-                            response.outcome,
+                            outcome,
+                            admitted_response,
                         ))
                     })
                 }
@@ -946,12 +1021,18 @@ where
         )
         .await?;
 
+        let run_id = if output.admitted_response.is_some() {
+            None
+        } else {
+            output.run_id.or_else(|| self.info().run_id.clone())
+        };
         Ok(WorkflowUpdateHandle {
             client: self.client.clone(),
             update_id: output.update_id,
             workflow_id: output.workflow_id,
-            run_id: output.run_id.or_else(|| self.info().run_id.clone()),
+            run_id,
             known_outcome: output.known_outcome,
+            admitted_response: output.admitted_response,
             _output: PhantomData,
         })
     }
@@ -1202,6 +1283,8 @@ pub struct WorkflowUpdateHandle<CT, T> {
     run_id: Option<String>,
     /// If the update was started with `Completed` wait stage, the outcome is already available.
     known_outcome: Option<update::v1::Outcome>,
+    // Keeping the Accepted request alive allows the service to make an admitted update durable.
+    admitted_response: Option<interceptors::AdmittedUpdateResponse>,
     _output: PhantomData<T>,
 }
 
@@ -1231,17 +1314,40 @@ where
     where
         T: temporalio_common::data_converters::TemporalDeserializable,
     {
+        let mut run_id = self.run_id.clone().unwrap_or_default();
+        let mut known_outcome = self.known_outcome.clone();
+        if let Some(admitted_response) = &self.admitted_response {
+            let mut admitted_response = admitted_response.clone();
+            while admitted_response.borrow().is_none() {
+                admitted_response.changed().await.map_err(|_| {
+                    WorkflowUpdateError::Other(
+                        "Update request task stopped before returning a response".into(),
+                    )
+                })?;
+            }
+            let response = admitted_response
+                .borrow()
+                .clone()
+                .expect("response sender must set a value before notifying")
+                .map_err(WorkflowUpdateError::from_status)?;
+            run_id = response
+                .update_ref
+                .as_ref()
+                .and_then(|reference| reference.workflow_execution.as_ref())
+                .map(|execution| execution.run_id.clone())
+                .unwrap_or_default();
+            known_outcome = response.outcome;
+        }
         let output = interceptors::call_poll_workflow_update(
             self.client.client_interceptors(),
             PollWorkflowUpdateInput {
                 update_id: self.update_id.clone(),
                 workflow_id: self.workflow_id.clone(),
-                run_id: self.run_id.clone().unwrap_or_default(),
+                run_id,
                 rpc_options,
             },
             Next::new({
                 let mut client = self.client.clone();
-                let known_outcome = self.known_outcome.clone();
                 move |input: PollWorkflowUpdateInput| -> BoxFuture<
                     '_,
                     Result<PollWorkflowUpdateOutput, WorkflowUpdateError>,

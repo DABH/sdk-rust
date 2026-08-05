@@ -23,6 +23,11 @@ to docs, or any other relevant information.
 * `CancellableFuture` and `CancellableFutureWithReason` now use the inherited `Future::Output`
   associated type instead of a generic output parameter.
 
+### Fixed
+* Update result RPC timeouts now report `DeadlineExceeded` instead of `Cancelled`.
+* Starting an update at the Admitted stage now returns after server admission and allows the
+  update to follow a Continue-As-New run.
+
 ## [0.6.0] - 2026-08-04
 
 ### Added

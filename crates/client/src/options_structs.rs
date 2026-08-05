@@ -576,7 +576,6 @@ pub struct WorkflowFetchHistoryOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WorkflowUpdateWaitStage {
     /// This stage is reached when the server receives the update to process.
-    /// This is currently an invalid value on start.
     Admitted,
     /// Wait until the update is accepted by the workflow (validator passed).
     #[default]

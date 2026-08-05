@@ -29,6 +29,7 @@ use temporalio_common::{
         workflowservice::v1::{
             CountWorkflowExecutionsResponse, DescribeScheduleResponse,
             DescribeWorkflowExecutionResponse, QueryWorkflowResponse,
+            UpdateWorkflowExecutionResponse,
         },
     },
 };
@@ -505,6 +506,9 @@ impl StartWorkflowUpdateInput {
 
 impl_with_args!(StartWorkflowUpdateInput);
 
+pub(crate) type AdmittedUpdateResponse =
+    tokio::sync::watch::Receiver<Option<Result<UpdateWorkflowExecutionResponse, tonic::Status>>>;
+
 /// Result of an intercepted workflow-update start.
 #[non_exhaustive]
 #[derive(Clone, Debug)]
@@ -517,6 +521,7 @@ pub struct StartWorkflowUpdateOutput {
     pub run_id: Option<String>,
     /// Outcome returned when the requested wait stage completed the update.
     pub known_outcome: Option<Outcome>,
+    pub(crate) admitted_response: Option<AdmittedUpdateResponse>,
 }
 
 impl StartWorkflowUpdateOutput {
@@ -525,12 +530,14 @@ impl StartWorkflowUpdateOutput {
         workflow_id: impl Into<String>,
         run_id: Option<String>,
         known_outcome: Option<Outcome>,
+        admitted_response: Option<AdmittedUpdateResponse>,
     ) -> Self {
         Self {
             update_id: update_id.into(),
             workflow_id: workflow_id.into(),
             run_id,
             known_outcome,
+            admitted_response,
         }
     }
 }

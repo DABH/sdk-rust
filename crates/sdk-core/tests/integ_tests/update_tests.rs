@@ -7,7 +7,7 @@ use assert_matches::assert_matches;
 use futures_util::{future, future::join_all};
 use std::{
     sync::{
-        LazyLock,
+        Arc, LazyLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -15,7 +15,8 @@ use std::{
 use temporalio_client::{
     Client, NamespacedClient, UntypedSignal, UntypedUpdate, UntypedWorkflow,
     WorkflowExecuteUpdateOptions, WorkflowExecutionInfo, WorkflowSignalOptions,
-    WorkflowStartOptions, grpc::WorkflowService,
+    WorkflowStartOptions, WorkflowStartUpdateOptions, WorkflowUpdateWaitStage,
+    grpc::WorkflowService,
 };
 use temporalio_common::{
     data_converters::RawValue,
@@ -41,8 +42,8 @@ use temporalio_common::{
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, LocalActivityOptions, SyncWorkflowContext, WorkflowContext,
-    WorkflowContextView, WorkflowResult,
+    ActivityOptions, ContinueAsNewOptions, LocalActivityOptions, SyncWorkflowContext,
+    WorkflowContext, WorkflowContextView, WorkflowResult,
     activities::{ActivityContext, ActivityError},
 };
 use temporalio_sdk_core::{
@@ -50,7 +51,10 @@ use temporalio_sdk_core::{
     replay::HistoryForReplay,
     test_help::{WorkerTestHelpers, drain_pollers_and_shutdown, start_timer_cmd},
 };
-use tokio::{join, sync::Barrier};
+use tokio::{
+    join,
+    sync::{Barrier, Notify},
+};
 use tonic::IntoRequest;
 use uuid::Uuid;
 
@@ -735,6 +739,158 @@ async fn update_with_local_acts() {
         .fetch_history_and_replay(worker.inner_mut())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn update_admitted_before_continue_as_new() {
+    let wf_name = "update_admitted_before_continue_as_new";
+    let task_started = Arc::new(Notify::new());
+    let release_task = Arc::new(Notify::new());
+    let mut starter = CoreWfStarter::new(wf_name);
+
+    struct HoldWorkflowTaskActivities {
+        task_started: Arc<Notify>,
+        release_task: Arc<Notify>,
+    }
+
+    #[activities]
+    impl HoldWorkflowTaskActivities {
+        #[activity]
+        async fn hold(self: Arc<Self>, _ctx: ActivityContext) -> Result<(), ActivityError> {
+            self.task_started.notify_one();
+            self.release_task.notified().await;
+            Ok(())
+        }
+    }
+
+    starter
+        .sdk_config
+        .register_activities(HoldWorkflowTaskActivities {
+            task_started: task_started.clone(),
+            release_task: release_task.clone(),
+        });
+    let mut worker = starter.worker().await;
+    let client = starter.get_client().await;
+
+    #[workflow]
+    #[derive(Default)]
+    struct ContinueAfterUpdateWf {
+        received_update: bool,
+    }
+
+    #[workflow_methods]
+    impl ContinueAfterUpdateWf {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+            if ctx.info().continued_from_run_id().is_none() {
+                ctx.execute_local_activity(
+                    HoldWorkflowTaskActivities::hold,
+                    (),
+                    LocalActivityOptions::default(),
+                )
+                .await?;
+                ctx.continue_as_new((), ContinueAsNewOptions::default())?;
+            }
+            ctx.wait_condition(|state| state.received_update).await;
+            Ok(ctx.info().run_id().to_owned())
+        }
+
+        #[update]
+        fn update(&mut self, ctx: &mut SyncWorkflowContext<Self>, _: ()) -> String {
+            self.received_update = true;
+            ctx.info().run_id().to_owned()
+        }
+    }
+
+    worker.register_workflow::<ContinueAfterUpdateWf>().unwrap();
+    let task_queue = starter.get_task_queue().to_owned();
+    let workflow_id = starter.get_wf_id().to_owned();
+    let handle = worker
+        .submit_workflow(
+            ContinueAfterUpdateWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue, workflow_id.clone()).build(),
+        )
+        .await
+        .unwrap();
+    let first_run_id = handle.run_id().unwrap().to_owned();
+
+    let update = async {
+        tokio::time::timeout(Duration::from_secs(10), task_started.notified())
+            .await
+            .expect("the first workflow task did not start");
+        let update = tokio::time::timeout(
+            Duration::from_secs(3),
+            handle.start_update(
+                ContinueAfterUpdateWf::update,
+                (),
+                WorkflowStartUpdateOptions::builder()
+                    .update_id("update-id".to_owned())
+                    .wait_for_stage(WorkflowUpdateWaitStage::Admitted)
+                    .build(),
+            ),
+        )
+        .await;
+        release_task.notify_one();
+        let update = update
+            .expect("start_update did not return after admission")
+            .unwrap();
+        let update_run_id = tokio::time::timeout(
+            Duration::from_secs(10),
+            update.get_result(Default::default()),
+        )
+        .await
+        .expect("the admitted update did not complete")
+        .unwrap();
+        assert_ne!(update_run_id, first_run_id);
+        assert_eq!(
+            handle.get_result(Default::default()).await.unwrap(),
+            update_run_id
+        );
+        update_run_id
+    };
+    let run = async {
+        worker.run_until_done().await.unwrap();
+    };
+    let (update_run_id, ()) = join!(update, run);
+
+    let old_events = WorkflowExecutionInfo {
+        namespace: client.namespace(),
+        workflow_id: workflow_id.clone(),
+        run_id: Some(first_run_id),
+        first_execution_run_id: None,
+    }
+    .bind_untyped(client.clone())
+    .fetch_history(Default::default())
+    .await
+    .unwrap()
+    .into_events();
+    let new_events = WorkflowExecutionInfo {
+        namespace: client.namespace(),
+        workflow_id,
+        run_id: Some(update_run_id),
+        first_execution_run_id: None,
+    }
+    .bind_untyped(client)
+    .fetch_history(Default::default())
+    .await
+    .unwrap()
+    .into_events();
+    for event_type in [
+        EventType::WorkflowExecutionUpdateAccepted,
+        EventType::WorkflowExecutionUpdateCompleted,
+    ] {
+        assert!(
+            !old_events
+                .iter()
+                .any(|event| event.event_type() == event_type)
+        );
+        assert!(
+            new_events
+                .iter()
+                .any(|event| event.event_type() == event_type)
+        );
+    }
 }
 
 #[tokio::test]
