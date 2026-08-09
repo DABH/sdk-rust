@@ -578,8 +578,6 @@ pub mod coresdk {
             DeserializeErr(#[from] anyhow::Error),
         }
 
-        // TODO: Once the prototype SDK is un-prototyped this serialization will need to be compat with
-        //   other SDKs (given they might execute an activity).
         pub trait AsJsonPayloadExt {
             fn as_json_payload(&self) -> anyhow::Result<Payload>;
         }
@@ -588,7 +586,7 @@ pub mod coresdk {
             T: Serialize,
         {
             fn as_json_payload(&self) -> anyhow::Result<Payload> {
-                let as_json = serde_json::to_string(self)?;
+                let data = serde_json::to_vec(self)?;
                 let mut metadata = HashMap::new();
                 metadata.insert(
                     ENCODING_PAYLOAD_KEY.to_string(),
@@ -596,7 +594,7 @@ pub mod coresdk {
                 );
                 Ok(Payload {
                     metadata,
-                    data: as_json.into_bytes(),
+                    data,
                     external_payloads: Default::default(),
                 })
             }

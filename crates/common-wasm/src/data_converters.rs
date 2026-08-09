@@ -10,6 +10,12 @@ pub use failure_converter::{
 
 use crate::protos::temporal::api::common::v1::Payload;
 use futures::{FutureExt, future::BoxFuture};
+#[cfg(feature = "protobuf-json")]
+use prost::Message;
+#[cfg(feature = "protobuf-json")]
+use prost_reflect::{DescriptorPool, DeserializeOptions, DynamicMessage, ReflectMessage, Value};
+#[cfg(feature = "protobuf-json")]
+use std::sync::OnceLock;
 use std::{collections::HashMap, sync::Arc};
 
 /// Combines a [`PayloadConverter`], [`FailureConverter`], and [`PayloadCodec`] to handle all
@@ -171,11 +177,17 @@ pub struct SerializationContext<'a> {
 }
 /// Converts values to and from [`Payload`]s using different encoding strategies.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum PayloadConverter {
     /// Uses a serde-based converter for encoding/decoding.
     Serde(Arc<dyn ErasedSerdePayloadConverter>),
     /// This variant signals the user wants to delegate to wrapper types
     UseWrappers,
+    /// Encodes [`ProstJsonSerializable`] values using canonical ProtoJSON.
+    ///
+    /// **Experimental:** This API may change incompatibly in a future release.
+    #[cfg(feature = "protobuf-json")]
+    ProtobufJson(Arc<ProtobufJsonPayloadConverter>),
     /// Tries multiple converters in order until one succeeds.
     Composite(Arc<CompositePayloadConverter>),
 }
@@ -185,6 +197,10 @@ impl std::fmt::Debug for PayloadConverter {
         match self {
             PayloadConverter::Serde(_) => write!(f, "PayloadConverter::Serde(...)"),
             PayloadConverter::UseWrappers => write!(f, "PayloadConverter::UseWrappers"),
+            #[cfg(feature = "protobuf-json")]
+            PayloadConverter::ProtobufJson(_) => {
+                write!(f, "PayloadConverter::ProtobufJson(...)")
+            }
             PayloadConverter::Composite(_) => write!(f, "PayloadConverter::Composite(...)"),
         }
     }
@@ -194,14 +210,30 @@ impl PayloadConverter {
     pub fn serde_json() -> Self {
         Self::Serde(Arc::new(SerdeJsonPayloadConverter))
     }
-    // TODO [rust-sdk-branch]: Proto binary, other standard built-ins
+
+    /// Create a payload converter that uses canonical ProtoJSON serialization.
+    ///
+    /// **Experimental:** This API may change incompatibly in a future release.
+    #[cfg(feature = "protobuf-json")]
+    pub fn protobuf_json(converter: ProtobufJsonPayloadConverter) -> Self {
+        Self::ProtobufJson(Arc::new(converter))
+    }
+
+    /// Create a payload converter from an ordered sequence of converters.
+    pub fn composite(converters: impl IntoIterator<Item = PayloadConverter>) -> Self {
+        Self::Composite(Arc::new(CompositePayloadConverter {
+            converters: converters.into_iter().collect(),
+        }))
+    }
 }
 
 impl Default for PayloadConverter {
     fn default() -> Self {
-        Self::Composite(Arc::new(CompositePayloadConverter {
-            converters: vec![Self::UseWrappers, Self::serde_json()],
-        }))
+        let mut converters = vec![Self::UseWrappers];
+        #[cfg(feature = "protobuf-json")]
+        converters.push(Self::protobuf_json(ProtobufJsonPayloadConverter::default()));
+        converters.push(Self::serde_json());
+        Self::composite(converters)
     }
 }
 
@@ -280,6 +312,13 @@ pub trait TemporalSerializable {
     fn as_serde(&self) -> Result<&dyn erased_serde::Serialize, PayloadConversionError> {
         Err(PayloadConversionError::WrongEncoding)
     }
+    /// Return the encoded protobuf value and its fully qualified message name.
+    ///
+    /// **Experimental:** This API may change incompatibly in a future release.
+    #[cfg(feature = "protobuf-json")]
+    fn as_protobuf(&self) -> Result<ProtobufValue, PayloadConversionError> {
+        Err(PayloadConversionError::WrongEncoding)
+    }
     /// Convert this value into a single [`Payload`].
     fn to_payload(&self, _: &SerializationContext<'_>) -> Result<Payload, PayloadConversionError> {
         Err(PayloadConversionError::WrongEncoding)
@@ -306,6 +345,21 @@ pub trait TemporalDeserializable: Sized {
     ) -> Result<Self, PayloadConversionError> {
         Err(PayloadConversionError::WrongEncoding)
     }
+    /// Return the fully qualified protobuf message name expected by this type.
+    ///
+    /// **Experimental:** This API may change incompatibly in a future release.
+    #[cfg(feature = "protobuf-json")]
+    fn protobuf_message_type() -> Result<String, PayloadConversionError> {
+        Err(PayloadConversionError::WrongEncoding)
+    }
+    /// Decode this type from protobuf wire bytes.
+    ///
+    /// **Experimental:** This API may change incompatibly in a future release.
+    #[cfg(feature = "protobuf-json")]
+    fn from_protobuf(bytes: &[u8]) -> Result<Self, PayloadConversionError> {
+        let _ = bytes;
+        Err(PayloadConversionError::WrongEncoding)
+    }
     /// Deserialize from a single [`Payload`].
     fn from_payload(
         ctx: &SerializationContext<'_>,
@@ -323,6 +377,28 @@ pub trait TemporalDeserializable: Sized {
             return Err(PayloadConversionError::WrongEncoding);
         }
         Self::from_payload(ctx, payloads.into_iter().next().unwrap())
+    }
+}
+
+/// An encoded protobuf value exposed to the built-in ProtoJSON converter.
+///
+/// **Experimental:** This API may change incompatibly in a future release.
+#[cfg(feature = "protobuf-json")]
+pub struct ProtobufValue {
+    message_type: String,
+    data: Vec<u8>,
+}
+
+#[cfg(feature = "protobuf-json")]
+impl ProtobufValue {
+    /// Create a protobuf value from its fully qualified message name and wire-encoded bytes.
+    ///
+    /// **Experimental:** This API may change incompatibly in a future release.
+    pub fn new(message_type: impl Into<String>, data: Vec<u8>) -> Self {
+        Self {
+            message_type: message_type.into(),
+            data,
+        }
     }
 }
 
@@ -538,6 +614,8 @@ impl GenericPayloadConverter for PayloadConverter {
                 }
             }
             PayloadConverter::UseWrappers => T::to_payloads(val, context),
+            #[cfg(feature = "protobuf-json")]
+            PayloadConverter::ProtobufJson(converter) => Ok(vec![converter.to_payload(val)?]),
             PayloadConverter::Composite(composite) => {
                 for converter in &composite.converters {
                     match converter.to_payloads(context, val) {
@@ -573,6 +651,13 @@ impl GenericPayloadConverter for PayloadConverter {
                 T::from_serde(pc.as_ref(), context, payloads.into_iter().next().unwrap())
             }
             PayloadConverter::UseWrappers => T::from_payloads(context, payloads),
+            #[cfg(feature = "protobuf-json")]
+            PayloadConverter::ProtobufJson(converter) => {
+                if payloads.len() != 1 {
+                    return Err(PayloadConversionError::WrongEncoding);
+                }
+                converter.from_payload(payloads.into_iter().next().unwrap())
+            }
             PayloadConverter::Composite(composite) => {
                 for converter in &composite.converters {
                     match converter.from_payloads(context, payloads.clone()) {
@@ -680,7 +765,291 @@ pub trait ErasedSerdePayloadConverter: Send + Sync {
     ) -> Result<Box<dyn erased_serde::Deserializer<'static>>, PayloadConversionError>;
 }
 
+#[cfg(feature = "protobuf-json")]
+fn protobuf_metadata(encoding: &'static [u8], message_type: String) -> HashMap<String, Vec<u8>> {
+    HashMap::from([
+        ("encoding".to_string(), encoding.to_vec()),
+        ("messageType".to_string(), message_type.into_bytes()),
+    ])
+}
+
+/// Error returned while constructing a schema-aware ProtoJSON converter.
+///
+/// **Experimental:** This API may change incompatibly in a future release.
+#[cfg(feature = "protobuf-json")]
+#[derive(Debug, thiserror::Error)]
+pub enum ProtobufJsonPayloadConverterError {
+    /// The supplied descriptor set could not be decoded or linked.
+    #[error("invalid protobuf descriptor set: {0}")]
+    InvalidDescriptorSet(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// A user descriptor reused a bundled file name with different contents.
+    #[error("protobuf descriptor file conflicts with bundled file: {0}")]
+    ConflictingFileName(String),
+}
+
+/// Error returned when converting a value selected for canonical ProtoJSON conversion.
+///
+/// **Experimental:** This API may change incompatibly in a future release.
+#[cfg(feature = "protobuf-json")]
+#[derive(Debug, thiserror::Error)]
+pub enum ProtobufJsonPayloadConversionError {
+    /// The converter does not contain the descriptor required for this message.
+    #[error("protobuf descriptor not found for message type '{message_type}'")]
+    MissingDescriptor {
+        /// Fully qualified protobuf message name requested by the wrapper or target type.
+        message_type: String,
+    },
+    /// The payload metadata names a different message than the requested Rust type.
+    #[error("protobuf payload message type '{actual}' does not match requested type '{expected}'")]
+    MessageTypeMismatch {
+        /// Fully qualified protobuf message name supplied by the target Rust type.
+        expected: String,
+        /// Message name found in the payload's `messageType` metadata.
+        actual: String,
+    },
+    /// Encoding would discard a wire field that is absent from the converter's descriptors.
+    #[error(
+        "protobuf descriptor for '{message_type}' does not include encoded field number {field_number} at '{field_path}'"
+    )]
+    DescriptorMismatch {
+        /// Fully qualified protobuf message name being converted.
+        message_type: String,
+        /// Location of the containing message whose descriptor is older than its wire data.
+        field_path: String,
+        /// Protobuf field number that would be discarded by JSON conversion.
+        field_number: u32,
+    },
+}
+
+#[cfg(feature = "protobuf-json")]
+fn unknown_protobuf_field(message: &DynamicMessage, path: &str) -> Option<(String, u32)> {
+    if let Some(field) = message.unknown_fields().next() {
+        return Some((path.to_string(), field.number()));
+    }
+    if message.descriptor().full_name() == "google.protobuf.Any" {
+        let type_url = message.get_field_by_name("type_url")?;
+        let message_name = type_url.as_ref().as_str()?.rsplit('/').next()?;
+        let data = message.get_field_by_name("value")?;
+        let data = data.as_ref().as_bytes()?;
+        let descriptor = message
+            .descriptor()
+            .parent_pool()
+            .get_message_by_name(message_name)?;
+        let embedded = DynamicMessage::decode(descriptor, data.as_ref()).ok()?;
+        if let Some(unknown) =
+            unknown_protobuf_field(&embedded, &format!("{path}.@type<{message_name}>"))
+        {
+            return Some(unknown);
+        }
+    }
+
+    for (field, value) in message.fields() {
+        let field_path = format!("{path}.{}", field.name());
+        if let Some(unknown) = unknown_protobuf_value(value, &field_path) {
+            return Some(unknown);
+        }
+    }
+    for (extension, value) in message.extensions() {
+        let field_path = format!("{path}.{}", extension.name());
+        if let Some(unknown) = unknown_protobuf_value(value, &field_path) {
+            return Some(unknown);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "protobuf-json")]
+fn unknown_protobuf_value(value: &Value, path: &str) -> Option<(String, u32)> {
+    match value {
+        Value::Message(message) => unknown_protobuf_field(message, path),
+        Value::List(values) => values
+            .iter()
+            .enumerate()
+            .find_map(|(index, value)| unknown_protobuf_value(value, &format!("{path}[{index}]"))),
+        Value::Map(values) => values
+            .iter()
+            .find_map(|(key, value)| unknown_protobuf_value(value, &format!("{path}[{key:?}]"))),
+        _ => None,
+    }
+}
+
+/// A schema-aware converter for canonical `json/protobuf` payloads.
+///
+/// Unlike the stateless serde converter, this converter requires descriptors to apply the
+/// ProtoJSON mapping. Clones cheaply share an immutable descriptor pool.
+///
+/// **Experimental:** This API may change incompatibly in a future release.
+#[cfg(feature = "protobuf-json")]
+#[derive(Clone)]
+pub struct ProtobufJsonPayloadConverter {
+    descriptors: DescriptorPool,
+}
+
+#[cfg(feature = "protobuf-json")]
+impl ProtobufJsonPayloadConverter {
+    /// Create a converter containing the bundled Temporal, Core, service, Google, and well-known
+    /// message descriptors plus the supplied descriptor set.
+    ///
+    /// **Experimental:** This API may change incompatibly in a future release.
+    pub fn from_file_descriptor_set(
+        descriptors: &[u8],
+    ) -> Result<Self, ProtobufJsonPayloadConverterError> {
+        let mut bundled =
+            prost_types_standard::FileDescriptorSet::decode(temporalio_protos::FILE_DESCRIPTOR_SET)
+                .map_err(|err| {
+                    ProtobufJsonPayloadConverterError::InvalidDescriptorSet(Box::new(err))
+                })?;
+        let supplied =
+            prost_types_standard::FileDescriptorSet::decode(descriptors).map_err(|err| {
+                ProtobufJsonPayloadConverterError::InvalidDescriptorSet(Box::new(err))
+            })?;
+        for mut file in supplied.file {
+            file.source_code_info = None;
+            if let Some(existing) = bundled
+                .file
+                .iter()
+                .find(|existing| existing.name == file.name)
+            {
+                if existing != &file {
+                    return Err(ProtobufJsonPayloadConverterError::ConflictingFileName(
+                        file.name.unwrap_or_default(),
+                    ));
+                }
+            } else {
+                bundled.file.push(file);
+            }
+        }
+        let descriptors = DescriptorPool::from_file_descriptor_set(bundled).map_err(|err| {
+            ProtobufJsonPayloadConverterError::InvalidDescriptorSet(Box::new(err))
+        })?;
+        Ok(Self { descriptors })
+    }
+
+    fn to_payload<T: TemporalSerializable>(
+        &self,
+        val: &T,
+    ) -> Result<Payload, PayloadConversionError> {
+        let protobuf = val.as_protobuf()?;
+        let descriptor = self
+            .descriptors
+            .get_message_by_name(&protobuf.message_type)
+            .ok_or_else(|| {
+                PayloadConversionError::EncodingError(Box::new(
+                    ProtobufJsonPayloadConversionError::MissingDescriptor {
+                        message_type: protobuf.message_type.clone(),
+                    },
+                ))
+            })?;
+        let dynamic = DynamicMessage::decode(descriptor, protobuf.data.as_slice())
+            .map_err(|err| PayloadConversionError::EncodingError(Box::new(err)))?;
+        if let Some((field_path, field_number)) =
+            unknown_protobuf_field(&dynamic, &protobuf.message_type)
+        {
+            return Err(PayloadConversionError::EncodingError(Box::new(
+                ProtobufJsonPayloadConversionError::DescriptorMismatch {
+                    message_type: protobuf.message_type,
+                    field_path,
+                    field_number,
+                },
+            )));
+        }
+        let data = serde_json::to_vec(&dynamic)
+            .map_err(|err| PayloadConversionError::EncodingError(Box::new(err)))?;
+        Ok(Payload {
+            metadata: protobuf_metadata(b"json/protobuf", protobuf.message_type),
+            data,
+            external_payloads: vec![],
+        })
+    }
+
+    #[allow(clippy::wrong_self_convention)]
+    fn from_payload<T: TemporalDeserializable>(
+        &self,
+        payload: Payload,
+    ) -> Result<T, PayloadConversionError> {
+        let message_type = T::protobuf_message_type()?;
+        if payload.metadata.get("encoding").map(Vec::as_slice) != Some(b"json/protobuf") {
+            return Err(PayloadConversionError::WrongEncoding);
+        }
+        if let Some(actual) = payload.metadata.get("messageType")
+            && actual.as_slice() != message_type.as_bytes()
+        {
+            return Err(PayloadConversionError::EncodingError(Box::new(
+                ProtobufJsonPayloadConversionError::MessageTypeMismatch {
+                    expected: message_type,
+                    actual: String::from_utf8_lossy(actual).into_owned(),
+                },
+            )));
+        }
+        let descriptor = self
+            .descriptors
+            .get_message_by_name(&message_type)
+            .ok_or_else(|| {
+                PayloadConversionError::EncodingError(Box::new(
+                    ProtobufJsonPayloadConversionError::MissingDescriptor {
+                        message_type: message_type.clone(),
+                    },
+                ))
+            })?;
+        let mut deserializer = serde_json::Deserializer::from_slice(&payload.data);
+        let options = DeserializeOptions::new().deny_unknown_fields(false);
+        let dynamic =
+            DynamicMessage::deserialize_with_options(descriptor, &mut deserializer, &options)
+                .map_err(|err| PayloadConversionError::EncodingError(Box::new(err)))?;
+        deserializer
+            .end()
+            .map_err(|err| PayloadConversionError::EncodingError(Box::new(err)))?;
+        T::from_protobuf(&dynamic.encode_to_vec())
+    }
+}
+
+#[cfg(feature = "protobuf-json")]
+impl Default for ProtobufJsonPayloadConverter {
+    fn default() -> Self {
+        static BUNDLED: OnceLock<DescriptorPool> = OnceLock::new();
+        let descriptors = BUNDLED
+            .get_or_init(|| {
+                DescriptorPool::decode(temporalio_protos::FILE_DESCRIPTOR_SET)
+                    .expect("bundled protobuf descriptors must be valid")
+            })
+            .clone();
+        Self { descriptors }
+    }
+}
+
 // TODO [rust-sdk-branch]: All prost things should be behind a compile flag
+
+/// Wrapper for named protobuf messages encoded using canonical `json/protobuf`.
+///
+/// **Experimental:** This API may change incompatibly in a future release.
+#[cfg(feature = "protobuf-json")]
+pub struct ProstJsonSerializable<T: prost::Message + prost::Name>(pub T);
+
+#[cfg(feature = "protobuf-json")]
+impl<T> TemporalSerializable for ProstJsonSerializable<T>
+where
+    T: prost::Message + prost::Name,
+{
+    fn as_protobuf(&self) -> Result<ProtobufValue, PayloadConversionError> {
+        Ok(ProtobufValue::new(T::full_name(), self.0.encode_to_vec()))
+    }
+}
+
+#[cfg(feature = "protobuf-json")]
+impl<T> TemporalDeserializable for ProstJsonSerializable<T>
+where
+    T: prost::Message + prost::Name + Default,
+{
+    fn protobuf_message_type() -> Result<String, PayloadConversionError> {
+        Ok(T::full_name())
+    }
+
+    fn from_protobuf(bytes: &[u8]) -> Result<Self, PayloadConversionError> {
+        T::decode(bytes)
+            .map(ProstJsonSerializable)
+            .map_err(|err| PayloadConversionError::EncodingError(Box::new(err)))
+    }
+}
 
 /// Wrapper for protobuf messages that implements [`TemporalSerializable`]/[`TemporalDeserializable`]
 /// using `binary/protobuf` encoding.
@@ -817,6 +1186,14 @@ impl_multi_args!(MultiArgs6; 6; 0: A, 1: B, 2: C, 3: D, 4: E, 5: F);
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "protobuf-json")]
+    use crate::protos::temporal::api::common::v1::WorkflowType;
+    #[cfg(feature = "protobuf-json")]
+    use prost_types_standard::{
+        DescriptorProto, EnumDescriptorProto, EnumValueDescriptorProto, FieldDescriptorProto,
+        FileDescriptorProto, FileDescriptorSet,
+        field_descriptor_proto::{Label, Type},
+    };
 
     #[test]
     fn test_empty_payloads_as_unit_type() {
@@ -962,5 +1339,504 @@ mod tests {
         let result: Vec<String> = payloads.deserialize().unwrap();
 
         assert_eq!(result, vec!["hello".to_string(), "world".to_string()]);
+    }
+
+    #[cfg(feature = "protobuf-json")]
+    mod protobufjson_tests {
+        use super::*;
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct TestMessage {
+            #[prost(int64, tag = "1")]
+            count: i64,
+            #[prost(bytes, tag = "2")]
+            data: Vec<u8>,
+            #[prost(enumeration = "TestState", tag = "3")]
+            state: i32,
+        }
+
+        impl prost::Name for TestMessage {
+            const NAME: &'static str = "TestMessage";
+            const PACKAGE: &'static str = "temporal.sdk.test";
+        }
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct NewerTestMessage {
+            #[prost(int64, tag = "1")]
+            count: i64,
+            #[prost(bytes, tag = "2")]
+            data: Vec<u8>,
+            #[prost(enumeration = "TestState", tag = "3")]
+            state: i32,
+            #[prost(string, tag = "4")]
+            future: String,
+        }
+
+        impl prost::Name for NewerTestMessage {
+            const NAME: &'static str = "TestMessage";
+            const PACKAGE: &'static str = "temporal.sdk.test";
+        }
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct ParentMessage {
+            #[prost(message, optional, tag = "1")]
+            child: Option<NewerChildMessage>,
+        }
+
+        impl prost::Name for ParentMessage {
+            const NAME: &'static str = "ParentMessage";
+            const PACKAGE: &'static str = "temporal.sdk.test";
+        }
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct AnyParentMessage {
+            #[prost(message, optional, tag = "1")]
+            value: Option<prost_types_standard::Any>,
+        }
+
+        impl prost::Name for AnyParentMessage {
+            const NAME: &'static str = "AnyParentMessage";
+            const PACKAGE: &'static str = "temporal.sdk.test";
+        }
+
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct NewerChildMessage {
+            #[prost(string, tag = "1")]
+            known: String,
+            #[prost(string, tag = "2")]
+            future: String,
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+        enum TestState {
+            Unspecified = 0,
+            Ready = 1,
+        }
+
+        fn test_message_descriptors() -> Vec<u8> {
+            FileDescriptorSet {
+                file: vec![FileDescriptorProto {
+                    name: Some("test_message.proto".to_string()),
+                    package: Some("temporal.sdk.test".to_string()),
+                    dependency: vec!["google/protobuf/any.proto".to_string()],
+                    message_type: vec![
+                        DescriptorProto {
+                            name: Some("TestMessage".to_string()),
+                            field: vec![
+                                FieldDescriptorProto {
+                                    name: Some("count".to_string()),
+                                    number: Some(1),
+                                    label: Some(Label::Optional as i32),
+                                    r#type: Some(Type::Int64 as i32),
+                                    json_name: Some("count".to_string()),
+                                    ..Default::default()
+                                },
+                                FieldDescriptorProto {
+                                    name: Some("data".to_string()),
+                                    number: Some(2),
+                                    label: Some(Label::Optional as i32),
+                                    r#type: Some(Type::Bytes as i32),
+                                    json_name: Some("data".to_string()),
+                                    ..Default::default()
+                                },
+                                FieldDescriptorProto {
+                                    name: Some("state".to_string()),
+                                    number: Some(3),
+                                    label: Some(Label::Optional as i32),
+                                    r#type: Some(Type::Enum as i32),
+                                    type_name: Some(".temporal.sdk.test.TestState".to_string()),
+                                    json_name: Some("state".to_string()),
+                                    ..Default::default()
+                                },
+                            ],
+                            ..Default::default()
+                        },
+                        DescriptorProto {
+                            name: Some("ParentMessage".to_string()),
+                            field: vec![FieldDescriptorProto {
+                                name: Some("child".to_string()),
+                                number: Some(1),
+                                label: Some(Label::Optional as i32),
+                                r#type: Some(Type::Message as i32),
+                                type_name: Some(".temporal.sdk.test.ChildMessage".to_string()),
+                                json_name: Some("child".to_string()),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                        DescriptorProto {
+                            name: Some("ChildMessage".to_string()),
+                            field: vec![FieldDescriptorProto {
+                                name: Some("known".to_string()),
+                                number: Some(1),
+                                label: Some(Label::Optional as i32),
+                                r#type: Some(Type::String as i32),
+                                json_name: Some("known".to_string()),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                        DescriptorProto {
+                            name: Some("AnyParentMessage".to_string()),
+                            field: vec![FieldDescriptorProto {
+                                name: Some("value".to_string()),
+                                number: Some(1),
+                                label: Some(Label::Optional as i32),
+                                r#type: Some(Type::Message as i32),
+                                type_name: Some(".google.protobuf.Any".to_string()),
+                                json_name: Some("value".to_string()),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                    ],
+                    enum_type: vec![EnumDescriptorProto {
+                        name: Some("TestState".to_string()),
+                        value: vec![
+                            EnumValueDescriptorProto {
+                                name: Some("TEST_STATE_UNSPECIFIED".to_string()),
+                                number: Some(0),
+                                ..Default::default()
+                            },
+                            EnumValueDescriptorProto {
+                                name: Some("TEST_STATE_READY".to_string()),
+                                number: Some(1),
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    }],
+                    syntax: Some("proto3".to_string()),
+                    ..Default::default()
+                }],
+            }
+            .encode_to_vec()
+        }
+
+        #[test]
+        fn custom_descriptor_uses_canonical_proto_json() {
+            let converter = PayloadConverter::protobuf_json(
+                ProtobufJsonPayloadConverter::from_file_descriptor_set(&test_message_descriptors())
+                    .unwrap(),
+            );
+            let context = SerializationContext {
+                data: &SerializationContextData::Workflow,
+                converter: &converter,
+            };
+            let value = TestMessage {
+                count: 9_007_199_254_740_993,
+                data: vec![1, 2],
+                state: TestState::Ready as i32,
+            };
+
+            let payload = converter
+                .to_payload(&context, &ProstJsonSerializable(value.clone()))
+                .unwrap();
+
+            assert_eq!(payload.metadata["encoding"], b"json/protobuf");
+            assert_eq!(
+                payload.metadata["messageType"],
+                b"temporal.sdk.test.TestMessage"
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&payload.data).unwrap(),
+                serde_json::json!({
+                    "count": "9007199254740993",
+                    "data": "AQI=",
+                    "state": "TEST_STATE_READY",
+                })
+            );
+            let decoded = converter
+                .from_payload::<ProstJsonSerializable<TestMessage>>(&context, payload)
+                .unwrap();
+            assert_eq!(decoded.0, value);
+        }
+
+        #[test]
+        fn proto_json_decode_ignores_unknown_fields() {
+            let converter = PayloadConverter::protobuf_json(
+                ProtobufJsonPayloadConverter::from_file_descriptor_set(&test_message_descriptors())
+                    .unwrap(),
+            );
+            let context = SerializationContext {
+                data: &SerializationContextData::Workflow,
+                converter: &converter,
+            };
+            let payload = Payload {
+                metadata: protobuf_metadata(
+                    b"json/protobuf",
+                    "temporal.sdk.test.TestMessage".to_string(),
+                ),
+                data: br#"{"count":"7","futureField":"from-a-newer-schema"}"#.to_vec(),
+                external_payloads: vec![],
+            };
+
+            let decoded = converter
+                .from_payload::<ProstJsonSerializable<TestMessage>>(&context, payload)
+                .unwrap();
+
+            assert_eq!(decoded.0.count, 7);
+        }
+
+        #[test]
+        fn proto_json_decode_accepts_missing_message_type() {
+            let converter = PayloadConverter::protobuf_json(
+                ProtobufJsonPayloadConverter::from_file_descriptor_set(&test_message_descriptors())
+                    .unwrap(),
+            );
+            let context = SerializationContext {
+                data: &SerializationContextData::Workflow,
+                converter: &converter,
+            };
+            let mut payload = Payload {
+                metadata: protobuf_metadata(
+                    b"json/protobuf",
+                    "temporal.sdk.test.TestMessage".to_string(),
+                ),
+                data: br#"{"count":"7"}"#.to_vec(),
+                external_payloads: vec![],
+            };
+            payload.metadata.remove("messageType");
+
+            let decoded = converter
+                .from_payload::<ProstJsonSerializable<TestMessage>>(&context, payload)
+                .unwrap();
+
+            assert_eq!(decoded.0.count, 7);
+        }
+
+        #[test]
+        fn proto_json_decode_rejects_mismatched_message_type() {
+            let converter = PayloadConverter::protobuf_json(
+                ProtobufJsonPayloadConverter::from_file_descriptor_set(&test_message_descriptors())
+                    .unwrap(),
+            );
+            let context = SerializationContext {
+                data: &SerializationContextData::Workflow,
+                converter: &converter,
+            };
+            let payload = Payload {
+                metadata: protobuf_metadata(
+                    b"json/protobuf",
+                    "temporal.sdk.test.ParentMessage".to_string(),
+                ),
+                data: b"{}".to_vec(),
+                external_payloads: vec![],
+            };
+
+            let error = converter
+                .from_payload::<ProstJsonSerializable<TestMessage>>(&context, payload)
+                .err()
+                .unwrap();
+
+            match error {
+                PayloadConversionError::EncodingError(error) => assert!(matches!(
+                    error.downcast_ref::<ProtobufJsonPayloadConversionError>(),
+                    Some(ProtobufJsonPayloadConversionError::MessageTypeMismatch {
+                        expected,
+                        actual,
+                    }) if expected == "temporal.sdk.test.TestMessage"
+                        && actual == "temporal.sdk.test.ParentMessage"
+                )),
+                error => panic!("expected message type mismatch, got {error}"),
+            }
+        }
+
+        #[test]
+        fn proto_json_encode_rejects_unknown_wire_fields() {
+            let converter = PayloadConverter::protobuf_json(
+                ProtobufJsonPayloadConverter::from_file_descriptor_set(&test_message_descriptors())
+                    .unwrap(),
+            );
+            let context = SerializationContext {
+                data: &SerializationContextData::Workflow,
+                converter: &converter,
+            };
+            let value = ProstJsonSerializable(NewerTestMessage {
+                future: "must not be discarded".to_string(),
+                ..Default::default()
+            });
+
+            let error = converter.to_payload(&context, &value).unwrap_err();
+
+            match error {
+                PayloadConversionError::EncodingError(error) => assert!(matches!(
+                    error.downcast_ref::<ProtobufJsonPayloadConversionError>(),
+                    Some(ProtobufJsonPayloadConversionError::DescriptorMismatch {
+                        field_number: 4,
+                        field_path,
+                        ..
+                    }) if field_path == "temporal.sdk.test.TestMessage"
+                )),
+                error => panic!("expected descriptor mismatch, got {error}"),
+            }
+        }
+
+        #[test]
+        fn proto_json_encode_rejects_nested_unknown_wire_fields() {
+            let converter = PayloadConverter::protobuf_json(
+                ProtobufJsonPayloadConverter::from_file_descriptor_set(&test_message_descriptors())
+                    .unwrap(),
+            );
+            let context = SerializationContext {
+                data: &SerializationContextData::Workflow,
+                converter: &converter,
+            };
+            let value = ProstJsonSerializable(ParentMessage {
+                child: Some(NewerChildMessage {
+                    known: "preserved".to_string(),
+                    future: "must not be discarded".to_string(),
+                }),
+            });
+
+            let error = converter.to_payload(&context, &value).unwrap_err();
+
+            match error {
+                PayloadConversionError::EncodingError(error) => assert!(matches!(
+                    error.downcast_ref::<ProtobufJsonPayloadConversionError>(),
+                    Some(ProtobufJsonPayloadConversionError::DescriptorMismatch {
+                        field_number: 2,
+                        field_path,
+                        ..
+                    }) if field_path == "temporal.sdk.test.ParentMessage.child"
+                )),
+                error => panic!("expected nested descriptor mismatch, got {error}"),
+            }
+        }
+
+        #[test]
+        fn proto_json_encode_rejects_unknown_wire_fields_inside_any() {
+            let converter = PayloadConverter::protobuf_json(
+                ProtobufJsonPayloadConverter::from_file_descriptor_set(&test_message_descriptors())
+                    .unwrap(),
+            );
+            let context = SerializationContext {
+                data: &SerializationContextData::Workflow,
+                converter: &converter,
+            };
+            let embedded = NewerTestMessage {
+                future: "must not be discarded".to_string(),
+                ..Default::default()
+            };
+            let value = ProstJsonSerializable(AnyParentMessage {
+                value: Some(prost_types_standard::Any {
+                    type_url: "type.googleapis.com/temporal.sdk.test.TestMessage".to_string(),
+                    value: embedded.encode_to_vec(),
+                }),
+            });
+
+            let error = converter.to_payload(&context, &value).unwrap_err();
+
+            match error {
+                PayloadConversionError::EncodingError(error) => assert!(matches!(
+                    error.downcast_ref::<ProtobufJsonPayloadConversionError>(),
+                    Some(ProtobufJsonPayloadConversionError::DescriptorMismatch {
+                        field_number: 4,
+                        field_path,
+                        ..
+                    }) if field_path == concat!(
+                        "temporal.sdk.test.AnyParentMessage.value.",
+                        "@type<temporal.sdk.test.TestMessage>"
+                    )
+                )),
+                error => panic!("expected Any descriptor mismatch, got {error}"),
+            }
+        }
+
+        #[test]
+        fn bundled_descriptor_uses_proto_json_by_default() {
+            let converter = PayloadConverter::default();
+            let context = SerializationContext {
+                data: &SerializationContextData::Workflow,
+                converter: &converter,
+            };
+            let value = WorkflowType {
+                name: "example".to_string(),
+            };
+
+            let payload = converter
+                .to_payload(&context, &ProstJsonSerializable(value.clone()))
+                .unwrap();
+
+            assert_eq!(payload.metadata["encoding"], b"json/protobuf");
+            assert_eq!(
+                payload.metadata["messageType"],
+                b"temporal.api.common.v1.WorkflowType"
+            );
+            assert_eq!(payload.data, br#"{"name":"example"}"#);
+            let decoded = converter
+                .from_payload::<ProstJsonSerializable<WorkflowType>>(&context, payload)
+                .unwrap();
+            assert_eq!(decoded.0, value);
+        }
+
+        #[test]
+        fn missing_descriptor_returns_configuration_error() {
+            let converter =
+                PayloadConverter::protobuf_json(ProtobufJsonPayloadConverter::default());
+            let context = SerializationContext {
+                data: &SerializationContextData::Workflow,
+                converter: &converter,
+            };
+            let value = ProstJsonSerializable(TestMessage::default());
+
+            let error = converter.to_payload(&context, &value).unwrap_err();
+
+            match error {
+                PayloadConversionError::EncodingError(error) => assert!(matches!(
+                    error.downcast_ref::<ProtobufJsonPayloadConversionError>(),
+                    Some(ProtobufJsonPayloadConversionError::MissingDescriptor {
+                        message_type,
+                    }) if message_type == "temporal.sdk.test.TestMessage"
+                )),
+                error => panic!("expected missing descriptor, got {error}"),
+            }
+        }
+
+        #[test]
+        fn conflicting_bundled_descriptor_is_rejected() {
+            let mut descriptors =
+                FileDescriptorSet::decode(temporalio_protos::FILE_DESCRIPTOR_SET).unwrap();
+            let mut conflicting = descriptors.file.remove(0);
+            let name = conflicting.name.clone().unwrap();
+            conflicting.package = Some("conflicting.package".to_string());
+            let supplied = FileDescriptorSet {
+                file: vec![conflicting],
+            }
+            .encode_to_vec();
+
+            assert!(matches!(
+                ProtobufJsonPayloadConverter::from_file_descriptor_set(&supplied),
+                Err(ProtobufJsonPayloadConverterError::ConflictingFileName(conflict))
+                    if conflict == name
+            ));
+        }
+
+        #[test]
+        fn invalid_descriptor_set_is_rejected() {
+            assert!(matches!(
+                ProtobufJsonPayloadConverter::from_file_descriptor_set(&[0xff]),
+                Err(ProtobufJsonPayloadConverterError::InvalidDescriptorSet(_))
+            ));
+        }
+
+        #[test]
+        fn existing_prost_wrapper_remains_binary() {
+            let converter = PayloadConverter::default();
+            let context = SerializationContext {
+                data: &SerializationContextData::Workflow,
+                converter: &converter,
+            };
+            let value = ProstSerializable(WorkflowType {
+                name: "example".to_string(),
+            });
+
+            let payload = converter.to_payload(&context, &value).unwrap();
+
+            assert_eq!(payload.metadata["encoding"], b"binary/protobuf");
+
+            let payload = converter.to_payload(&context, &"example").unwrap();
+            assert_eq!(payload.metadata["encoding"], b"json/plain");
+        }
     }
 }

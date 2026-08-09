@@ -13,6 +13,8 @@ readme = "README.md"
 
 [features]
 default = ["envconfig", "tls-ring"]
+# Experimental and may change incompatibly in a future release.
+protobuf-json = ["temporalio-common/protobuf-json"]
 tls-ring = ["tonic/tls-ring"]
 tls-aws-lc = ["tonic/tls-aws-lc"]
 telemetry = ["dep:opentelemetry"]

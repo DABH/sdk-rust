@@ -10,6 +10,10 @@ repository = "https://github.com/temporalio/sdk-core"
 keywords = ["temporal", "workflow"]
 categories = ["development-tools"]
 
+[features]
+# Experimental and may change incompatibly in a future release.
+protobuf-json = ["temporalio-common-wasm/protobuf-json"]
+
 [dependencies]
 anyhow = "1.0"
 bon = { workspace = true }

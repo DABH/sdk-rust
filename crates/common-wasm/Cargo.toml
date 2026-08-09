@@ -13,6 +13,12 @@ categories = ["development-tools"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
+# Experimental and may change incompatibly in a future release.
+protobuf-json = [
+  "dep:prost-reflect",
+  "dep:prost-types-standard",
+  "temporalio-protos/descriptors",
+]
 serde_serialize = ["temporalio-protos/serde_serialize"]
 grpc-clients = ["temporalio-protos/grpc-clients"]
 
@@ -30,7 +36,9 @@ chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 parking_lot = { version = "0.12" }
 prost = { workspace = true }
+prost-reflect = { workspace = true, optional = true }
 prost-types = { workspace = true }
+prost-types-standard = { workspace = true, optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

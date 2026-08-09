@@ -69,6 +69,13 @@ rstest = "0.26"
 
 [features]
 default = ["envconfig", "prometheus"]
+# Experimental and may change incompatibly in a future release.
+protobuf-json = [
+  "temporalio-client/protobuf-json",
+  "temporalio-common/protobuf-json",
+  "temporalio-sdk-core/protobuf-json",
+  "temporalio-workflow/protobuf-json",
+]
 envconfig = ["temporalio-sdk-core/envconfig"]
 prometheus = ["temporalio-sdk-core/prometheus"]
 otel = ["temporalio-sdk-core/otel"]

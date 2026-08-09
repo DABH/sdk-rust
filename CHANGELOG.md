@@ -20,6 +20,9 @@ to docs, or any other relevant information.
 ## Unreleased
 
 ### Added
+* Added experimental, opt-in canonical ProtoJSON payload conversion through
+  `ProstJsonSerializable<T>`, including bundled Temporal descriptors and support for merging
+  user-provided descriptor sets. These APIs may change incompatibly in a future release.
 * Worker heartbeats now report the SDK runtime, hosting environments, operating system, and
   architecture once per worker, retrying until the first successful delivery. Runtime options can
   disable this reporting, and language SDK bridges can supply their own runtime details. The Rust
@@ -28,6 +31,8 @@ to docs, or any other relevant information.
 * `DnsLoadBalancingOptions::builder()` for configuring DNS re-resolution intervals.
 
 ### Breaking Changes :boom:
+* `PayloadConverter` is now non-exhaustive so additional built-in converters can be added without
+  breaking exhaustive matches.
 * `CancellableFuture` and `CancellableFutureWithReason` now use the inherited `Future::Output`
   associated type instead of a generic output parameter.
 * `TimerOptions` is now tagged with `#[non_exhaustive]`. Use

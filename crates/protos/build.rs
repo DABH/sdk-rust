@@ -151,6 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 let mut c = Config::new();
                 c.enable_type_names();
+                c.skip_source_info();
                 c
             },
             &[
