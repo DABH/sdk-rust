@@ -118,8 +118,33 @@ temporalio-sdk = { version = "0.3", default-features = false, features = ["envco
   loading connection settings from environment variables and `temporal.toml` files.
 - `prometheus` - enabled by default. Adds the Prometheus metrics exporter in
   `temporalio_common::telemetry` for serving SDK metrics from a HTTP endpoint.
-- `otel` - optional. Adds the OpenTelemetry metrics exporter in `temporalio_common::telemetry` for
-  sending SDK metrics to an OpenTelemetry collector.
+- `otel` - optional. Adds OpenTelemetry metric and trace exporters, including the AWS Lambda
+  defaults in `temporalio_sdk::aws_lambda::otel`.
+
+### AWS Lambda OpenTelemetry
+
+With the `otel` feature enabled, `OpenTelemetryPlugin` configures metrics and Rust `tracing` spans
+for the local OTLP endpoint exposed by the AWS Distro for OpenTelemetry (ADOT) Lambda layer. The
+plugin uses `OTEL_SERVICE_NAME`, `AWS_LAMBDA_FUNCTION_NAME`, and `OTEL_EXPORTER_OTLP_ENDPOINT` when
+present, and flushes pending data after each worker shutdown without shutting down providers needed
+by warm invocations.
+
+```rust
+use temporalio_client::ClientOptions;
+use temporalio_sdk::{Runtime, aws_lambda::otel::OpenTelemetryPlugin, runtime::RuntimeOptions};
+
+let plugin = OpenTelemetryPlugin::new(Default::default())?;
+let runtime = Runtime::new_assume_tokio(
+    RuntimeOptions::builder()
+        .telemetry_options(plugin.telemetry_options())
+        .build()
+        .unwrap(),
+)?;
+let client_options = ClientOptions::new("default").plugin(plugin).build();
+```
+
+The current Rust SDK does not propagate OpenTelemetry trace context through Temporal headers, so
+these spans are local worker traces rather than a cross-service distributed trace.
 
 ## Workflows in detail
 

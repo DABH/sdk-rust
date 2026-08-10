@@ -20,6 +20,10 @@ to docs, or any other relevant information.
 ## Unreleased
 
 ### Added
+* `temporalio_sdk::aws_lambda::otel::OpenTelemetryPlugin` configures OTLP metrics and Rust tracing
+  spans with ADOT Lambda defaults and force-flushes both after worker shutdown while retaining the
+  providers for warm invocations. Core OTel meters and tracers now expose non-destructive
+  force-flush support, and worker interceptors have an `on_shutdown_complete` lifecycle callback.
 * Worker heartbeats now report the SDK runtime, hosting environments, operating system, and
   architecture once per worker, retrying until the first successful delivery. Runtime options can
   disable this reporting, and language SDK bridges can supply their own runtime details. The Rust

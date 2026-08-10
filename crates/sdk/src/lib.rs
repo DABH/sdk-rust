@@ -65,6 +65,8 @@ extern crate tracing;
 extern crate self as temporalio_sdk;
 
 pub mod activities;
+/// Helpers for running Temporal workers in AWS Lambda.
+pub mod aws_lambda;
 pub mod error;
 pub mod interceptors;
 /// Experimental APIs for configuring clients and workers with reusable plugins.
@@ -1120,6 +1122,9 @@ impl Worker {
             i.on_shutdown(self);
         }
         self.common.worker.shutdown().await;
+        for i in &self.common.worker_interceptors {
+            i.on_shutdown_complete(self);
+        }
         Ok(())
     }
 
