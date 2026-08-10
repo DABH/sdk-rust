@@ -15,7 +15,8 @@ links = "temporalio_protos"
 [features]
 default = []
 serde_serialize = []
-grpc-clients = ["tonic/channel"]
+grpc-clients = []
+grpc-transport = ["grpc-clients", "tonic/channel"]
 
 [dependencies]
 anyhow = "1.0"

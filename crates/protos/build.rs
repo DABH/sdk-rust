@@ -55,6 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // feature to preserve the generated clients it re-exports today.
         .build_server(false)
         .build_client(env::var_os("CARGO_FEATURE_GRPC_CLIENTS").is_some())
+        .build_transport(env::var_os("CARGO_FEATURE_GRPC_TRANSPORT").is_some())
         // Make conversions easier for some types
         .type_attribute(
             "temporal.api.history.v1.HistoryEvent.attributes",

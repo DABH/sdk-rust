@@ -67,6 +67,7 @@ use activities::WorkerActivityTasks;
 use anyhow::bail;
 use crossbeam_utils::atomic::AtomicCell;
 use futures_util::{StreamExt, stream};
+#[cfg(feature = "native-environment")]
 use gethostname::gethostname;
 use parking_lot::{Mutex, RwLock};
 use slot_provider::SlotProvider;
@@ -2304,7 +2305,7 @@ impl WorkerHeartbeatManager {
             let mut worker_heartbeat = WorkerHeartbeat {
                 worker_instance_key: worker_instance_key.to_string(),
                 host_info: Some(WorkerHostInfo {
-                    host_name: gethostname().to_string_lossy().to_string(),
+                    host_name: worker_host_name(),
                     process_id: std::process::id().to_string(),
                     current_host_cpu_usage: heartbeat_manager_metrics.sys_info.used_cpu_percent()
                         as f32,
@@ -2445,6 +2446,16 @@ impl WorkerHeartbeatManager {
             heartbeat_success_callback,
         }
     }
+}
+
+#[cfg(feature = "native-environment")]
+fn worker_host_name() -> String {
+    gethostname().to_string_lossy().to_string()
+}
+
+#[cfg(not(feature = "native-environment"))]
+fn worker_host_name() -> String {
+    String::new()
 }
 
 pub(crate) struct PostActivateHookData<'a> {

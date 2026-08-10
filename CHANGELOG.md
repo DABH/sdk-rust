@@ -20,6 +20,8 @@ to docs, or any other relevant information.
 ## Unreleased
 
 ### Added
+* Native client transport, runtime, and host-environment dependencies can now be disabled so Core
+  workers can run behind a callback transport on WASM hosts.
 * Worker heartbeats now report the SDK runtime, hosting environments, operating system, and
   architecture once per worker, retrying until the first successful delivery. Runtime options can
   disable this reporting, and language SDK bridges can supply their own runtime details. The Rust
