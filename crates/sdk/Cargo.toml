@@ -228,7 +228,9 @@ required-features = ["examples"]
 [[example]]
 name = "wasm-workflows"
 path = "examples/wasm_workflows/src/lib.rs"
-crate-type = ["cdylib"]
+# The standalone example crate builds the cdylib through cargo-component; the workspace target
+# only needs to compile the source without linking wasm-only component exports on the host.
+crate-type = ["rlib"]
 required-features = ["examples", "wasm-examples"]
 
 [lints]
