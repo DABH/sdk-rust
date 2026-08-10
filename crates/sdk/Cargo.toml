@@ -21,6 +21,7 @@ futures-util = { version = "0.3", default-features = false, features = [
   "async-await-macro",
 ] }
 gethostname = "1.0.2"
+lambda_runtime = { version = "1.3", optional = true }
 parking_lot = { version = "0.12" }
 prost = { workspace = true }
 prost-types = { workspace = true }
@@ -66,10 +67,12 @@ version = "0.6"
 
 [dev-dependencies]
 futures = "0.3"
+http = "1"
 rstest = "0.26"
 
 [features]
 default = ["envconfig", "prometheus"]
+aws-lambda = ["envconfig", "dep:lambda_runtime", "dep:serde_json"]
 envconfig = ["temporalio-sdk-core/envconfig"]
 prometheus = ["temporalio-sdk-core/prometheus"]
 otel = ["temporalio-sdk-core/otel"]
