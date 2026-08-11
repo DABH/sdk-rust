@@ -30,6 +30,7 @@ const BRIDGE_ERROR: i32 = -1;
 const BRIDGE_PENDING: i32 = 1;
 
 type OperationSlot = Arc<Mutex<OperationState>>;
+type ConnectionSlot = Arc<Mutex<Option<Result<Connection, String>>>>;
 
 enum OperationState {
     Idle,
@@ -40,7 +41,10 @@ enum OperationState {
 struct BridgeState {
     runtime: tokio::runtime::Runtime,
     _core_runtime: CoreRuntime,
-    worker: Arc<Worker>,
+    worker: Option<Arc<Worker>>,
+    worker_config: Option<WorkerConfig>,
+    connection_result: ConnectionSlot,
+    initialization_result: OperationSlot,
     poll_result: OperationSlot,
     completion_result: OperationSlot,
     shutdown_result: OperationSlot,
@@ -142,7 +146,7 @@ pub unsafe extern "C" fn temporal_dealloc(ptr: *mut u8, len: usize) {
     }
 }
 
-/// Initialize one activity-only Temporal Core worker.
+/// Start initializing one activity-only Temporal Core worker.
 #[unsafe(no_mangle)]
 pub extern "C" fn temporal_core_init(
     namespace_ptr: *const u8,
@@ -190,7 +194,7 @@ pub extern "C" fn temporal_core_init(
                     .boxed()
             }),
         };
-        let mut connection_options = ConnectionOptions::new(
+        let connection_options = ConnectionOptions::new(
             temporalio_client::Url::parse("http://temporal-host.invalid:7233")
                 .expect("static URL is valid"),
         )
@@ -199,10 +203,6 @@ pub extern "C" fn temporal_core_init(
         .dns_load_balancing(None)
         .keep_alive(None)
         .build();
-        connection_options.set_skip_get_system_info(true);
-        let connection = runtime
-            .block_on(Connection::connect(connection_options))
-            .map_err(|err| format!("failed to initialize callback gRPC client: {err}"))?;
 
         let worker_config = WorkerConfig::builder()
             .namespace(namespace)
@@ -215,21 +215,95 @@ pub extern "C" fn temporal_core_init(
             .max_outstanding_activities(1_usize)
             .build()
             .map_err(|err| format!("invalid activity worker configuration: {err}"))?;
-        let worker = Arc::new(
-            init_worker(&core_runtime, worker_config, connection)
-                .map_err(|err| format!("failed to initialize activity worker: {err}"))?,
-        );
+
+        let connection_result = Arc::new(Mutex::new(None));
+        let initialization_result = operation_slot();
+        mark_pending(&initialization_result, "worker initialization")?;
+        let connection_result_for_task = connection_result.clone();
+        runtime.spawn(async move {
+            let result = Connection::connect(connection_options)
+                .await
+                .map_err(|err| format!("failed to initialize callback gRPC client: {err}"));
+            *connection_result_for_task
+                .lock()
+                .expect("connection result lock is not poisoned") = Some(result);
+        });
 
         *state = Some(BridgeState {
             runtime,
             _core_runtime: core_runtime,
-            worker,
+            worker: None,
+            worker_config: Some(worker_config),
+            connection_result,
+            initialization_result,
             poll_result: operation_slot(),
             completion_result: operation_slot(),
             shutdown_result: operation_slot(),
         });
         Ok(Vec::new())
     })
+}
+
+/// Take the result of Core connection and worker validation, or return the pending result code.
+#[unsafe(no_mangle)]
+pub extern "C" fn temporal_core_take_init(error_ptr: *mut u8, error_capacity: usize) -> i64 {
+    let preparation = with_state(|state| {
+        if state.worker.is_some() {
+            return Ok(());
+        }
+        let Some(connection) = state
+            .connection_result
+            .lock()
+            .map_err(|_| "connection result lock is poisoned".to_owned())?
+            .take()
+        else {
+            return Ok(());
+        };
+        let connection = match connection {
+            Ok(connection) => connection,
+            Err(error) => {
+                set_ready(&state.initialization_result, Err(error));
+                return Ok(());
+            }
+        };
+        let worker_config = state
+            .worker_config
+            .take()
+            .ok_or_else(|| "worker configuration is missing".to_owned())?;
+        let worker = match init_worker(&state._core_runtime, worker_config, connection) {
+            Ok(worker) => Arc::new(worker),
+            Err(error) => {
+                set_ready(
+                    &state.initialization_result,
+                    Err(format!("failed to initialize activity worker: {error}")),
+                );
+                return Ok(());
+            }
+        };
+        state.worker = Some(worker.clone());
+        let result = state.initialization_result.clone();
+        state.runtime.spawn(async move {
+            let value = worker
+                .validate()
+                .await
+                .map(|_| Vec::new())
+                .map_err(|err| format!("activity worker validation failed: {err}"));
+            set_ready(&result, value);
+        });
+        Ok(())
+    });
+    if let Err(error) = preparation {
+        let result = write_result(error_ptr, error_capacity, || Err(error));
+        reset_bridge_state();
+        return result;
+    }
+    let result = take_operation_result(error_ptr, error_capacity, |state| {
+        &state.initialization_result
+    });
+    if unpack_result_code(result) == BRIDGE_ERROR {
+        reset_bridge_state();
+    }
+    result
 }
 
 /// Start an asynchronous Core activity poll.
@@ -241,7 +315,7 @@ pub extern "C" fn temporal_core_start_poll_activity(
     write_result(error_ptr, error_capacity, || {
         with_state(|state| {
             mark_pending(&state.poll_result, "activity poll")?;
-            let worker = state.worker.clone();
+            let worker = initialized_worker(state)?;
             let result = state.poll_result.clone();
             state.runtime.spawn(async move {
                 let value = worker
@@ -278,7 +352,7 @@ pub extern "C" fn temporal_core_start_complete_activity(
             .map_err(|err| format!("invalid ActivityTaskCompletion protobuf: {err}"))?;
         with_state(|state| {
             mark_pending(&state.completion_result, "activity completion")?;
-            let worker = state.worker.clone();
+            let worker = initialized_worker(state)?;
             let result = state.completion_result.clone();
             state.runtime.spawn(async move {
                 let value = worker
@@ -314,7 +388,7 @@ pub extern "C" fn temporal_core_record_activity_heartbeat(
         let heartbeat = ActivityHeartbeat::decode(read_bytes(heartbeat_ptr, heartbeat_len))
             .map_err(|err| format!("invalid ActivityHeartbeat protobuf: {err}"))?;
         with_state(|state| {
-            state.worker.record_activity_heartbeat(heartbeat);
+            initialized_worker(state)?.record_activity_heartbeat(heartbeat);
             Ok(Vec::new())
         })
     })
@@ -386,7 +460,7 @@ pub extern "C" fn temporal_core_start_shutdown(error_ptr: *mut u8, error_capacit
     write_result(error_ptr, error_capacity, || {
         with_state(|state| {
             mark_pending(&state.shutdown_result, "worker shutdown")?;
-            let worker = state.worker.clone();
+            let worker = initialized_worker(state)?;
             let result = state.shutdown_result.clone();
             state.runtime.spawn(async move {
                 worker.shutdown().await;
@@ -402,10 +476,7 @@ pub extern "C" fn temporal_core_start_shutdown(error_ptr: *mut u8, error_capacit
 pub extern "C" fn temporal_core_take_shutdown(error_ptr: *mut u8, error_capacity: usize) -> i64 {
     let result = take_operation_result(error_ptr, error_capacity, |state| &state.shutdown_result);
     if unpack_result_code(result) == 0 {
-        if let Ok(mut state) = STATE.get_or_init(|| Mutex::new(None)).lock() {
-            state.take();
-        }
-        HOST_TRANSPORT.get_or_init(HostTransport::default).reset();
+        reset_bridge_state();
     }
     result
 }
@@ -465,6 +536,20 @@ fn with_state<T>(
         .as_mut()
         .ok_or_else(|| "Core worker is not initialized".to_owned())?;
     operation(state)
+}
+
+fn initialized_worker(state: &BridgeState) -> Result<Arc<Worker>, String> {
+    state
+        .worker
+        .clone()
+        .ok_or_else(|| "Core worker initialization is not complete".to_owned())
+}
+
+fn reset_bridge_state() {
+    if let Ok(mut state) = STATE.get_or_init(|| Mutex::new(None)).lock() {
+        state.take();
+    }
+    HOST_TRANSPORT.get_or_init(HostTransport::default).reset();
 }
 
 fn unpack_result_code(result: i64) -> i32 {
