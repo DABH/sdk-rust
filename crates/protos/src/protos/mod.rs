@@ -389,26 +389,6 @@ pub mod coresdk {
                 }
             }
 
-            pub fn application_failure_from_error(ae: anyhow::Error, non_retryable: bool) -> Self {
-                Self {
-                    failure_info: Some(FailureInfo::ApplicationFailureInfo(
-                        ApplicationFailureInfo {
-                            non_retryable,
-                            ..Default::default()
-                        },
-                    )),
-                    ..ae.chain()
-                        .rfold(None, |cause, e| {
-                            Some(Self {
-                                message: e.to_string(),
-                                cause: cause.map(Box::new),
-                                ..Default::default()
-                            })
-                        })
-                        .unwrap_or_default()
-                }
-            }
-
             pub fn timeout(timeout_type: TimeoutType) -> Self {
                 Self {
                     message: "Activity timed out".to_string(),
@@ -511,12 +491,6 @@ pub mod coresdk {
             }
         }
 
-        impl From<anyhow::Error> for Failure {
-            fn from(ae: anyhow::Error) -> Self {
-                Failure::application_failure_from_error(ae, false)
-            }
-        }
-
         pub trait FromPayloadsExt {
             fn from_payloads(p: Option<Payloads>) -> Self;
         }
@@ -575,7 +549,7 @@ pub mod coresdk {
             #[error("This deserializer does not understand this payload")]
             DeserializerDoesNotHandle,
             #[error("Error during deserialization: {0}")]
-            DeserializeErr(#[from] anyhow::Error),
+            DeserializeErr(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
         }
 
         // TODO: Once the prototype SDK is un-prototyped this serialization will need to be compat with
@@ -613,9 +587,10 @@ pub mod coresdk {
                 if !payload.is_json_payload() {
                     return Err(PayloadDeserializeErr::DeserializerDoesNotHandle);
                 }
-                let payload_str =
-                    std::str::from_utf8(&payload.data).map_err(anyhow::Error::from)?;
-                Ok(serde_json::from_str(payload_str).map_err(anyhow::Error::from)?)
+                let payload_str = std::str::from_utf8(&payload.data)
+                    .map_err(|error| PayloadDeserializeErr::DeserializeErr(error.into()))?;
+                serde_json::from_str(payload_str)
+                    .map_err(|error| PayloadDeserializeErr::DeserializeErr(error.into()))
             }
         }
 
@@ -3044,12 +3019,8 @@ mod sdk_helpers {
     mod tests {
         use crate::protos::{
             coresdk::{activity_task, activity_task::ActivityTask},
-            temporal::api::{
-                failure::v1::Failure, workflowservice::v1::PollActivityTaskQueueResponse,
-            },
+            temporal::api::workflowservice::v1::PollActivityTaskQueueResponse,
         };
-        use anyhow::anyhow;
-
         #[test]
         fn start_from_poll_resp_standalone_activity_populates_run_id() {
             let resp = PollActivityTaskQueueResponse {
@@ -3088,20 +3059,6 @@ mod sdk_helpers {
             assert!(start.run_id.is_empty());
             // workflow_execution is preserved and distinct from run_id
             assert_eq!(start.workflow_execution.unwrap().run_id, "wf-run-456");
-        }
-
-        #[test]
-        fn anyhow_to_failure_conversion() {
-            let no_causes: Failure = anyhow!("no causes").into();
-            assert_eq!(no_causes.cause, None);
-            assert_eq!(no_causes.message, "no causes");
-            let orig = anyhow!("fail 1");
-            let mid = orig.context("fail 2");
-            let top = mid.context("fail 3");
-            let as_fail: Failure = top.into();
-            assert_eq!(as_fail.message, "fail 3");
-            assert_eq!(as_fail.cause.as_ref().unwrap().message, "fail 2");
-            assert_eq!(as_fail.cause.unwrap().cause.unwrap().message, "fail 1");
         }
     }
 }

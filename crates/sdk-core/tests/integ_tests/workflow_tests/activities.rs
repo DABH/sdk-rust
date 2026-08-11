@@ -982,7 +982,7 @@ async fn activity_non_retryable_failure_with_error() {
     let task = core.poll_activity_task().await.unwrap();
     assert_matches!(task.variant, Some(act_task::Variant::Start(_)));
     // Fail activity with non-retryable error
-    let failure = Failure::application_failure_from_error(anyhow!("activity failed"), true);
+    let failure = Failure::application_failure("activity failed".to_owned(), true);
     core.complete_activity_task(ActivityTaskCompletion {
         task_token: task.task_token,
         result: Some(ActivityExecutionResult::fail(failure.clone())),

@@ -217,7 +217,17 @@ impl WorkflowFuture {
     }
 
     fn fail_wft(&self, run_id: String, fail: Error, cause: Option<WorkflowTaskFailedCause>) {
-        self.fail_wft_with_failure(run_id, fail.into(), cause);
+        let failure = fail
+            .chain()
+            .rfold(None, |cause, error| {
+                Some(Failure {
+                    message: error.to_string(),
+                    cause: cause.map(Box::new),
+                    ..Default::default()
+                })
+            })
+            .unwrap_or_default();
+        self.fail_wft_with_failure(run_id, failure, cause);
     }
 
     fn fail_wft_with_failure(
