@@ -394,12 +394,6 @@ impl std::error::Error for ApplicationFailure {
     }
 }
 
-impl From<anyhow::Error> for ApplicationFailure {
-    fn from(value: anyhow::Error) -> Self {
-        Self::new(value)
-    }
-}
-
 impl From<PayloadConversionError> for ApplicationFailure {
     fn from(value: PayloadConversionError) -> Self {
         Self::new(value)
