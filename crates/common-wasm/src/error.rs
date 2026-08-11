@@ -459,12 +459,6 @@ impl OutgoingWorkflowError {
     }
 }
 
-impl From<anyhow::Error> for OutgoingWorkflowError {
-    fn from(value: anyhow::Error) -> Self {
-        Self::Application(Box::new(ApplicationFailure::new(value)))
-    }
-}
-
 impl From<PayloadConversionError> for OutgoingWorkflowError {
     fn from(value: PayloadConversionError) -> Self {
         Self::Application(Box::new(value.into()))
@@ -1397,16 +1391,6 @@ mod tests {
             failure.failure_info,
             Some(FailureInfo::ApplicationFailureInfo(_))
         ));
-    }
-
-    #[test]
-    fn anyhow_workflow_errors_default_to_application_outgoing_errors() {
-        let outgoing: OutgoingWorkflowError = anyhow::anyhow!("workflow boom").into();
-
-        let OutgoingWorkflowError::Application(app) = outgoing else {
-            panic!("plain workflow errors should default to application failures");
-        };
-        assert_eq!(app.to_string(), "workflow boom");
     }
 
     #[test]
