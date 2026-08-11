@@ -82,11 +82,12 @@ impl ActivityError {
 
 impl<E> From<E> for ActivityError
 where
-    E: Into<anyhow::Error>,
+    E: std::error::Error + Send + Sync + 'static,
 {
     fn from(source: E) -> Self {
-        match source.into().downcast::<ApplicationFailure>() {
-            Ok(application_failure) => Self::Application(Box::new(application_failure)),
+        let source: Box<dyn std::error::Error + Send + Sync> = Box::new(source);
+        match source.downcast::<ApplicationFailure>() {
+            Ok(application_failure) => Self::Application(application_failure),
             Err(err) => Self::Application(ApplicationFailure::new(err).into()),
         }
     }

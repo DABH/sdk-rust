@@ -42,7 +42,7 @@ impl StdActivities {
     /// Always fails
     #[activity]
     pub(crate) async fn always_fail(_ctx: ActivityContext) -> Result<(), ActivityError> {
-        Err(anyhow::anyhow!("Oh no I failed!").into())
+        Err(std::io::Error::other("Oh no I failed!").into())
     }
 
     #[activity]

@@ -2,7 +2,6 @@ use crate::common::{
     CoreWfStarter, WorkflowHandleExt, activity_functions::StdActivities, init_core_and_create_wf,
     init_core_replay_preloaded,
 };
-use anyhow::anyhow;
 use assert_matches::assert_matches;
 use futures_util::{future, future::join_all};
 use std::{
@@ -1233,7 +1232,7 @@ async fn worker_restarted_in_middle_of_update() {
             BARR.wait().await;
             if !ACT_RAN.fetch_or(true, Ordering::Relaxed) {
                 // On first run fail the task so we'll get retried on the new worker
-                return Err(anyhow!("Fail first time").into());
+                return Err(std::io::Error::other("Fail first time").into());
             }
             Ok(echo_me)
         }

@@ -498,7 +498,7 @@ async fn cancel_after_act_starts(
                     return Err(ActivityError::cancelled());
                 }
                 // Just fail constantly so we get stuck on the backoff timer
-                return Err(anyhow!("Oh no I failed!").into());
+                return Err(std::io::Error::other("Oh no I failed!").into());
             } else {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(100)) => {}
@@ -512,7 +512,7 @@ async fn cancel_after_act_starts(
                     }
                 }
             }
-            Err(anyhow!("Oh no I failed!").into())
+            Err(std::io::Error::other("Oh no I failed!").into())
         }
     }
 
@@ -769,7 +769,7 @@ async fn schedule_to_close_timeout_across_timer_backoff(#[case] cached: bool) {
         #[activity]
         async fn go(self: Arc<Self>, _: ActivityContext, _: String) -> Result<(), ActivityError> {
             self.counter.fetch_add(1, Ordering::Relaxed);
-            Err(anyhow!("Oh no I failed!").into())
+            Err(std::io::Error::other("Oh no I failed!").into())
         }
     }
 
@@ -1554,7 +1554,7 @@ async fn local_act_fail_and_retry(#[case] eventually_pass: bool) {
             if 2 == self.attempts.fetch_add(1, Ordering::Relaxed) && self.eventually_pass {
                 Ok(())
             } else {
-                Err(anyhow!("Oh no I failed!").into())
+                Err(std::io::Error::other("Oh no I failed!").into())
             }
         }
     }
@@ -2741,7 +2741,7 @@ async fn local_act_retry_explicit_delay() {
             } else if 2 == last_attempt {
                 Ok(())
             } else {
-                Err(anyhow!("Oh no I failed!").into())
+                Err(std::io::Error::other("Oh no I failed!").into())
             }
         }
     }
@@ -2870,7 +2870,7 @@ async fn one_la_success(#[case] replay: bool, #[case] completes_ok: bool) {
             if self.completes_ok {
                 Ok("hi".to_string())
             } else {
-                Err(anyhow!("Oh no I failed!").into())
+                Err(std::io::Error::other("Oh no I failed!").into())
             }
         }
     }

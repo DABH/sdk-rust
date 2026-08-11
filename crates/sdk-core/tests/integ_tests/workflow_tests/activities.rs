@@ -500,7 +500,7 @@ async fn activity_interceptor_observes_activity_error() {
     impl FailingActivities {
         #[activity]
         async fn fail(_ctx: ActivityContext, input: String) -> Result<String, ActivityError> {
-            Err(anyhow!("failed input: {input}").into())
+            Err(std::io::Error::other(format!("failed input: {input}")).into())
         }
     }
 

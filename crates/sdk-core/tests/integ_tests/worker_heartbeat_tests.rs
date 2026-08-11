@@ -1,7 +1,6 @@
 use crate::common::{
     ANY_PORT, CoreWfStarter, activity_functions::StdActivities, eventually, get_integ_telem_options,
 };
-use anyhow::anyhow;
 use crossbeam_utils::atomic::AtomicCell;
 use prost_types::{Duration as PbDuration, Timestamp};
 use std::{
@@ -980,7 +979,7 @@ async fn worker_heartbeat_failure_metrics() {
             }
             ACT_COUNT.fetch_add(1, Ordering::Relaxed);
             ACT_FAIL.notify_one();
-            Err(anyhow!("Expected error").into())
+            Err(std::io::Error::other("Expected error").into())
         }
     }
 

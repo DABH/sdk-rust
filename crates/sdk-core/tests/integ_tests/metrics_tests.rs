@@ -1012,7 +1012,7 @@ async fn activity_metrics() {
                     ctx.cancelled().await;
                     Err(ActivityError::cancelled())
                 }
-                _ => Err(anyhow!("fail").into()),
+                _ => Err(std::io::Error::other("fail").into()),
             }
         }
     }
