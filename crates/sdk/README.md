@@ -176,18 +176,20 @@ temporalio-sdk = { version = "0.3", default-features = false, features = ["envco
 - `envconfig` - enabled by default. Adds `ClientOptions::load_from_config` and related helpers for
   loading connection settings from environment variables and `temporal.toml` files.
 - `aws-lambda` - optional. Adds the AWS Lambda Worker lifecycle helper and enables `envconfig`.
+- `aws-lambda-otel` - optional. Adds the AWS Lambda OpenTelemetry plugin and enables `otel` without
+  enabling the Lambda runtime dependency. This can be used independently of `aws-lambda`.
 - `prometheus` - enabled by default. Adds the Prometheus metrics exporter in
   `temporalio_common::telemetry` for serving SDK metrics from a HTTP endpoint.
-- `otel` - optional. Adds OpenTelemetry metric and trace exporters, including the AWS Lambda
-  defaults in `temporalio_sdk::aws_lambda::otel`.
+- `otel` - optional. Adds generic OpenTelemetry metric and trace exporters.
 
 ### AWS Lambda OpenTelemetry
 
-With the `otel` feature enabled, `OpenTelemetryPlugin` configures metrics and Rust `tracing` spans
-for the local OTLP endpoint exposed by the AWS Distro for OpenTelemetry (ADOT) Lambda layer. The
-plugin uses `OTEL_SERVICE_NAME`, `AWS_LAMBDA_FUNCTION_NAME`, and `OTEL_EXPORTER_OTLP_ENDPOINT` when
-present, and flushes pending data after each worker shutdown without shutting down providers needed
-by warm invocations.
+With the `aws-lambda-otel` feature enabled, `OpenTelemetryPlugin` configures metrics and Rust
+`tracing` spans for the local OTLP endpoint exposed by the AWS Distro for OpenTelemetry (ADOT)
+Lambda layer. The feature is independent of `aws-lambda`; add both features when using the plugin
+with the Lambda Worker helper. The plugin uses `OTEL_SERVICE_NAME`, `AWS_LAMBDA_FUNCTION_NAME`, and
+`OTEL_EXPORTER_OTLP_ENDPOINT` when present, and flushes pending data after each worker shutdown
+without shutting down providers needed by warm invocations.
 
 ```rust
 use temporalio_client::ClientOptions;

@@ -17,6 +17,7 @@ use opentelemetry::{
     metrics::{Meter, MeterProvider as MeterProviderT},
     trace::TracerProvider as _,
 };
+#[cfg(feature = "otel-aws")]
 use opentelemetry_aws::trace::id_generator::XrayIdGenerator;
 #[cfg(any(feature = "tls-ring", feature = "tls-aws-lc"))]
 use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
@@ -199,7 +200,12 @@ pub fn build_otlp_trace_exporter(opts: OtelTraceOptions) -> Result<CoreOtelTrace
         .with_batch_exporter(exporter)
         .with_resource(default_resource(&opts.global_tags));
     if opts.use_aws_xray_id_generator {
-        provider = provider.with_id_generator(XrayIdGenerator::default());
+        #[cfg(feature = "otel-aws")]
+        {
+            provider = provider.with_id_generator(XrayIdGenerator::default());
+        }
+        #[cfg(not(feature = "otel-aws"))]
+        anyhow::bail!("AWS X-Ray trace IDs require the otel-aws feature");
     }
     let provider = provider.build();
     let subscriber = tracing_subscriber::registry()

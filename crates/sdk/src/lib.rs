@@ -66,7 +66,7 @@ extern crate self as temporalio_sdk;
 
 pub mod activities;
 /// Helpers for running Temporal workers in AWS Lambda.
-#[cfg(feature = "aws-lambda")]
+#[cfg(any(feature = "aws-lambda", feature = "aws-lambda-otel"))]
 pub mod aws_lambda;
 pub mod error;
 pub mod interceptors;

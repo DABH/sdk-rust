@@ -73,6 +73,7 @@ rstest = "0.26"
 [features]
 default = ["envconfig", "prometheus"]
 aws-lambda = ["envconfig", "dep:lambda_runtime", "dep:serde_json"]
+aws-lambda-otel = ["otel", "temporalio-common/otel-aws"]
 envconfig = ["temporalio-sdk-core/envconfig"]
 prometheus = ["temporalio-sdk-core/prometheus"]
 otel = ["temporalio-sdk-core/otel"]

@@ -172,7 +172,7 @@ pub struct OtelTraceOptions {
     /// Protocol to use for communication with the collector.
     #[builder(default = OtlpProtocol::Grpc)]
     pub protocol: OtlpProtocol,
-    /// Use AWS X-Ray-compatible trace IDs.
+    /// Use AWS X-Ray-compatible trace IDs. Requires the `otel-aws` feature.
     #[builder(default)]
     pub use_aws_xray_id_generator: bool,
 }

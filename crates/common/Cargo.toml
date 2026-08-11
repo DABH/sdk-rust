@@ -17,10 +17,10 @@ otel = [
   "dep:opentelemetry",
   "dep:opentelemetry_sdk",
   "dep:opentelemetry-otlp",
-  "dep:opentelemetry-aws",
   "dep:reqwest",
   "dep:tracing-opentelemetry",
 ]
+otel-aws = ["otel", "dep:opentelemetry-aws"]
 tls-ring = [
   "opentelemetry-otlp?/tls-ring",
   "opentelemetry-otlp?/reqwest-rustls",
