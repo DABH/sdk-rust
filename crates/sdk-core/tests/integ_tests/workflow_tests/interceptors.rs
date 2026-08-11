@@ -622,6 +622,10 @@ impl ConstructionWakeWorkflow {
     async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         Ok(())
     }
+
+    /// Produces an activation, the only thing that re-polls a routine parked in its interceptor.
+    #[signal]
+    fn nudge(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {}
 }
 
 #[workflow]
@@ -647,6 +651,10 @@ impl ConstructionWakeHandlerWorkflow {
     async fn async_update(ctx: &mut WorkflowContext<Self>) {
         ctx.state_mut(|state| state.handled = true);
     }
+
+    /// Produces an activation, the only thing that re-polls a routine parked in its interceptor.
+    #[signal]
+    fn nudge(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {}
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -731,22 +739,67 @@ impl WorkflowInterceptor for ConstructionWakeInterceptor {
     }
 }
 
-fn nondeterministic_future_failure_count(history: &History) -> usize {
+/// The failure messages of every workflow task failure caused by nondeterministic future detection.
+fn nondeterministic_future_failures(history: &History) -> Vec<&str> {
     history
         .events
         .iter()
-        .filter(|event| {
-            event.event_type() == EventType::WorkflowTaskFailed
-                && matches!(
-                    event.attributes.as_ref(),
-                    Some(WorkflowTaskFailedEventAttributes(attributes))
-                        if attributes.cause
-                            == WorkflowTaskFailedCause::NonDeterministicError as i32
-                            && attributes.failure.as_ref().is_some_and(|failure|
-                                failure.message.contains("Nondeterministic future detected"))
-                )
+        .filter(|event| event.event_type() == EventType::WorkflowTaskFailed)
+        .filter_map(|event| match event.attributes.as_ref() {
+            Some(WorkflowTaskFailedEventAttributes(attributes))
+                if attributes.cause == WorkflowTaskFailedCause::NonDeterministicError as i32 =>
+            {
+                attributes
+                    .failure
+                    .as_ref()
+                    .map(|failure| failure.message.as_str())
+            }
+            _ => None,
         })
-        .count()
+        .filter(|message| message.contains("Nondeterministic future detected"))
+        .collect()
+}
+
+fn nondeterministic_future_failure_count(history: &History) -> usize {
+    nondeterministic_future_failures(history).len()
+}
+
+// Long enough for a slow server, short enough that a regression fails the test rather than hanging.
+const HISTORY_POLL_ATTEMPTS: usize = 100;
+const HISTORY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Polls the default workflow's history until `reached` holds, returning the history that satisfied
+/// it.
+async fn history_until(starter: &CoreWfStarter, reached: impl Fn(&History) -> bool) -> History {
+    for _ in 0..HISTORY_POLL_ATTEMPTS {
+        let history = starter.get_history().await;
+        if reached(&history) {
+            return history;
+        }
+        tokio::time::sleep(HISTORY_POLL_INTERVAL).await;
+    }
+    panic!("Workflow history never reached the expected state");
+}
+
+fn has_event(history: &History, event_type: EventType) -> bool {
+    history
+        .events
+        .iter()
+        .any(|event| event.event_type() == event_type)
+}
+
+/// Whether a workflow task was completed after the last `after` event, i.e. the worker has
+/// processed the job that event delivered.
+fn task_completed_after(history: &History, after: EventType) -> bool {
+    history
+        .events
+        .iter()
+        .rposition(|event| event.event_type() == after)
+        .is_some_and(|anchor| {
+            history.events[anchor..]
+                .iter()
+                .any(|event| event.event_type() == EventType::WorkflowTaskCompleted)
+        })
 }
 
 struct SdkTimerBeforeNextInterceptor;
@@ -850,11 +903,31 @@ async fn nondeterministic_future_detection_is_respected_for_interceptors(
         .await
         .unwrap();
 
-    let (result, worker_result) = join!(
-        handle.get_result(Default::default()),
-        worker.run_until_done()
-    );
-    result.unwrap();
+    let driver = async {
+        if detect_nondeterministic_futures {
+            handle.get_result(Default::default()).await.unwrap();
+        } else {
+            let history = history_until(&starter, |h| {
+                task_completed_after(h, EventType::WorkflowExecutionStarted)
+            })
+            .await;
+            assert!(
+                !has_event(&history, EventType::WorkflowExecutionCompleted),
+                "workflow completed while its interceptor was parked on a non-SDK future"
+            );
+            handle
+                .signal(
+                    ConstructionWakeWorkflow::nudge,
+                    (),
+                    WorkflowSignalOptions::default(),
+                )
+                .await
+                .unwrap();
+            handle.get_result(Default::default()).await.unwrap();
+        }
+    };
+
+    let (_, worker_result) = join!(driver, worker.run_until_done());
     worker_result.unwrap();
 
     let history = starter.get_history().await;
@@ -915,15 +988,42 @@ async fn nondeterministic_future_detection_is_respected_for_async_signal_interce
             )
             .await
             .unwrap();
-        handle.get_result(Default::default()).await.unwrap();
+        if detect_nondeterministic_futures {
+            handle.get_result(Default::default()).await.unwrap();
+        } else {
+            // Anchor on the signal: an unanchored WorkflowTaskCompleted check would match the
+            // start task.
+            let history = history_until(&starter, |h| {
+                task_completed_after(h, EventType::WorkflowExecutionSignaled)
+            })
+            .await;
+            assert!(
+                !has_event(&history, EventType::WorkflowExecutionCompleted),
+                "signal was handled while its interceptor was parked on a non-SDK future"
+            );
+            handle
+                .signal(
+                    ConstructionWakeHandlerWorkflow::nudge,
+                    (),
+                    WorkflowSignalOptions::default(),
+                )
+                .await
+                .unwrap();
+            handle.get_result(Default::default()).await.unwrap();
+        }
     };
     let (_, worker_result) = join!(driver, worker.run_until_done());
     worker_result.unwrap();
     let history = starter.get_history().await;
-    assert_eq!(
-        nondeterministic_future_failure_count(&history),
-        usize::from(detect_nondeterministic_futures)
-    );
+    let failures = nondeterministic_future_failures(&history);
+    assert_eq!(failures.len(), usize::from(detect_nondeterministic_futures));
+    if detect_nondeterministic_futures {
+        assert!(
+            failures[0].contains("the `async_signal` signal handler"),
+            "the failure must name the signal handler whose interceptor stalled: {}",
+            failures[0]
+        );
+    }
 }
 
 #[rstest::rstest]
@@ -969,24 +1069,53 @@ async fn nondeterministic_future_detection_is_respected_for_async_update_interce
         .unwrap();
 
     let driver = async {
-        handle
-            .execute_update(
-                ConstructionWakeHandlerWorkflow::async_update,
-                (),
-                WorkflowExecuteUpdateOptions::default(),
-            )
-            .await
-            .unwrap();
+        let update = handle.execute_update(
+            ConstructionWakeHandlerWorkflow::async_update,
+            (),
+            WorkflowExecuteUpdateOptions::default(),
+        );
+        if detect_nondeterministic_futures {
+            update.await.unwrap();
+        } else {
+            // The update future stays polled throughout so that its request is actually issued.
+            tokio::pin!(update);
+            let history = tokio::select! {
+                history = history_until(&starter, |h| {
+                    has_event(h, EventType::WorkflowExecutionUpdateAccepted)
+                }) => history,
+                res = &mut update => {
+                    panic!("update resolved early: {res:?}")
+                }
+            };
+            assert!(
+                !has_event(&history, EventType::WorkflowExecutionCompleted),
+                "workflow completed while its update interceptor was parked on a non-SDK future"
+            );
+            handle
+                .signal(
+                    ConstructionWakeHandlerWorkflow::nudge,
+                    (),
+                    WorkflowSignalOptions::default(),
+                )
+                .await
+                .unwrap();
+            update.await.unwrap();
+        }
         handle.get_result(Default::default()).await.unwrap();
     };
     let (_, worker_result) = join!(driver, worker.run_until_done());
     worker_result.unwrap();
 
     let history = starter.get_history().await;
-    assert_eq!(
-        nondeterministic_future_failure_count(&history),
-        usize::from(detect_nondeterministic_futures)
-    );
+    let failures = nondeterministic_future_failures(&history);
+    assert_eq!(failures.len(), usize::from(detect_nondeterministic_futures));
+    if detect_nondeterministic_futures {
+        assert!(
+            failures[0].contains("the `async_update` update handler"),
+            "the failure must name the update handler whose interceptor stalled: {}",
+            failures[0]
+        );
+    }
 }
 
 impl WorkflowInterceptor for ConstructionPollingInterceptor {

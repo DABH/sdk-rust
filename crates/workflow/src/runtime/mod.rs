@@ -3,7 +3,6 @@
 //! These modules collect the parts of the workflow crate that are intended for SDK/runtime glue
 //! rather than normal workflow authors.
 
-use crate::runtime::types::RoutinePendingState;
 use std::{
     cell::{Cell, RefCell},
     future::Future,
@@ -31,6 +30,25 @@ thread_local! {
 pub(crate) enum InterceptedFuturePollKind {
     Construction,
     Routine,
+}
+
+/// Describes why the outer inbound interceptor future remained pending after its latest poll.
+///
+/// A plain [`std::task::Poll::Pending`] cannot tell the runtime whether completing the current
+/// activation will provide another opportunity to poll the chain, so the runtime records that
+/// distinction here. It stays internal to the guest: the only thing the host needs is
+/// [`crate::runtime::types::RoutinePollResult::stalled_in_interceptor`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RoutinePendingState {
+    /// The underlying handler future was polled, after which normal workflow blocking semantics
+    /// determine when another activation is needed.
+    Handler,
+    /// No handler boundary or command-backed SDK future was polled, so Core cannot produce the
+    /// activation needed to make progress.
+    Interceptor,
+    /// A command-backed SDK future was polled, so its resolution will produce another activation
+    /// that re-polls the chain.
+    InterceptorWithActivation,
 }
 
 /// Tracks whether polling is still in the interceptor chain or has crossed the handler

@@ -4,14 +4,15 @@ use crate::{
     BaseWorkflowContext, WorkflowContext, WorkflowContextView,
     runtime::{
         InterceptedFuturePollGuard, InterceptedFuturePollKind, InterceptedFutureStatus,
+        RoutinePendingState,
         entry::{WorkflowError, WorkflowImplementation},
         guest::WorkflowInstance,
         model::{TimerResult, UnblockEvent, WorkflowTermination},
         types::{
             ActivationJobResult, ActivationResult, MAIN_ROUTINE_ID, MainRoutineCompletion,
-            QueryResponse, RoutineCompletion, RoutineId, RoutineKind, RoutinePendingState,
-            RoutinePollResult, StartedRoutine, UpdateRoutineCompletion, UpdateRoutineKind,
-            WorkflowActivation, WorkflowFailure,
+            QueryResponse, RoutineCompletion, RoutineId, RoutineKind, RoutinePollResult,
+            StartedRoutine, UpdateRoutineCompletion, UpdateRoutineKind, WorkflowActivation,
+            WorkflowFailure,
         },
     },
     workflow_interceptors::{
@@ -169,6 +170,10 @@ enum RoutinePollState<T> {
 
 fn expect_resolution<T>(value: Option<T>) -> T {
     value.expect("resolution expected payload")
+}
+
+fn stalled_in_interceptor(pending_state: RoutinePendingState) -> bool {
+    matches!(pending_state, RoutinePendingState::Interceptor)
 }
 
 // Macro for defining a function that drives forward an interceptor chain
@@ -859,7 +864,7 @@ where
                         Box::new(self.terminal_outcome_from_result(result)),
                     ))),
                     made_progress,
-                    pending_state: None,
+                    stalled_in_interceptor: false,
                 },
                 RoutinePollState::ForcedFailure {
                     failure,
@@ -872,7 +877,7 @@ where
                         },
                     ))),
                     made_progress,
-                    pending_state: None,
+                    stalled_in_interceptor: false,
                 },
                 RoutinePollState::Stalled {
                     made_progress,
@@ -880,7 +885,7 @@ where
                 } => RoutinePollResult {
                     completion: Some(RoutineCompletion::Main(MainRoutineCompletion::Blocked)),
                     made_progress,
-                    pending_state: Some(pending_state),
+                    stalled_in_interceptor: stalled_in_interceptor(pending_state),
                 },
             },
         )
@@ -901,7 +906,7 @@ where
                 Ok(RoutinePollResult {
                     completion: Some(RoutineCompletion::Signal(result)),
                     made_progress,
-                    pending_state: None,
+                    stalled_in_interceptor: false,
                 })
             }
             RoutinePollState::ForcedFailure { failure, .. } => Err(failure),
@@ -914,7 +919,7 @@ where
                 Ok(RoutinePollResult {
                     completion: None,
                     made_progress,
-                    pending_state: Some(pending_state),
+                    stalled_in_interceptor: stalled_in_interceptor(pending_state),
                 })
             }
         }
@@ -956,7 +961,7 @@ where
                 Ok(RoutinePollResult {
                     completion: Some(RoutineCompletion::Update(completion)),
                     made_progress,
-                    pending_state: None,
+                    stalled_in_interceptor: false,
                 })
             }
             RoutinePollState::ForcedFailure { failure, .. } => Err(failure),
@@ -974,7 +979,7 @@ where
                 Ok(RoutinePollResult {
                     completion: None,
                     made_progress,
-                    pending_state: Some(pending_state),
+                    stalled_in_interceptor: stalled_in_interceptor(pending_state),
                 })
             }
         }
@@ -1227,6 +1232,7 @@ mod tests {
 
         assert!(future.poll_unpin(&mut cx).is_pending());
         assert_eq!(future.pending_state(), RoutinePendingState::Interceptor);
+        assert!(stalled_in_interceptor(future.pending_state()));
     }
 
     #[test]
@@ -1244,6 +1250,7 @@ mod tests {
             future.pending_state(),
             RoutinePendingState::InterceptorWithActivation
         );
+        assert!(!stalled_in_interceptor(future.pending_state()));
     }
 
     #[test]
@@ -1255,6 +1262,7 @@ mod tests {
 
         assert!(future.poll_unpin(&mut cx).is_pending());
         assert_eq!(future.pending_state(), RoutinePendingState::Handler);
+        assert!(!stalled_in_interceptor(future.pending_state()));
     }
 
     #[test]

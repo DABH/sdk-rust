@@ -112,15 +112,14 @@ variant routine-completion {
   update(update-routine-completion),
 }
 
-variant routine-pending-state {
-  handler,
-  interceptor,
-  interceptor-with-activation,
-}
-
 record routine-poll-result {
   completion: option<routine-completion>,
   made-progress: bool,
-  pending-state: option<routine-pending-state>,
+  // The routine returned pending while still inside its inbound interceptor chain, and that chain
+  // polled neither the workflow's handler nor an SDK operation whose resolution would produce
+  // another activation, so no activation will arise on this routine's account. The routine is not
+  // abandoned: it is polled again on the next activation that polls routines. Hosts that detect
+  // nondeterministic futures should fail the workflow task.
+  stalled-in-interceptor: bool,
 }
 }

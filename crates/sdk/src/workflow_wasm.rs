@@ -12,8 +12,8 @@ use temporalio_workflow::{
         host::WorkflowHost,
         types::{
             ActivationJobResult, ActivationResult, MainRoutineCompletion, QueryResponse,
-            RoutineCompletion, RoutinePendingState, RoutinePollResult, StartedRoutine, TaskFailure,
-            TerminalOutcome, UpdateRoutineCompletion, UpdateRoutineKind, WorkflowActivation,
+            RoutineCompletion, RoutinePollResult, StartedRoutine, TaskFailure, TerminalOutcome,
+            UpdateRoutineCompletion, UpdateRoutineKind, WorkflowActivation,
             WorkflowDefinitionDescriptor, WorkflowFailure,
         },
     },
@@ -375,13 +375,7 @@ impl WorkflowInstance for WasmWorkflowInstance {
                 }
             }),
             made_progress: result.made_progress,
-            pending_state: result.pending_state.map(|state| match state {
-                wit_types::RoutinePendingState::Handler => RoutinePendingState::Handler,
-                wit_types::RoutinePendingState::Interceptor => RoutinePendingState::Interceptor,
-                wit_types::RoutinePendingState::InterceptorWithActivation => {
-                    RoutinePendingState::InterceptorWithActivation
-                }
-            }),
+            stalled_in_interceptor: result.stalled_in_interceptor,
         })
     }
 }

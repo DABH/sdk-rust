@@ -40,8 +40,8 @@ use temporalio_workflow::{
         model::{WorkflowResult, WorkflowTermination},
         types::{
             ActivationJobResult, ActivationResult, MainRoutineCompletion, RoutineCompletion,
-            RoutineId, RoutineKind, RoutinePendingState, RoutinePollResult, TerminalOutcome,
-            UpdateRoutineCompletion, WorkflowActivation,
+            RoutineId, RoutineKind, RoutinePollResult, TerminalOutcome, UpdateRoutineCompletion,
+            WorkflowActivation,
         },
     },
 };
@@ -111,7 +111,6 @@ pub(crate) fn start_workflow(
             incoming_activations,
             wake_tracking,
             active_routines: Vec::new(),
-            in_flight_activation: None,
         },
         tx,
     ))
@@ -159,19 +158,16 @@ pub(crate) struct WorkflowFuture {
     /// for polling user workflow code, and any non-SDK wake is flagged.
     wake_tracking: Option<WakeTracker>,
     /// Signal and update routines that are still live across activations.
-    active_routines: Vec<RoutineId>,
-    /// Activation retained while an interceptor is waiting for a wake that Core cannot provide.
-    in_flight_activation: Option<InFlightActivation>,
+    active_routines: Vec<ActiveRoutine>,
 }
 
-struct InFlightActivation {
-    run_id: String,
-    commands: Vec<WorkflowCommand>,
+struct ActiveRoutine {
+    id: RoutineId,
+    kind: RoutineKind,
 }
 
 enum RoutineDriveOutcome {
     Complete,
-    AwaitWake,
     Failed,
 }
 
@@ -371,7 +367,10 @@ impl WorkflowFuture {
                     ActivationJobContext::Signal,
                     ActivationJobResult::StartedRoutine(started_routine),
                 ) => match started_routine.kind {
-                    RoutineKind::Signal(_) => self.active_routines.push(started_routine.routine_id),
+                    kind @ RoutineKind::Signal(_) => self.active_routines.push(ActiveRoutine {
+                        id: started_routine.routine_id,
+                        kind,
+                    }),
                     other => bail!("Signal job started unexpected routine kind {other:?}"),
                 },
                 (
@@ -381,11 +380,10 @@ impl WorkflowFuture {
                     ActivationJobResult::StartedRoutine(started_routine),
                 ) => match started_routine.kind {
                     RoutineKind::Update(update_kind) => {
-                        let started_id = update_kind.protocol_instance_id;
-                        if started_id != protocol_instance_id {
+                        if update_kind.protocol_instance_id != protocol_instance_id {
                             bail!(
                                 "Update routine protocol instance id {} did not match {}",
-                                started_id,
+                                update_kind.protocol_instance_id,
                                 protocol_instance_id
                             );
                         }
@@ -396,7 +394,10 @@ impl WorkflowFuture {
                             )
                             .into(),
                         );
-                        self.active_routines.push(started_routine.routine_id);
+                        self.active_routines.push(ActiveRoutine {
+                            id: started_routine.routine_id,
+                            kind: RoutineKind::Update(update_kind),
+                        });
                     }
                     other => bail!("Update job started unexpected routine kind {other:?}"),
                 },
@@ -463,13 +464,14 @@ impl WorkflowFuture {
         run_id: &str,
         activation_cmds: &mut Vec<WorkflowCommand>,
     ) -> RoutineDriveOutcome {
+        let detecting_nondeterminism = self.wake_tracking.is_some();
         loop {
             let mut pass_made_progress = false;
-            let mut interceptor_pending = false;
             let mut should_stop_polling = false;
+            let mut stalled_routines = Vec::new();
             let mut still_active = Vec::with_capacity(self.active_routines.len());
-            for routine_id in std::mem::take(&mut self.active_routines) {
-                let poll_result = match self.poll_guest_routine(routine_id, cx) {
+            for routine in std::mem::take(&mut self.active_routines) {
+                let poll_result = match self.poll_guest_routine(routine.id, cx) {
                     Ok(result) => result,
                     Err(e) => {
                         self.fail_wft(run_id.to_owned(), e, None);
@@ -480,12 +482,11 @@ impl WorkflowFuture {
                     return RoutineDriveOutcome::Failed;
                 }
                 pass_made_progress |= poll_result.made_progress;
-                interceptor_pending |= matches!(
-                    poll_result.pending_state,
-                    Some(RoutinePendingState::Interceptor)
-                );
+                if poll_result.stalled_in_interceptor {
+                    stalled_routines.push(routine.kind.clone());
+                }
                 match poll_result.completion {
-                    None => still_active.push(routine_id),
+                    None => still_active.push(routine),
                     Some(result) => match result {
                         RoutineCompletion::Signal(Ok(())) => {}
                         RoutineCompletion::Signal(Err(failure)) => {
@@ -538,10 +539,9 @@ impl WorkflowFuture {
                 return RoutineDriveOutcome::Failed;
             }
             pass_made_progress |= main_poll_result.made_progress;
-            interceptor_pending |= matches!(
-                main_poll_result.pending_state,
-                Some(RoutinePendingState::Interceptor)
-            );
+            if main_poll_result.stalled_in_interceptor {
+                stalled_routines.push(RoutineKind::Main);
+            }
 
             match main_poll_result.completion {
                 None => {
@@ -613,21 +613,65 @@ impl WorkflowFuture {
                 return RoutineDriveOutcome::Complete;
             }
             if !pass_made_progress {
-                if !interceptor_pending {
-                    return RoutineDriveOutcome::Complete;
-                }
-                if self.wake_tracking.is_some() {
+                if detecting_nondeterminism && !stalled_routines.is_empty() {
                     self.fail_nondeterministic_future(
                         run_id,
-                        "a workflow interceptor returned Poll::Pending without polling its \
-                         handler or an SDK operation that will produce another workflow \
-                         activation.",
+                        &interceptor_stall_message(&stalled_routines),
                     );
                     return RoutineDriveOutcome::Failed;
                 }
-                return RoutineDriveOutcome::AwaitWake;
+                // Safe even for a routine stalled in its interceptor: it is polled again on the
+                // next activation that polls routines.
+                return RoutineDriveOutcome::Complete;
             }
         }
+    }
+}
+
+fn interceptor_stall_message(stalled_routines: &[RoutineKind]) -> String {
+    // An empty slice renders as a plural subject with no routines named.
+    debug_assert!(!stalled_routines.is_empty());
+    let subject = if stalled_routines.len() == 1 {
+        "a workflow interceptor chain"
+    } else {
+        "workflow interceptor chains"
+    };
+    let routines = join_routine_descriptions(stalled_routines);
+    format!(
+        "{subject} returned Poll::Pending before invoking {routines} — without awaiting an SDK \
+         operation whose resolution will produce another workflow activation. Interceptors may \
+         only await the future returned by next.run(input), or a command-producing SDK operation \
+         such as ctx.timer(), ctx.execute_activity(), ctx.execute_local_activity(), \
+         ctx.start_child_workflow(), ctx.external_workflow(..).signal(..), or \
+         ctx.start_nexus_operation()."
+    )
+}
+
+fn join_routine_descriptions(kinds: &[RoutineKind]) -> String {
+    match kinds {
+        [] => String::new(),
+        [only] => routine_description(only),
+        [first, second] => format!(
+            "{} and {}",
+            routine_description(first),
+            routine_description(second)
+        ),
+        [rest @ .., last] => format!(
+            "{}, and {}",
+            rest.iter()
+                .map(routine_description)
+                .collect::<Vec<_>>()
+                .join(", "),
+            routine_description(last)
+        ),
+    }
+}
+
+fn routine_description(kind: &RoutineKind) -> String {
+    match kind {
+        RoutineKind::Main => "the workflow run method".to_owned(),
+        RoutineKind::Signal(name) => format!("the `{name}` signal handler"),
+        RoutineKind::Update(update) => format!("the `{}` update handler", update.name),
     }
 }
 
@@ -636,93 +680,80 @@ impl Future for WorkflowFuture {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         'activations: loop {
-            let mut in_flight = if let Some(in_flight) = self.in_flight_activation.take() {
-                if self.fail_on_non_sdk_wake(&in_flight.run_id) {
-                    continue 'activations;
-                }
-                in_flight
-            } else {
-                let activation = match self.incoming_activations.poll_recv(cx) {
-                    Poll::Ready(a) => match a {
-                        Some(act) => act,
-                        None => {
-                            return Poll::Ready(Err(anyhow!(
-                                "Workflow future's activation channel was lost!"
-                            )
-                            .into()));
-                        }
-                    },
-                    Poll::Pending => return Poll::Pending,
-                };
-
-                let run_id = activation.run_id.clone();
-                if activation.is_only_eviction() {
-                    self.outgoing_completions
-                        .send(WorkflowActivationCompletion::from_cmds(run_id, vec![]))
-                        .expect("Completion channel intact");
-                    return Err(WorkflowTermination::Evicted).into();
-                }
-                if self.fail_on_non_sdk_wake(&run_id) {
-                    continue 'activations;
-                }
-
-                let (guest_activation, job_contexts, should_poll_routines) =
-                    match self.translate_activation(activation) {
-                        Ok(translated) => translated,
-                        Err(e) => {
-                            self.fail_wft(run_id, e, None);
-                            continue 'activations;
-                        }
-                    };
-
-                let tracked_waker = self.tracked_waker(cx.waker());
-                let waker = tracked_waker.as_ref().unwrap_or(cx.waker());
-                let activation_result = match panic::catch_unwind(AssertUnwindSafe(|| {
-                    self.execution.activate(guest_activation, waker)
-                })) {
-                    Ok(Ok(result)) => result,
-                    Ok(Err(err)) => {
-                        self.fail_wft(run_id.clone(), anyhow!(err.message), None);
-                        continue 'activations;
+            let activation = match self.incoming_activations.poll_recv(cx) {
+                Poll::Ready(a) => match a {
+                    Some(act) => act,
+                    None => {
+                        return Poll::Ready(Err(anyhow!(
+                            "Workflow future's activation channel was lost!"
+                        )
+                        .into()));
                     }
-                    Err(e) => {
-                        self.fail_wft(
-                            run_id.clone(),
-                            anyhow!("Workflow function panicked: {}", panic_formatter(e)),
-                            None,
-                        );
-                        continue 'activations;
-                    }
-                };
-                if self.fail_on_non_sdk_wake(&run_id) {
-                    continue 'activations;
-                }
-
-                let mut commands = Vec::new();
-                if let Err(e) =
-                    self.process_activation_results(job_contexts, activation_result, &mut commands)
-                {
-                    self.fail_wft(run_id.clone(), e, None);
-                    continue 'activations;
-                }
-
-                if !should_poll_routines {
-                    commands.extend(self.host.take_commands());
-                    self.send_completion(run_id, commands);
-                    continue 'activations;
-                }
-
-                InFlightActivation { run_id, commands }
+                },
+                Poll::Pending => return Poll::Pending,
             };
 
-            match self.drive_routines(cx, &in_flight.run_id, &mut in_flight.commands) {
-                RoutineDriveOutcome::Complete => {
-                    in_flight.commands.extend(self.host.take_commands());
-                    self.send_completion(in_flight.run_id, in_flight.commands);
+            let run_id = activation.run_id.clone();
+            if activation.is_only_eviction() {
+                self.outgoing_completions
+                    .send(WorkflowActivationCompletion::from_cmds(run_id, vec![]))
+                    .expect("Completion channel intact");
+                return Err(WorkflowTermination::Evicted).into();
+            }
+            if self.fail_on_non_sdk_wake(&run_id) {
+                continue 'activations;
+            }
+
+            let (guest_activation, job_contexts, should_poll_routines) =
+                match self.translate_activation(activation) {
+                    Ok(translated) => translated,
+                    Err(e) => {
+                        self.fail_wft(run_id, e, None);
+                        continue 'activations;
+                    }
+                };
+
+            let tracked_waker = self.tracked_waker(cx.waker());
+            let waker = tracked_waker.as_ref().unwrap_or(cx.waker());
+            let activation_result = match panic::catch_unwind(AssertUnwindSafe(|| {
+                self.execution.activate(guest_activation, waker)
+            })) {
+                Ok(Ok(result)) => result,
+                Ok(Err(err)) => {
+                    self.fail_wft(run_id.clone(), anyhow!(err.message), None);
+                    continue 'activations;
                 }
-                RoutineDriveOutcome::AwaitWake => {
-                    self.in_flight_activation = Some(in_flight);
-                    return Poll::Pending;
+                Err(e) => {
+                    self.fail_wft(
+                        run_id.clone(),
+                        anyhow!("Workflow function panicked: {}", panic_formatter(e)),
+                        None,
+                    );
+                    continue 'activations;
+                }
+            };
+            if self.fail_on_non_sdk_wake(&run_id) {
+                continue 'activations;
+            }
+
+            let mut commands = Vec::new();
+            if let Err(e) =
+                self.process_activation_results(job_contexts, activation_result, &mut commands)
+            {
+                self.fail_wft(run_id.clone(), e, None);
+                continue 'activations;
+            }
+
+            if !should_poll_routines {
+                commands.extend(self.host.take_commands());
+                self.send_completion(run_id, commands);
+                continue 'activations;
+            }
+
+            match self.drive_routines(cx, &run_id, &mut commands) {
+                RoutineDriveOutcome::Complete => {
+                    commands.extend(self.host.take_commands());
+                    self.send_completion(run_id, commands);
                 }
                 RoutineDriveOutcome::Failed => continue 'activations,
             }
@@ -750,6 +781,112 @@ fn update_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temporalio_workflow::runtime::types::{
+        MAIN_ROUTINE_ID, UpdateRoutineKind, WorkflowFailure,
+    };
+
+    const HEALTHY_SIGNAL_ROUTINE_ID: RoutineId = 7;
+    const HEALTHY_SIGNAL_NAME: &str = "healthy_signal";
+    const STALLED_SIGNAL_ROUTINE_ID: RoutineId = 8;
+    const STALLED_SIGNAL_NAME: &str = "stalled_signal";
+
+    /// A guest whose main routine and [`STALLED_SIGNAL_ROUTINE_ID`] are permanently parked inside
+    /// their inbound interceptor chains, while every other routine is merely blocked.
+    struct StalledInInterceptorInstance;
+
+    impl WorkflowInstance for StalledInInterceptorInstance {
+        fn activate(
+            &mut self,
+            _activation: WorkflowActivation,
+            _waker: &Waker,
+        ) -> Result<ActivationResult, WorkflowFailure> {
+            unreachable!("this test drives routines directly")
+        }
+
+        fn poll_routine(
+            &mut self,
+            routine_id: RoutineId,
+            _waker: &Waker,
+        ) -> Result<RoutinePollResult, WorkflowFailure> {
+            Ok(RoutinePollResult {
+                // Only the main routine reports a completion when it blocks; signal and update
+                // routines report one only once they finish.
+                completion: (routine_id == MAIN_ROUTINE_ID)
+                    .then_some(RoutineCompletion::Main(MainRoutineCompletion::Blocked)),
+                made_progress: false,
+                stalled_in_interceptor: routine_id == MAIN_ROUTINE_ID
+                    || routine_id == STALLED_SIGNAL_ROUTINE_ID,
+            })
+        }
+    }
+
+    /// Drives a healthy signal routine, a stalled signal routine, and a stalled main routine
+    /// through `drive_routines`, returning its outcome and whatever completion it sent (a failure,
+    /// or nothing when the caller is left to complete).
+    fn drive_stalled_routines(
+        detect_nondeterministic: bool,
+    ) -> (RoutineDriveOutcome, Option<WorkflowActivationCompletion>) {
+        let (outgoing_completions, mut completions) = unbounded_channel();
+        let (_activations, incoming_activations) = unbounded_channel();
+        let mut wf_future = WorkflowFuture {
+            execution: Box::new(StalledInInterceptorInstance),
+            host: Rc::new(NativeWorkflowHost::default()),
+            span: tracing::Span::none(),
+            outgoing_completions,
+            incoming_activations,
+            wake_tracking: detect_nondeterministic.then(WakeTracker::new),
+            // The stalled routine sits at a non-zero index so that naming it in the failure
+            // requires reading the kind of the routine that actually stalled.
+            active_routines: vec![
+                ActiveRoutine {
+                    id: HEALTHY_SIGNAL_ROUTINE_ID,
+                    kind: RoutineKind::Signal(HEALTHY_SIGNAL_NAME.to_owned()),
+                },
+                ActiveRoutine {
+                    id: STALLED_SIGNAL_ROUTINE_ID,
+                    kind: RoutineKind::Signal(STALLED_SIGNAL_NAME.to_owned()),
+                },
+            ],
+        };
+        let cx = Context::from_waker(Waker::noop());
+        let outcome = wf_future.drive_routines(&cx, "test-run-id", &mut Vec::new());
+        (outcome, completions.try_recv().ok())
+    }
+
+    #[test]
+    fn interceptor_stall_completes_the_task_when_detection_is_off() {
+        let (outcome, completion) = drive_stalled_routines(false);
+        assert!(
+            matches!(outcome, RoutineDriveOutcome::Complete),
+            "a stalled routine must not fail the workflow task when \
+             detect_nondeterministic_futures is disabled"
+        );
+        assert!(
+            completion.is_none(),
+            "`drive_routines` must not send a completion of its own: {completion:?}"
+        );
+    }
+
+    #[test]
+    fn interceptor_stall_fails_the_task_when_detection_is_on() {
+        let (outcome, completion) = drive_stalled_routines(true);
+        assert!(matches!(outcome, RoutineDriveOutcome::Failed));
+        let failure = match completion.and_then(|completion| completion.status) {
+            Some(workflow_activation_completion::Status::Failed(failed)) => failed,
+            other => panic!("expected a failed completion, got {other:?}"),
+        };
+        let message = failure.failure.expect("failure present").message;
+        assert!(message.contains("[TMPRL1100]"), "{message}");
+        assert!(message.contains("interceptor chain"), "{message}");
+        // The stalled signal routine's stored kind must survive into the message, alongside main's.
+        assert!(
+            message.contains(&format!("the `{STALLED_SIGNAL_NAME}` signal handler")),
+            "{message}"
+        );
+        assert!(message.contains("the workflow run method"), "{message}");
+        // The routine that merely blocked is not stalled and must not be named.
+        assert!(!message.contains(HEALTHY_SIGNAL_NAME), "{message}");
+    }
 
     #[test]
     fn workflow_task_failed_cause_from_wit_preserves_known_causes() {
@@ -771,5 +908,54 @@ mod tests {
     fn workflow_task_failed_cause_from_wit_ignores_unknown_causes() {
         assert_eq!(workflow_task_failed_cause_from_wit(None), None);
         assert_eq!(workflow_task_failed_cause_from_wit(Some(u32::MAX)), None);
+    }
+
+    #[test]
+    fn interceptor_stall_message_names_every_stalled_routine() {
+        let message = interceptor_stall_message(&[
+            RoutineKind::Main,
+            RoutineKind::Signal("my_signal".to_owned()),
+            RoutineKind::Update(UpdateRoutineKind {
+                name: "my_update".to_owned(),
+                update_id: "update-id".to_owned(),
+                protocol_instance_id: "protocol-id".to_owned(),
+            }),
+        ]);
+        assert!(
+            message.starts_with(
+                "workflow interceptor chains returned Poll::Pending before invoking the workflow \
+                 run method, the `my_signal` signal handler, and the `my_update` update handler \
+                 — without awaiting an SDK operation"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("Interceptors may only await the future returned by next.run(input)"),
+            "{message}"
+        );
+
+        let two = interceptor_stall_message(&[
+            RoutineKind::Main,
+            RoutineKind::Signal("my_signal".to_owned()),
+        ]);
+        assert!(
+            two.starts_with(
+                "workflow interceptor chains returned Poll::Pending before invoking the workflow \
+                 run method and the `my_signal` signal handler — without"
+            ),
+            "{two}"
+        );
+    }
+
+    #[test]
+    fn interceptor_stall_message_is_singular_for_one_stalled_routine() {
+        let message = interceptor_stall_message(&[RoutineKind::Signal("my_signal".to_owned())]);
+        assert!(
+            message.starts_with(
+                "a workflow interceptor chain returned Poll::Pending before invoking the \
+                 `my_signal` signal handler — without"
+            ),
+            "{message}"
+        );
     }
 }

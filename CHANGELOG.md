@@ -73,6 +73,13 @@ to docs, or any other relevant information.
   `NexusOperationOptions::builder()` to construct Nexus operation options.
 * `WorkflowContext::wait_condition` now returns `Result<(), WorkflowCancellationError>` instead of
   `()` so that workflow cancellation can be propagated to the caller.
+* `temporalio_workflow::runtime::types::RoutinePollResult::pending_state` and the
+  `RoutinePendingState` enum it carried are removed, replaced by a
+  `RoutinePollResult::stalled_in_interceptor` boolean; implementors of
+  `runtime::guest::WorkflowInstance` must set the new field. The `temporal:workflow-runtime@0.1.0`
+  `types` interface changes to match, replacing `routine-poll-result.pending-state` and the
+  `routine-pending-state` variant with `routine-poll-result.stalled-in-interceptor`. The new field
+  is `true` exactly where `pending-state` was `interceptor`, and `false` otherwise.
 
 ### Added
 * `WorkflowCancellationToken` for deterministic cancellation of workflow operations.
@@ -83,6 +90,13 @@ to docs, or any other relevant information.
 * Cancellation errors propagated after workflow cancellation now complete the workflow as cancelled
   instead of failed.
 * The default `tls-ring` build no longer pulls in `aws-lc-rs`. `tls-aws-lc` builds are unchanged.
+* A workflow interceptor that returns `Poll::Pending` without awaiting a workflow future no longer
+  holds the workflow task open waiting for a wake the SDK cannot produce. When
+  `detect_nondeterministic_futures` is disabled the workflow task is now completed and the parked
+  routine is polled again on the next activation that polls routines, the same as a workflow
+  handler that blocks on a future the SDK does not own. With detection enabled (the default) the
+  workflow task still fails immediately, and the failure message now names the run method, signal,
+  or update whose handler had not been invoked.
 
 ### Fixed
 * Panics from update validators now reject the update instead of repeatedly failing workflow

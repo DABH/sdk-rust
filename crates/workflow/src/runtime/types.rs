@@ -119,29 +119,16 @@ pub enum RoutineCompletion {
     Update(UpdateRoutineCompletion),
 }
 
-/// Describes why the outer inbound interceptor future remained pending after its latest poll.
-///
-/// A plain [`std::task::Poll::Pending`] cannot tell the SDK whether completing the current
-/// activation will provide another opportunity to poll the chain, so the runtime records that
-/// distinction here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RoutinePendingState {
-    /// The underlying handler future was polled, after which normal workflow blocking semantics
-    /// determine when another activation is needed.
-    Handler,
-    /// No handler boundary or command-backed SDK future was polled, so Core cannot produce the
-    /// activation needed to make progress.
-    Interceptor,
-    /// A command-backed SDK future was polled, allowing the current activation to complete because
-    /// its resolution will produce another activation.
-    InterceptorWithActivation,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct RoutinePollResult {
     pub completion: Option<RoutineCompletion>,
     pub made_progress: bool,
-    pub pending_state: Option<RoutinePendingState>,
+    /// The routine returned pending while still inside its inbound interceptor chain, and that
+    /// chain polled neither the workflow's handler nor an SDK operation whose resolution would
+    /// produce another activation, so no activation will arise on this routine's account. The
+    /// routine is not abandoned: it is polled again on the next activation that polls routines.
+    /// Hosts that detect nondeterministic futures should fail the workflow task.
+    pub stalled_in_interceptor: bool,
 }
 
 pub type WorkflowFailure = Box<Failure>;

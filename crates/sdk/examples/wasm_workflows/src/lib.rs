@@ -76,7 +76,7 @@ impl WorkflowInstance for WasmTaskFailureWorkflow {
                 },
             ))),
             made_progress: true,
-            pending_state: None,
+            stalled_in_interceptor: false,
         })
     }
 }
