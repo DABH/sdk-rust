@@ -734,9 +734,9 @@ impl Worker {
         plugins::apply_worker_plugins(client.options(), &mut options)?;
         let wc = options
             .to_core_options(client.namespace(), client.identity())
-            .map_err(|error| WorkerCreateError::Initialization(anyhow!(error)))?;
+            .map_err(|error| WorkerCreateError::Initialization(anyhow!(error).into()))?;
         let core = init_worker(runtime, wc, client.connection().clone())
-            .map_err(WorkerCreateError::Initialization)?;
+            .map_err(|error| WorkerCreateError::Initialization(error.into()))?;
         Self::new_from_core_options_prepared(Arc::new(core), client.options().clone(), options)
     }
 
@@ -800,7 +800,7 @@ impl Worker {
                 wasm_components,
                 !me.common.workflow_interceptor_constructors.is_empty(),
             )
-            .map_err(|error| WorkerCreateError::Initialization(anyhow!(error)))?;
+            .map_err(|error| WorkerCreateError::Initialization(anyhow!(error).into()))?;
         Ok(me)
     }
 

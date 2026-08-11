@@ -15,7 +15,7 @@ pub enum WorkerCreateError {
     Plugin(#[from] PluginApplyError),
     /// Worker initialization failed after plugin configuration completed.
     #[error("worker initialization failed: {0}")]
-    Initialization(#[source] anyhow::Error),
+    Initialization(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
 /// Errors that can occur while running a worker.
