@@ -24,6 +24,11 @@ to docs, or any other relevant information.
   native threads are unavailable.
 * Native client transport, runtime, and host-environment dependencies can now be disabled so Core
   workers can run behind a callback transport on WASM hosts.
+* The WASM bridge now exports `temporal_core_init_with_worker_options` for explicit workflow
+  worker capacity configuration and supports multiple concurrent workflow activation completions via
+  ID-keyed completion operations. Runtime progress calls now drain ready work without the previous
+  fixed one-millisecond delay. The superseded init, tick, and no-ID workflow completion exports were
+  removed.
 * Worker heartbeats now report the SDK runtime, hosting environments, operating system, and
   architecture once per worker, retrying until the first successful delivery. Runtime options can
   disable this reporting, and language SDK bridges can supply their own runtime details. The Rust

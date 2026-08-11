@@ -12,7 +12,6 @@ use std::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
 };
 use temporalio_client::{
     Connection, ConnectionOptions,
@@ -32,9 +31,11 @@ use tonic::{Code, Status};
 
 const BRIDGE_ERROR: i32 = -1;
 const BRIDGE_PENDING: i32 = 1;
+const READY_TASK_DRAIN_TURNS: usize = 16;
 
 type OperationSlot = Arc<Mutex<OperationState>>;
 type ConnectionSlot = Arc<Mutex<Option<Result<Connection, String>>>>;
+type WorkflowCompletionRegistry = Arc<Mutex<HashMap<u64, OperationState>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -70,6 +71,15 @@ enum OperationState {
     Ready(Result<Vec<u8>, String>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorkerInitOptions {
+    max_concurrent_activity_executions: usize,
+    max_concurrent_activity_task_pollers: usize,
+    max_concurrent_workflow_task_executions: usize,
+    max_concurrent_workflow_task_pollers: usize,
+    max_cached_workflows: usize,
+}
+
 struct BridgeState {
     mode: BridgeInitMode,
     runtime: tokio::runtime::Runtime,
@@ -79,7 +89,7 @@ struct BridgeState {
     connection_result: ConnectionSlot,
     initialization_result: OperationSlot,
     workflow_poll_result: OperationSlot,
-    workflow_completion_result: OperationSlot,
+    workflow_completion_results: WorkflowCompletionRegistry,
     activity_poll_result: OperationSlot,
     activity_completion_result: OperationSlot,
     shutdown_result: OperationSlot,
@@ -185,9 +195,9 @@ pub unsafe extern "C" fn temporal_dealloc(ptr: *mut u8, len: usize) {
     }
 }
 
-/// Start initializing one activity-only Temporal Core worker.
+/// Start initializing one Temporal Core worker with explicit workflow and activity options.
 #[unsafe(no_mangle)]
-pub extern "C" fn temporal_core_init(
+pub extern "C" fn temporal_core_init_with_worker_options(
     namespace_ptr: *const u8,
     namespace_len: usize,
     task_queue_ptr: *const u8,
@@ -196,39 +206,9 @@ pub extern "C" fn temporal_core_init(
     identity_len: usize,
     max_concurrent_activity_executions: usize,
     max_concurrent_activity_task_pollers: usize,
-    error_ptr: *mut u8,
-    error_capacity: usize,
-) -> i64 {
-    temporal_core_init_with_mode(
-        namespace_ptr,
-        namespace_len,
-        task_queue_ptr,
-        task_queue_len,
-        identity_ptr,
-        identity_len,
-        max_concurrent_activity_executions,
-        max_concurrent_activity_task_pollers,
-        BridgeInitMode::ActivityOnly as u32,
-        error_ptr,
-        error_capacity,
-    )
-}
-
-/// Start initializing one Temporal Core worker in the requested bridge mode.
-///
-/// Supported modes:
-/// - `0`: activity-only
-/// - `1`: workflow-only
-#[unsafe(no_mangle)]
-pub extern "C" fn temporal_core_init_with_mode(
-    namespace_ptr: *const u8,
-    namespace_len: usize,
-    task_queue_ptr: *const u8,
-    task_queue_len: usize,
-    identity_ptr: *const u8,
-    identity_len: usize,
-    max_concurrent_activity_executions: usize,
-    max_concurrent_activity_task_pollers: usize,
+    max_concurrent_workflow_task_executions: usize,
+    max_concurrent_workflow_task_pollers: usize,
+    max_cached_workflows: usize,
     mode: u32,
     error_ptr: *mut u8,
     error_capacity: usize,
@@ -238,6 +218,13 @@ pub extern "C" fn temporal_core_init_with_mode(
         let namespace = read_string(namespace_ptr, namespace_len)?;
         let task_queue = read_string(task_queue_ptr, task_queue_len)?;
         let identity = read_string(identity_ptr, identity_len)?;
+        let options = WorkerInitOptions {
+            max_concurrent_activity_executions,
+            max_concurrent_activity_task_pollers,
+            max_concurrent_workflow_task_executions,
+            max_concurrent_workflow_task_pollers,
+            max_cached_workflows,
+        };
         let state_lock = STATE.get_or_init(|| Mutex::new(None));
         let mut state = state_lock
             .lock()
@@ -280,13 +267,7 @@ pub extern "C" fn temporal_core_init_with_mode(
         .keep_alive(None)
         .build();
 
-        let worker_config = worker_config_for_mode(
-            mode,
-            namespace,
-            task_queue,
-            max_concurrent_activity_executions,
-            max_concurrent_activity_task_pollers,
-        )?;
+        let worker_config = worker_config_for_mode(mode, namespace, task_queue, options)?;
 
         let connection_result = Arc::new(Mutex::new(None));
         let initialization_result = operation_slot();
@@ -310,7 +291,7 @@ pub extern "C" fn temporal_core_init_with_mode(
             connection_result,
             initialization_result,
             workflow_poll_result: operation_slot(),
-            workflow_completion_result: operation_slot(),
+            workflow_completion_results: workflow_completion_registry(),
             activity_poll_result: operation_slot(),
             activity_completion_result: operation_slot(),
             shutdown_result: operation_slot(),
@@ -323,17 +304,16 @@ fn worker_config_for_mode(
     mode: BridgeInitMode,
     namespace: String,
     task_queue: String,
-    max_concurrent_activity_executions: usize,
-    max_concurrent_activity_task_pollers: usize,
+    options: WorkerInitOptions,
 ) -> Result<WorkerConfig, String> {
     match mode {
         BridgeInitMode::ActivityOnly => activity_worker_config(
             namespace,
             task_queue,
-            max_concurrent_activity_executions,
-            max_concurrent_activity_task_pollers,
+            options.max_concurrent_activity_executions,
+            options.max_concurrent_activity_task_pollers,
         ),
-        BridgeInitMode::WorkflowOnly => workflow_worker_config(namespace, task_queue),
+        BridgeInitMode::WorkflowOnly => workflow_worker_config(namespace, task_queue, options),
     }
 }
 
@@ -358,7 +338,11 @@ fn activity_worker_config(
         .map_err(|err| format!("invalid activity worker configuration: {err}"))
 }
 
-fn workflow_worker_config(namespace: String, task_queue: String) -> Result<WorkerConfig, String> {
+fn workflow_worker_config(
+    namespace: String,
+    task_queue: String,
+    options: WorkerInitOptions,
+) -> Result<WorkerConfig, String> {
     WorkerConfig::builder()
         .namespace(namespace)
         .task_queue(task_queue)
@@ -366,9 +350,13 @@ fn workflow_worker_config(namespace: String, task_queue: String) -> Result<Worke
             build_id: "go-wasm-core-prototype".to_owned(),
         })
         .task_types(WorkerTaskTypes::workflow_only())
-        .max_cached_workflows(1_usize)
-        .max_outstanding_workflow_tasks(2_usize)
-        .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(2))
+        .max_cached_workflows(options.max_cached_workflows)
+        .max_outstanding_workflow_tasks(options.max_concurrent_workflow_task_executions)
+        .maybe_workflow_task_poller_behavior(
+            (options.max_concurrent_workflow_task_pollers > 0).then_some(
+                PollerBehavior::SimpleMaximum(options.max_concurrent_workflow_task_pollers),
+            ),
+        )
         .build()
         .map_err(|err| format!("invalid workflow worker configuration: {err}"))
 }
@@ -565,9 +553,31 @@ pub extern "C" fn temporal_core_take_poll_workflow_activation(
     })
 }
 
-/// Start submitting a protobuf-encoded workflow activation completion to Core.
+/// Start submitting a protobuf-encoded workflow activation completion to Core using a caller ID.
 #[unsafe(no_mangle)]
-pub extern "C" fn temporal_core_start_complete_workflow_activation(
+pub extern "C" fn temporal_core_start_complete_workflow_activation_with_id(
+    operation_id: u64,
+    completion_ptr: *const u8,
+    completion_len: usize,
+    error_ptr: *mut u8,
+    error_capacity: usize,
+) -> i64 {
+    if operation_id == 0 {
+        return write_result(error_ptr, error_capacity, || {
+            Err("workflow activation completion operation ID must be nonzero".to_owned())
+        });
+    }
+    start_complete_workflow_activation(
+        operation_id,
+        completion_ptr,
+        completion_len,
+        error_ptr,
+        error_capacity,
+    )
+}
+
+fn start_complete_workflow_activation(
+    operation_id: u64,
     completion_ptr: *const u8,
     completion_len: usize,
     error_ptr: *mut u8,
@@ -579,19 +589,20 @@ pub extern "C" fn temporal_core_start_complete_workflow_activation(
                 .map_err(|err| format!("invalid WorkflowActivationCompletion protobuf: {err}"))?;
         with_state(|state| {
             ensure_mode(state, BridgeInitMode::WorkflowOnly)?;
-            mark_pending(
-                &state.workflow_completion_result,
+            mark_workflow_completion_pending(
+                &state.workflow_completion_results,
+                operation_id,
                 "workflow activation completion",
             )?;
             let worker = initialized_worker(state)?;
-            let result = state.workflow_completion_result.clone();
+            let results = state.workflow_completion_results.clone();
             let completion = async move {
                 let value = worker
                     .complete_workflow_activation(completion)
                     .await
                     .map(|_| Vec::new())
                     .map_err(|err| format!("workflow activation completion failed: {err}"));
-                set_ready(&result, value);
+                set_workflow_completion_ready(&results, operation_id, value);
             };
             #[cfg(not(target_arch = "wasm32"))]
             drop(state.runtime.spawn(completion));
@@ -602,15 +613,38 @@ pub extern "C" fn temporal_core_start_complete_workflow_activation(
     })
 }
 
-/// Take the result of a started workflow activation completion, or return the pending result code.
+/// Take the result of a started workflow activation completion by caller ID.
 #[unsafe(no_mangle)]
-pub extern "C" fn temporal_core_take_complete_workflow_activation(
+pub extern "C" fn temporal_core_take_complete_workflow_activation_with_id(
+    operation_id: u64,
     error_ptr: *mut u8,
     error_capacity: usize,
 ) -> i64 {
-    take_operation_result(error_ptr, error_capacity, |state| {
-        &state.workflow_completion_result
-    })
+    if operation_id == 0 {
+        return write_result(error_ptr, error_capacity, || {
+            Err("workflow activation completion operation ID must be nonzero".to_owned())
+        });
+    }
+    take_workflow_completion_result(operation_id, error_ptr, error_capacity)
+}
+
+fn take_workflow_completion_result(
+    operation_id: u64,
+    error_ptr: *mut u8,
+    error_capacity: usize,
+) -> i64 {
+    let result = with_state(|state| {
+        take_workflow_completion_operation(
+            &state.workflow_completion_results,
+            operation_id,
+            "workflow activation completion",
+        )
+    });
+    match result {
+        Ok(None) => pack_result(BRIDGE_PENDING, 0),
+        Ok(Some(output)) => write_result(error_ptr, error_capacity, || Ok(output)),
+        Err(error) => write_result(error_ptr, error_capacity, || Err(error)),
+    }
 }
 
 /// Record a protobuf-encoded activity heartbeat through Core.
@@ -631,19 +665,26 @@ pub extern "C" fn temporal_core_record_activity_heartbeat(
     })
 }
 
-/// Advance Core's current-thread Tokio runtime without blocking on a long poll.
+/// Advance all currently ready Core tasks without imposing a fixed host-side delay.
 #[unsafe(no_mangle)]
-pub extern "C" fn temporal_core_tick(error_ptr: *mut u8, error_capacity: usize) -> i64 {
+pub extern "C" fn temporal_core_drain_ready_tasks(
+    error_ptr: *mut u8,
+    error_capacity: usize,
+) -> i64 {
     write_result(error_ptr, error_capacity, || {
         with_state(|state| {
             #[cfg(not(target_arch = "wasm32"))]
-            state
-                .runtime
-                .block_on(async { tokio::time::sleep(Duration::from_millis(1)).await });
+            state.runtime.block_on(async {
+                for _ in 0..READY_TASK_DRAIN_TURNS {
+                    tokio::task::yield_now().await;
+                }
+            });
             #[cfg(target_arch = "wasm32")]
             WORKFLOW_LOCAL_SET.with(|local| {
                 local.block_on(&state.runtime, async {
-                    tokio::time::sleep(Duration::from_millis(1)).await
+                    for _ in 0..READY_TASK_DRAIN_TURNS {
+                        tokio::task::yield_now().await;
+                    }
                 });
             });
             Ok(Vec::new())
@@ -729,6 +770,10 @@ fn operation_slot() -> OperationSlot {
     Arc::new(Mutex::new(OperationState::Idle))
 }
 
+fn workflow_completion_registry() -> WorkflowCompletionRegistry {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
 fn mark_pending(slot: &OperationSlot, name: &str) -> Result<(), String> {
     let mut state = slot
         .lock()
@@ -742,6 +787,68 @@ fn mark_pending(slot: &OperationSlot, name: &str) -> Result<(), String> {
 
 fn set_ready(slot: &OperationSlot, value: Result<Vec<u8>, String>) {
     *slot.lock().expect("operation result lock is not poisoned") = OperationState::Ready(value);
+}
+
+fn mark_workflow_completion_pending(
+    registry: &WorkflowCompletionRegistry,
+    operation_id: u64,
+    name: &str,
+) -> Result<(), String> {
+    let mut operations = registry
+        .lock()
+        .map_err(|_| format!("{name} registry lock is poisoned"))?;
+    if operations.contains_key(&operation_id) {
+        return Err(format!(
+            "{name} operation ID {operation_id} is already in progress"
+        ));
+    }
+    operations.insert(operation_id, OperationState::Pending);
+    Ok(())
+}
+
+fn set_workflow_completion_ready(
+    registry: &WorkflowCompletionRegistry,
+    operation_id: u64,
+    value: Result<Vec<u8>, String>,
+) {
+    let mut operations = registry
+        .lock()
+        .expect("workflow completion registry lock is not poisoned");
+    if let Some(operation) = operations.get_mut(&operation_id) {
+        *operation = OperationState::Ready(value);
+    }
+}
+
+fn take_workflow_completion_operation(
+    registry: &WorkflowCompletionRegistry,
+    operation_id: u64,
+    name: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut operations = registry
+        .lock()
+        .map_err(|_| format!("{name} registry lock is poisoned"))?;
+    let Some(operation) = operations.remove(&operation_id) else {
+        return Err(format!(
+            "{name} operation ID {operation_id} has not been started"
+        ));
+    };
+    match operation {
+        OperationState::Ready(result) => result.map(Some),
+        OperationState::Pending => {
+            operations.insert(operation_id, OperationState::Pending);
+            Ok(None)
+        }
+        OperationState::Idle => Err(format!(
+            "{name} operation ID {operation_id} is in an invalid state"
+        )),
+    }
+}
+
+fn reset_workflow_completion_registry(registry: &WorkflowCompletionRegistry) {
+    registry
+        .lock()
+        .expect("workflow completion registry lock is not poisoned")
+        .clear();
 }
 
 fn take_operation_result(
@@ -802,8 +909,10 @@ fn ensure_mode(state: &BridgeState, expected: BridgeInitMode) -> Result<(), Stri
 }
 
 fn reset_bridge_state() {
-    if let Ok(mut state) = STATE.get_or_init(|| Mutex::new(None)).lock() {
-        state.take();
+    if let Ok(mut state) = STATE.get_or_init(|| Mutex::new(None)).lock()
+        && let Some(state) = state.take()
+    {
+        reset_workflow_completion_registry(&state.workflow_completion_results);
     }
     HOST_TRANSPORT.get_or_init(HostTransport::default).reset();
 }
@@ -930,8 +1039,18 @@ mod tests {
 
     #[test]
     fn workflow_worker_config_enables_cached_state_and_evictions() {
-        let config = workflow_worker_config("namespace".to_owned(), "queue".to_owned())
-            .expect("worker config is valid");
+        let config = workflow_worker_config(
+            "namespace".to_owned(),
+            "queue".to_owned(),
+            WorkerInitOptions {
+                max_concurrent_activity_executions: 12,
+                max_concurrent_activity_task_pollers: 3,
+                max_concurrent_workflow_task_executions: 2,
+                max_concurrent_workflow_task_pollers: 2,
+                max_cached_workflows: 1,
+            },
+        )
+        .expect("worker config is valid");
         assert_eq!(config.task_types, WorkerTaskTypes::workflow_only());
         assert_eq!(config.max_cached_workflows, 1);
         assert_eq!(config.max_outstanding_workflow_tasks, Some(2));
@@ -939,6 +1058,97 @@ mod tests {
             config.workflow_task_poller_behavior,
             Some(PollerBehavior::SimpleMaximum(2))
         );
+    }
+
+    #[test]
+    fn workflow_worker_config_uses_explicit_workflow_concurrency() {
+        let config = workflow_worker_config(
+            "namespace".to_owned(),
+            "queue".to_owned(),
+            WorkerInitOptions {
+                max_concurrent_activity_executions: 7,
+                max_concurrent_activity_task_pollers: 0,
+                max_concurrent_workflow_task_executions: 8,
+                max_concurrent_workflow_task_pollers: 5,
+                max_cached_workflows: 3,
+            },
+        )
+        .expect("worker config is valid");
+        assert_eq!(config.max_cached_workflows, 3);
+        assert_eq!(config.max_outstanding_workflow_tasks, Some(8));
+        assert_eq!(
+            config.workflow_task_poller_behavior,
+            Some(PollerBehavior::SimpleMaximum(5))
+        );
+    }
+
+    #[test]
+    fn workflow_worker_config_leaves_default_poller_behavior_to_core() {
+        let config = workflow_worker_config(
+            "namespace".to_owned(),
+            "queue".to_owned(),
+            WorkerInitOptions {
+                max_concurrent_activity_executions: 7,
+                max_concurrent_activity_task_pollers: 0,
+                max_concurrent_workflow_task_executions: 8,
+                max_concurrent_workflow_task_pollers: 0,
+                max_cached_workflows: 1,
+            },
+        )
+        .expect("worker config is valid");
+        assert_eq!(config.workflow_task_poller_behavior, None);
+    }
+
+    #[test]
+    fn workflow_worker_config_rejects_core_cache_minimum_violations() {
+        let error = workflow_worker_config(
+            "namespace".to_owned(),
+            "queue".to_owned(),
+            WorkerInitOptions {
+                max_concurrent_activity_executions: 7,
+                max_concurrent_activity_task_pollers: 0,
+                max_concurrent_workflow_task_executions: 1,
+                max_concurrent_workflow_task_pollers: 1,
+                max_cached_workflows: 1,
+            },
+        )
+        .err()
+        .expect("config should fail validation");
+        assert!(error.contains("max_outstanding_workflow_tasks"));
+    }
+
+    #[test]
+    fn worker_config_for_mode_routes_both_bridge_modes() {
+        let activity = worker_config_for_mode(
+            BridgeInitMode::ActivityOnly,
+            "namespace".to_owned(),
+            "queue".to_owned(),
+            WorkerInitOptions {
+                max_concurrent_activity_executions: 4,
+                max_concurrent_activity_task_pollers: 2,
+                max_concurrent_workflow_task_executions: 8,
+                max_concurrent_workflow_task_pollers: 6,
+                max_cached_workflows: 5,
+            },
+        )
+        .expect("activity config is valid");
+        let workflow = worker_config_for_mode(
+            BridgeInitMode::WorkflowOnly,
+            "namespace".to_owned(),
+            "queue".to_owned(),
+            WorkerInitOptions {
+                max_concurrent_activity_executions: 4,
+                max_concurrent_activity_task_pollers: 2,
+                max_concurrent_workflow_task_executions: 8,
+                max_concurrent_workflow_task_pollers: 6,
+                max_cached_workflows: 5,
+            },
+        )
+        .expect("workflow config is valid");
+        assert_eq!(activity.task_types, WorkerTaskTypes::activity_only());
+        assert_eq!(workflow.task_types, WorkerTaskTypes::workflow_only());
+        assert_eq!(activity.max_outstanding_activities, Some(4));
+        assert_eq!(workflow.max_cached_workflows, 5);
     }
 
     #[test]
@@ -957,15 +1167,123 @@ mod tests {
     #[test]
     fn bridge_uses_independent_workflow_and_activity_slots() {
         let workflow_poll = operation_slot();
-        let workflow_completion = operation_slot();
+        let workflow_completion = workflow_completion_registry();
         let activity_poll = operation_slot();
         let activity_completion = operation_slot();
-        assert!(!Arc::ptr_eq(&workflow_poll, &workflow_completion));
         assert!(!Arc::ptr_eq(&workflow_poll, &activity_poll));
         assert!(!Arc::ptr_eq(&workflow_poll, &activity_completion));
-        assert!(!Arc::ptr_eq(&workflow_completion, &activity_poll));
-        assert!(!Arc::ptr_eq(&workflow_completion, &activity_completion));
         assert!(!Arc::ptr_eq(&activity_poll, &activity_completion));
+        assert_eq!(
+            workflow_completion
+                .lock()
+                .expect("registry lock is not poisoned")
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn workflow_completion_registry_supports_out_of_order_ready_results() {
+        let registry = workflow_completion_registry();
+        mark_workflow_completion_pending(&registry, 1, "workflow activation completion")
+            .expect("first operation starts");
+        mark_workflow_completion_pending(&registry, 2, "workflow activation completion")
+            .expect("second operation starts");
+
+        set_workflow_completion_ready(&registry, 2, Ok(vec![2]));
+        set_workflow_completion_ready(&registry, 1, Ok(vec![1]));
+
+        assert_eq!(
+            take_workflow_completion_operation(&registry, 2, "workflow activation completion")
+                .expect("second result is available"),
+            Some(vec![2])
+        );
+        assert_eq!(
+            take_workflow_completion_operation(&registry, 1, "workflow activation completion")
+                .expect("first result is available"),
+            Some(vec![1])
+        );
+    }
+
+    #[test]
+    fn workflow_completion_registry_rejects_duplicate_unknown_and_reused_ids() {
+        let registry = workflow_completion_registry();
+        mark_workflow_completion_pending(&registry, 9, "workflow activation completion")
+            .expect("operation starts");
+
+        let duplicate =
+            mark_workflow_completion_pending(&registry, 9, "workflow activation completion")
+                .expect_err("duplicate ID should fail");
+        assert!(duplicate.contains("operation ID 9 is already in progress"));
+
+        let unknown =
+            take_workflow_completion_operation(&registry, 7, "workflow activation completion")
+                .expect_err("unknown ID should fail");
+        assert!(unknown.contains("operation ID 7 has not been started"));
+
+        set_workflow_completion_ready(&registry, 9, Ok(Vec::new()));
+        assert_eq!(
+            take_workflow_completion_operation(&registry, 9, "workflow activation completion")
+                .expect("result should be available"),
+            Some(Vec::new())
+        );
+
+        let reused =
+            take_workflow_completion_operation(&registry, 9, "workflow activation completion")
+                .expect_err("reused ID should fail");
+        assert!(reused.contains("operation ID 9 has not been started"));
+    }
+
+    #[test]
+    fn workflow_completion_registry_keeps_pending_entries_and_allows_second_take_error() {
+        let registry = workflow_completion_registry();
+        mark_workflow_completion_pending(&registry, 11, "workflow activation completion")
+            .expect("operation starts");
+
+        assert_eq!(
+            take_workflow_completion_operation(&registry, 11, "workflow activation completion")
+                .expect("pending result should not error"),
+            None
+        );
+        assert!(
+            registry
+                .lock()
+                .expect("registry lock is not poisoned")
+                .contains_key(&11)
+        );
+
+        set_workflow_completion_ready(&registry, 11, Ok(vec![1, 1]));
+        assert_eq!(
+            take_workflow_completion_operation(&registry, 11, "workflow activation completion")
+                .expect("ready result should be returned"),
+            Some(vec![1, 1])
+        );
+
+        let second_take =
+            take_workflow_completion_operation(&registry, 11, "workflow activation completion")
+                .expect_err("second take should fail");
+        assert!(second_take.contains("operation ID 11 has not been started"));
+    }
+
+    #[test]
+    fn workflow_completion_registry_cleanup_drops_pending_operations() {
+        let registry = workflow_completion_registry();
+        mark_workflow_completion_pending(&registry, 15, "workflow activation completion")
+            .expect("operation starts");
+        reset_workflow_completion_registry(&registry);
+        assert!(
+            registry
+                .lock()
+                .expect("registry lock is not poisoned")
+                .is_empty()
+        );
+        set_workflow_completion_ready(&registry, 15, Ok(vec![9]));
+        assert!(
+            registry
+                .lock()
+                .expect("registry lock is not poisoned")
+                .is_empty()
+        );
     }
 
     #[test]
