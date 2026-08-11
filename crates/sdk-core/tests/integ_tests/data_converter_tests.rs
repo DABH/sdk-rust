@@ -297,7 +297,7 @@ struct WorkflowFailureFallbackWorkflow;
 impl WorkflowFailureFallbackWorkflow {
     #[run]
     async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        Err(anyhow::anyhow!(WORKFLOW_FAILURE_MESSAGE).into())
+        Err(temporalio_sdk::ApplicationFailure::new(WORKFLOW_FAILURE_MESSAGE).into())
     }
 }
 

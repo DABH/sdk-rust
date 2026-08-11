@@ -42,7 +42,7 @@ use temporalio_common::{
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, CancellableFuture, SyncWorkflowContext, WorkflowContext, WorkflowResult,
-    WorkflowTermination, activities::ActivityContext,
+    activities::ActivityContext,
 };
 use tokio::{
     net::TcpListener,
@@ -306,8 +306,7 @@ impl ShutdownTimerActivityLoopWf {
                 (),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(10)),
             )
-            .await
-            .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+            .await?;
         }
     }
 }
@@ -482,9 +481,7 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat(disable_eager: b
             // through the worker commands path.
             ctx.wait_condition(|s| s.act_started).await?;
             act_fut.cancel();
-            act_fut
-                .await
-                .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+            act_fut.await?;
             Ok(())
         }
 

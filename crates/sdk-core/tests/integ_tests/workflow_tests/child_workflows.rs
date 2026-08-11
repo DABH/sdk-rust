@@ -1,5 +1,4 @@
 use crate::common::{CoreWfStarter, WorkflowHandleExt, build_fake_sdk, mock_sdk, mock_sdk_cfg};
-use anyhow::anyhow;
 use assert_matches::assert_matches;
 use std::{sync::Arc, time::Duration};
 use temporalio_client::{WorkflowCancelOptions, WorkflowStartOptions};
@@ -905,7 +904,11 @@ impl ParentWf {
         if let Expectation::StartFailure = expectation {
             match start_res {
                 Err(ChildWorkflowStartError::StartFailed { .. }) => return Ok(()),
-                _ => return Err(anyhow!("Expected start failure").into()),
+                _ => {
+                    return Err(
+                        temporalio_sdk::ApplicationFailure::new("Expected start failure").into(),
+                    );
+                }
             }
         }
         let started = start_res?;
@@ -919,7 +922,7 @@ impl ParentWf {
                 assert_eq!(failure.workflow_type(), Some("child"));
                 Ok(())
             }
-            _ => Err(anyhow!("Unexpected child WF status").into()),
+            _ => Err(temporalio_sdk::ApplicationFailure::new("Unexpected child WF status").into()),
         }
     }
 }
@@ -1019,7 +1022,7 @@ impl CancelBeforeSendWf {
         start.cancel();
         match start.await {
             Err(ChildWorkflowStartError::Cancelled(_)) => Ok(()),
-            _ => Err(anyhow!("Unexpected start status").into()),
+            _ => Err(temporalio_sdk::ApplicationFailure::new("Unexpected start status").into()),
         }
     }
 }

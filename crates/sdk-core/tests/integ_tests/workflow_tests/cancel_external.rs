@@ -102,7 +102,7 @@ impl CancelSenderCanned {
         let handle = ctx.external_workflow("fake_wid", Some("fake_rid".into()));
         let res = handle.cancel(None).await;
         if res.is_err() {
-            Err(anyhow::anyhow!("Cancel fail!").into())
+            Err(temporalio_sdk::ApplicationFailure::new("Cancel fail!").into())
         } else {
             Ok(())
         }

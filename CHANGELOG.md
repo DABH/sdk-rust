@@ -30,6 +30,8 @@ to docs, or any other relevant information.
 ### Breaking Changes :boom:
 * `Worker::run` now returns `WorkerRunError` instead of `anyhow::Error`.
   Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.
+* Public error types no longer expose `anyhow::Error`. Error sources are boxed standard errors,
+  and conversions from `anyhow::Error` have been removed.
 * `CancellableFuture` and `CancellableFutureWithReason` now use the inherited `Future::Output`
   associated type instead of a generic output parameter.
 * `TimerOptions` is now tagged with `#[non_exhaustive]`. Use

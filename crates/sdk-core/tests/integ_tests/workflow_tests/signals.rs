@@ -269,7 +269,7 @@ impl SignalSenderCanned {
             )
             .await;
         if res.is_err() {
-            Err(anyhow::anyhow!("Signal fail!").into())
+            Err(temporalio_sdk::ApplicationFailure::new("Signal fail!").into())
         } else {
             Ok(())
         }

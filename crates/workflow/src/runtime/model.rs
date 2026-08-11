@@ -235,12 +235,6 @@ impl WorkflowTermination {
     }
 }
 
-impl From<anyhow::Error> for WorkflowTermination {
-    fn from(err: anyhow::Error) -> Self {
-        Self::Failed(err.into())
-    }
-}
-
 impl From<WorkflowCancellationError> for WorkflowTermination {
     fn from(_value: WorkflowCancellationError) -> Self {
         Self::Cancelled

@@ -2,7 +2,6 @@ use crate::{
     common::{CoreWfStarter, WorkflowHandleExt, rand_6_chars},
     integ_tests::mk_nexus_endpoint,
 };
-use anyhow::anyhow;
 use assert_matches::assert_matches;
 use std::{
     sync::{
@@ -301,7 +300,7 @@ impl AsyncCompleter {
                 ctx.cancelled().await;
                 Err(WorkflowTermination::Cancelled)
             }
-            _ => Err(anyhow!("broken").into()),
+            _ => Err(temporalio_sdk::ApplicationFailure::new("broken").into()),
         }
     }
 }

@@ -10,6 +10,7 @@ use std::{
 };
 use temporalio_common::{
     data_converters::DataConverter,
+    error::ApplicationFailure,
     protos::{
         coresdk::{
             workflow_activation::{
@@ -656,8 +657,8 @@ impl Future for WorkflowFuture {
                     Poll::Ready(a) => match a {
                         Some(act) => act,
                         None => {
-                            return Poll::Ready(Err(anyhow!(
-                                "Workflow future's activation channel was lost!"
+                            return Poll::Ready(Err(ApplicationFailure::new(
+                                "Workflow future's activation channel was lost!",
                             )
                             .into()));
                         }
