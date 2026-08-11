@@ -20,6 +20,8 @@ to docs, or any other relevant information.
 ## Unreleased
 
 ### Added
+* Core workflow processing can run on a caller-driven Tokio `LocalSet` on `wasm32` targets where
+  native threads are unavailable.
 * Native client transport, runtime, and host-environment dependencies can now be disabled so Core
   workers can run behind a callback transport on WASM hosts.
 * Worker heartbeats now report the SDK runtime, hosting environments, operating system, and
