@@ -25,10 +25,13 @@ to docs, or any other relevant information.
 * Native client transport, runtime, and host-environment dependencies can now be disabled so Core
   workers can run behind a callback transport on WASM hosts.
 * The WASM bridge now exports `temporal_core_init_with_worker_options` for explicit workflow
-  worker capacity configuration and supports multiple concurrent workflow activation completions via
-  ID-keyed completion operations. Runtime progress calls now drain ready work without the previous
-  fixed one-millisecond delay. The superseded init, tick, and no-ID workflow completion exports were
-  removed.
+  worker capacity configuration and supports multiple concurrent workflow activation and activity
+  task completions via ID-keyed completion operations. Runtime progress calls now drain ready work
+  without the previous fixed one-millisecond delay. `temporal_core_take_*` operations for poll
+  results, keyed completion results, and queued gRPC requests now return `BRIDGE_BUFFER_TOO_SMALL`
+  (`2`) with the required byte length when the host buffer is undersized, and they retain the
+  ready result/request so the host can retry without duplicating side effects. The superseded init,
+  tick, and no-ID workflow/activity completion exports were removed.
 * Worker heartbeats now report the SDK runtime, hosting environments, operating system, and
   architecture once per worker, retrying until the first successful delivery. Runtime options can
   disable this reporting, and language SDK bridges can supply their own runtime details. The Rust
@@ -89,11 +92,14 @@ to docs, or any other relevant information.
   custom cancellation token.
 
 ### Changed
+* The WASM bridge no longer clears guest allocations that are immediately populated by the host.
 * Cancellation errors propagated after workflow cancellation now complete the workflow as cancelled
   instead of failed.
 * The default `tls-ring` build no longer pulls in `aws-lc-rs`. `tls-aws-lc` builds are unchanged.
 
 ### Fixed
+* The WASM callback transport now preserves unary gRPC response metadata and structured status
+  details when responses cross the host bridge.
 * Panics from update validators now reject the update instead of repeatedly failing workflow
   tasks.
 
