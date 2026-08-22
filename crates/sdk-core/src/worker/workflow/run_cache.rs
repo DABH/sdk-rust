@@ -67,6 +67,7 @@ impl RunCache {
         let metrics = self
             .metrics
             .with_new_attrs([workflow_type(pwft.work.workflow_type.clone())]);
+        let record_first_wft_flags = pwft.paginator.should_record_first_wft_flags();
         let (mrh, rur) = ManagedRun::new(
             RunBasics {
                 worker_config: self.worker_config.clone(),
@@ -78,6 +79,7 @@ impl RunCache {
                 capabilities: &self.server_capabilities,
                 sdk_name: &self.sdk_name_and_version.0,
                 sdk_version: &self.sdk_name_and_version.1,
+                record_first_wft_flags,
             },
             pwft,
             self.local_activity_request_sink.clone(),

@@ -20,7 +20,7 @@ use crate::{
         MeteredPermitDealer, TrackedOwnedMeteredSemPermit, UsedMeteredSemPermit, dbg_panic,
         take_cell::TakeCell,
     },
-    internal_flags::InternalFlags,
+    internal_flags::{CoreInternalFlags, InternalFlags, use_wft_chunking_v2_opt_in},
     pollers::TrackedPermittedTqResp,
     protosext::{ValidPollWFTQResponse, protocol_messages::IncomingProtocolMessage},
     telemetry::{
@@ -33,7 +33,7 @@ use crate::{
         activities::{ActivitiesFromWFTsHandle, LocalActivityManager},
         client::{LegacyQueryResult, WorkerClient, WorkflowTaskCompletion},
         workflow::{
-            history_update::HistoryPaginator,
+            history_update::{HistoryPaginator, WFTChunkingVersionRegistry},
             machines::MachineError,
             managed_run::RunUpdateAct,
             wft_extraction::{HistoryFetchReq, WFTExtractor, WFTStreamIn},
@@ -139,6 +139,7 @@ pub(crate) struct Workflows {
     local_act_mgr: Option<Arc<LocalActivityManager>>,
     ever_polled: AtomicBool,
     default_versioning_behavior: Option<VersioningBehavior>,
+    chunking_versions: WFTChunkingVersionRegistry,
 }
 
 pub(crate) struct WorkflowBasics {
@@ -161,6 +162,7 @@ pub(crate) struct RunBasics<'a> {
     pub(crate) capabilities: &'a get_system_info_response::Capabilities,
     pub(crate) sdk_name: &'a str,
     pub(crate) sdk_version: &'a str,
+    pub(crate) record_first_wft_flags: bool,
 }
 
 impl Workflows {
@@ -177,6 +179,11 @@ impl Workflows {
         activity_tasks_handle: Option<ActivitiesFromWFTsHandle>,
         tracing_sub: Option<Arc<dyn Subscriber + Send + Sync>>,
     ) -> Self {
+        if use_wft_chunking_v2_opt_in() && !basics.server_capabilities.sdk_metadata {
+            warn!(
+                "TEMPORAL_USE_WFT_CHUNKING_V2 is enabled, but the server does not advertise SDK metadata support; new workflow runs will remain on WFT chunking v1"
+            );
+        }
         let (local_tx, local_rx) = unbounded_channel();
         let (fetch_tx, fetch_rx) = unbounded_channel();
         let shutdown_tok = basics.shutdown_token.clone();
@@ -185,11 +192,13 @@ impl Workflows {
             .worker_config
             .max_eager_activity_reservations_per_workflow_task;
         let default_versioning_behavior = basics.default_versioning_behavior;
+        let chunking_versions = WFTChunkingVersionRegistry::default();
         let extracted_wft_stream = WFTExtractor::build(
             client.clone(),
             basics.worker_config.fetching_concurrency,
             wft_stream,
             UnboundedReceiverStream::new(fetch_rx),
+            chunking_versions.clone(),
         );
         let locals_stream = if let Some(hb_rx) = heartbeat_timeout_rx {
             Either::Left(stream::select(
@@ -276,6 +285,7 @@ impl Workflows {
             local_act_mgr,
             ever_polled: AtomicBool::new(false),
             default_versioning_behavior,
+            chunking_versions,
         }
     }
 
@@ -340,16 +350,21 @@ impl Workflows {
                 },
                 WorkflowStreamAction::FailUnstoredWft {
                     run_id,
-                    task_token,
+                    task,
                     cause,
-                    failure,
+                    mut failure,
                 } => {
-                    self.handle_activation_failed(
-                        &run_id,
-                        Instant::now(),
-                        FailedActivationWFTReport::Report(task_token, cause, failure),
-                    )
-                    .await;
+                    let report = match task {
+                        AutoReplyTask::Workflow(task_token) => {
+                            FailedActivationWFTReport::Report(task_token, cause, failure)
+                        }
+                        AutoReplyTask::LegacyQuery(task_token) => {
+                            failure.force_cause = cause as i32;
+                            FailedActivationWFTReport::ReportLegacyQueryFailure(task_token, failure)
+                        }
+                    };
+                    self.handle_activation_failed(&run_id, Instant::now(), report)
+                        .await;
                 }
             }
         }
@@ -415,6 +430,10 @@ impl Workflows {
                     completion.return_new_workflow_task = false;
                 }
                 completion.sticky_attributes = sticky_attrs;
+                let used_chunking_v2 = completion
+                    .sdk_metadata
+                    .core_used_flags
+                    .contains(&(CoreInternalFlags::WftChunkingV2 as u32));
 
                 let mut reset_last_started_to = None;
                 self.handle_wft_reporting_errs(run_id, || async {
@@ -425,6 +444,9 @@ impl Workflows {
                             }
                             if response.reset_history_event_id > 0 {
                                 reset_last_started_to = Some(response.reset_history_event_id);
+                            } else {
+                                self.chunking_versions
+                                    .record_successful_completion(run_id, used_chunking_v2);
                             }
                             if let Some(wft) = response.workflow_task {
                                 *wft_from_complete = Some(validate_wft(wft)?);
@@ -609,7 +631,13 @@ impl Workflows {
             .await;
 
         let maybe_pwft = if let Some(wft) = wft_from_complete {
-            match HistoryPaginator::from_poll(wft, self.client.clone()).await {
+            match HistoryPaginator::from_poll(
+                wft,
+                self.client.clone(),
+                self.chunking_versions.clone(),
+            )
+            .await
+            {
                 Ok((paginator, wft)) => Some(WFTWithPaginator { wft, paginator }),
                 Err(e) => {
                     self.request_eviction(
@@ -934,12 +962,11 @@ struct WFStreamOutput {
 #[derive(Debug, derive_more::Display)]
 enum WorkflowStreamAction {
     Activation(ActivationOrAuto),
-    /// Fail a WFT that could not be associated with a run and therefore cannot use the normal
-    /// activation completion path.
+    /// Fail a task that was never stored on its run and cannot use the activation completion path.
     #[display("FailUnstoredWft(run_id={run_id})")]
     FailUnstoredWft {
         run_id: String,
-        task_token: TaskToken,
+        task: AutoReplyTask,
         cause: WorkflowTaskFailedCause,
         failure: Failure,
     },
@@ -1181,6 +1208,20 @@ impl TaskStorageMetrics {
         Self {
             download: completion.payload_download_metrics.clone(),
             upload: completion.payload_upload_metrics.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum AutoReplyTask {
+    Workflow(TaskToken),
+    LegacyQuery(TaskToken),
+}
+
+impl AutoReplyTask {
+    fn into_task_token(self) -> TaskToken {
+        match self {
+            Self::Workflow(task_token) | Self::LegacyQuery(task_token) => task_token,
         }
     }
 }

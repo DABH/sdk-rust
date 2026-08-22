@@ -1,6 +1,6 @@
 use crate::{
     PollError, PollWorkflowOptions, Worker, advance_fut,
-    internal_flags::CoreInternalFlags,
+    internal_flags::{CoreInternalFlags, use_wft_chunking_v2_opt_in},
     job_assert,
     replay::{TestHistoryBuilder, canned_histories, default_act_sched, default_wes_attribs},
     test_help::{
@@ -2609,15 +2609,19 @@ async fn core_internal_flags() {
         mock_worker_client(),
     );
     mh.completion_mock_fn = Some(Box::new(move |c| {
+        let mut expected: HashSet<_> = CoreInternalFlags::all_cumulative_default_enabled()
+            .map(|f| f as u32)
+            .collect();
+        if use_wft_chunking_v2_opt_in() {
+            expected.insert(CoreInternalFlags::WftChunkingV2 as u32);
+        }
         assert_eq!(
             c.sdk_metadata
                 .core_used_flags
                 .iter()
                 .copied()
                 .collect::<HashSet<_>>(),
-            CoreInternalFlags::all_except_too_high()
-                .map(|f| f as u32)
-                .collect()
+            expected
         );
         Ok(Default::default())
     }));
@@ -2628,6 +2632,47 @@ async fn core_internal_flags() {
     let act = core.poll_workflow_activation().await.unwrap();
     core.complete_execution(&act.run_id).await;
     core.shutdown().await;
+}
+
+#[tokio::test]
+async fn unknown_first_completion_flag_fails_polled_task() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_workflow_task_scheduled_and_started();
+    t.modify_event(4, |event| {
+        let Some(history_event::Attributes::WorkflowTaskCompletedEventAttributes(attrs)) =
+            event.attributes.as_mut()
+        else {
+            panic!("event 4 must be WorkflowTaskCompleted");
+        };
+        attrs
+            .sdk_metadata
+            .get_or_insert_default()
+            .core_used_flags
+            .push(1_000_000);
+    });
+    let mut mh = MockPollCfg::from_resp_batches(
+        "unknown-chunker",
+        t,
+        [ResponseType::AllHistory, ResponseType::AllHistory],
+        mock_worker_client(),
+    );
+    mh.num_expected_completions = Some(TimesRange::from(0));
+    mh.num_expected_fails = 2;
+    mh.expect_fail_wft_matcher = Box::new(|_, cause, failure| {
+        *cause == WorkflowTaskFailedCause::NonDeterministicError
+            && failure.as_ref().is_some_and(|failure| {
+                failure.message.contains("1000000") && failure.message.contains("event 4")
+            })
+    });
+    let worker = mock_worker(build_mock_pollers(mh));
+
+    assert_matches!(
+        worker.poll_workflow_activation().await,
+        Err(PollError::ShutDown)
+    );
+    worker.shutdown().await;
 }
 
 #[tokio::test]
