@@ -264,7 +264,7 @@ impl WorkflowMachines {
             basics.capabilities,
             basics.sdk_name.to_owned(),
             basics.sdk_version.to_owned(),
-            basics.record_first_wft_flags,
+            basics.record_wft_chunking_v2,
         );
         // Peek ahead to determine used flags in the first WFT.
         if let Some(attrs) = basics.history.peek_next_wft_completed(0) {

@@ -64,6 +64,7 @@ impl WFStream {
     /// manager), which is a quite substantial change.
     pub(super) fn build(
         basics: WorkflowBasics,
+        may_record_wft_chunking_v2: bool,
         wft_stream: impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static,
         local_rx: impl Stream<Item = LocalInput> + Send + 'static,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
@@ -78,12 +79,18 @@ impl WFStream {
             // Priority always goes to the local stream
             |_: &mut ()| PollNext::Left,
         );
-        Self::build_internal(all_inputs, basics, local_activity_request_sink)
+        Self::build_internal(
+            all_inputs,
+            basics,
+            may_record_wft_chunking_v2,
+            local_activity_request_sink,
+        )
     }
 
     fn build_internal(
         all_inputs: impl Stream<Item = WFStreamInput>,
         basics: WorkflowBasics,
+        may_record_wft_chunking_v2: bool,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
     ) -> impl Stream<Item = Result<WFStreamOutput, PollError>> {
         let mut state = WFStream {
@@ -92,6 +99,7 @@ impl WFStream {
                 basics.worker_config.clone(),
                 (basics.sdk_name.clone(), basics.sdk_version.clone()),
                 basics.server_capabilities,
+                may_record_wft_chunking_v2,
                 local_activity_request_sink,
                 basics.metrics.clone(),
             ),

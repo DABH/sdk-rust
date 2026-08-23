@@ -1,10 +1,7 @@
 //! Utilities for and tracking of internal versions which alter history in incompatible ways
 //! so that we can use older code paths for workflows executed on older core versions.
 
-use std::{
-    collections::{BTreeSet, HashSet},
-    sync::OnceLock,
-};
+use std::collections::{BTreeSet, HashSet};
 use temporalio_common::protos::temporal::api::{
     history::v1::WorkflowTaskCompletedEventAttributes, sdk::v1::WorkflowTaskCompletedMetadata,
     workflowservice::v1::get_system_info_response,
@@ -62,13 +59,10 @@ impl InternalFlags {
         server_capabilities: &get_system_info_response::Capabilities,
         sdk_name: String,
         sdk_version: String,
-        record_first_wft_flags: bool,
+        record_wft_chunking_v2: bool,
     ) -> Self {
         let mut core_since_last_complete = HashSet::new();
-        if server_capabilities.sdk_metadata
-            && record_first_wft_flags
-            && use_wft_chunking_v2_opt_in()
-        {
+        if server_capabilities.sdk_metadata && record_wft_chunking_v2 {
             core_since_last_complete.insert(CoreInternalFlags::WftChunkingV2);
         }
         Self {
@@ -223,19 +217,6 @@ impl CoreInternalFlags {
     }
 }
 
-const USE_WFT_CHUNKING_V2_ENV_VAR: &str = "TEMPORAL_USE_WFT_CHUNKING_V2";
-
-fn parse_wft_chunking_v2_opt_in(value: Option<&str>) -> bool {
-    value.is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "true" | "1"))
-}
-
-pub(crate) fn use_wft_chunking_v2_opt_in() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        parse_wft_chunking_v2_opt_in(std::env::var(USE_WFT_CHUNKING_V2_ENV_VAR).ok().as_deref())
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,16 +283,6 @@ mod tests {
     }
 
     #[test]
-    fn chunking_v2_opt_in_requires_explicit_truthy_value() {
-        for value in [Some("true"), Some("TRUE"), Some("1")] {
-            assert!(parse_wft_chunking_v2_opt_in(value));
-        }
-        for value in [None, Some(""), Some("false"), Some("0"), Some("yes")] {
-            assert!(!parse_wft_chunking_v2_opt_in(value));
-        }
-    }
-
-    #[test]
     fn chunking_v2_stays_staged_until_first_completion_is_observed() {
         let mut flags = InternalFlags::new(
             &Capabilities {
@@ -320,11 +291,8 @@ mod tests {
             },
             "name".to_string(),
             "ver".to_string(),
-            false,
+            true,
         );
-        flags
-            .core_since_last_complete
-            .insert(CoreInternalFlags::WftChunkingV2);
 
         assert_eq!(
             flags.gather_for_wft_complete().core_used_flags,

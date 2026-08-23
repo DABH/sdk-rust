@@ -1153,7 +1153,7 @@ fn find_end_index_of_next_wft_seq_v2(
     if events.is_empty() {
         return NextWFTSeqEndIndex::Incomplete(0);
     }
-    let incomplete = || NextWFTSeqEndIndex::Incomplete(events.len() - 1);
+    let incomplete = NextWFTSeqEndIndex::Incomplete(events.len() - 1);
     let mut ix = events
         .iter()
         .position(|event| event.event_id > from_event_id)
@@ -1171,7 +1171,7 @@ fn find_end_index_of_next_wft_seq_v2(
             ix += 1;
         }
         if ix == events.len() && !has_last_wft {
-            return incomplete();
+            return incomplete;
         }
     }
 
@@ -1179,7 +1179,7 @@ fn find_end_index_of_next_wft_seq_v2(
         let event_type = events[ix].event_type();
         if events[ix].is_final_wf_execution_event() {
             if ix + 1 == events.len() && !has_last_wft {
-                return incomplete();
+                return incomplete;
             }
             return NextWFTSeqEndIndex::Complete(ix);
         }
@@ -1191,32 +1191,35 @@ fn find_end_index_of_next_wft_seq_v2(
             continue;
         }
 
+        // At this point `ix` identifies a WFT Started event. Its outcome is the immediately
+        // following event; looking beyond that pair is safe only after matching the outcome.
         let started_ix = ix;
         match events.get(ix + 1).map(HistoryEvent::event_type) {
             None => {
                 return if has_last_wft {
                     NextWFTSeqEndIndex::Complete(started_ix)
                 } else {
-                    incomplete()
+                    incomplete
                 };
             }
             Some(WorkflowTaskFailed | WorkflowTaskTimedOut) => {
+                // A failed attempt has no command batch or durable workflow decision. Consume its
+                // Started/outcome pair and keep scanning into the retry's logical WFT.
                 ix += 2;
                 continue;
             }
             Some(WorkflowTaskCompleted) => {}
-            Some(_) if events[ix + 1].is_final_wf_execution_event() => {
-                return NextWFTSeqEndIndex::Complete(started_ix);
-            }
             Some(_) => return NextWFTSeqEndIndex::Complete(started_ix),
         }
 
+        // The match above proved `ix + 1` is this attempt's Completed event, making `ix + 2` the
+        // first event after the completion.
         let after_completion = ix + 2;
         let Some(after_type) = events.get(after_completion).map(HistoryEvent::event_type) else {
             return if has_last_wft {
                 NextWFTSeqEndIndex::Complete(started_ix)
             } else {
-                incomplete()
+                incomplete
             };
         };
 
@@ -1232,7 +1235,7 @@ fn find_end_index_of_next_wft_seq_v2(
                 command_ix += 1;
             }
             if command_ix == events.len() && !has_last_wft {
-                return incomplete();
+                return incomplete;
             }
             return NextWFTSeqEndIndex::Complete(started_ix);
         }
@@ -1240,10 +1243,12 @@ fn find_end_index_of_next_wft_seq_v2(
             return NextWFTSeqEndIndex::Complete(started_ix);
         }
 
+        // Reaching here proved `after_completion` is Scheduled, whose matching Started event must
+        // immediately follow it.
         let successor_ix = after_completion + 1;
         if events.get(successor_ix).map(HistoryEvent::event_type) != Some(WorkflowTaskStarted) {
             return if successor_ix == events.len() && !has_last_wft {
-                incomplete()
+                incomplete
             } else {
                 NextWFTSeqEndIndex::Complete(started_ix)
             };
@@ -1251,7 +1256,7 @@ fn find_end_index_of_next_wft_seq_v2(
         match events.get(successor_ix + 1).map(HistoryEvent::event_type) {
             None => {
                 return if !has_last_wft {
-                    incomplete()
+                    incomplete
                 } else if has_pending_speculative_updates {
                     NextWFTSeqEndIndex::Complete(started_ix)
                 } else {
@@ -1262,6 +1267,8 @@ fn find_end_index_of_next_wft_seq_v2(
             Some(_) => return NextWFTSeqEndIndex::Complete(started_ix),
         }
 
+        // The preceding match proved `successor_ix + 1` is Completed, so commands emitted by that
+        // successor begin at `successor_ix + 2`.
         let mut command_ix = successor_ix + 2;
         let mut preserve_boundary = false;
         while let Some(command) = events.get(command_ix) {
@@ -1276,7 +1283,7 @@ fn find_end_index_of_next_wft_seq_v2(
             command_ix += 1;
         }
         if command_ix == events.len() && !has_last_wft {
-            return incomplete();
+            return incomplete;
         }
         if preserve_boundary {
             return NextWFTSeqEndIndex::Complete(started_ix);
@@ -1284,7 +1291,7 @@ fn find_end_index_of_next_wft_seq_v2(
         ix = successor_ix;
     }
 
-    incomplete()
+    incomplete
 }
 
 #[cfg(test)]

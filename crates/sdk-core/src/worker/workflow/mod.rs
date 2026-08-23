@@ -20,7 +20,7 @@ use crate::{
         MeteredPermitDealer, TrackedOwnedMeteredSemPermit, UsedMeteredSemPermit, dbg_panic,
         take_cell::TakeCell,
     },
-    internal_flags::{CoreInternalFlags, InternalFlags, use_wft_chunking_v2_opt_in},
+    internal_flags::{CoreInternalFlags, InternalFlags},
     pollers::TrackedPermittedTqResp,
     protosext::{ValidPollWFTQResponse, protocol_messages::IncomingProtocolMessage},
     telemetry::{
@@ -54,7 +54,7 @@ use std::{
     ops::DerefMut,
     rc::Rc,
     result,
-    sync::{Arc, atomic, atomic::AtomicBool},
+    sync::{Arc, OnceLock, atomic, atomic::AtomicBool},
     thread,
     time::{Duration, Instant},
 };
@@ -111,6 +111,20 @@ pub const LEGACY_QUERY_ID: &str = "legacy_query";
 /// What percentage of a WFT timeout we are willing to wait before sending a WFT heartbeat when
 /// necessary.
 const WFT_HEARTBEAT_TIMEOUT_FRACTION: f32 = 0.8;
+const USE_WFT_CHUNKING_V2_ENV_VAR: &str = "TEMPORAL_USE_WFT_CHUNKING_V2";
+
+fn parse_wft_chunking_v2_opt_in(value: Option<&str>) -> bool {
+    value.is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "true" | "1"))
+}
+
+fn use_wft_chunking_v2_opt_in() -> bool {
+    // Workers in one process must not choose different rollout policies if the environment is
+    // mutated after the first worker is constructed.
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        parse_wft_chunking_v2_opt_in(std::env::var(USE_WFT_CHUNKING_V2_ENV_VAR).ok().as_deref())
+    })
+}
 
 type Result<T, E = WFMachinesError> = result::Result<T, E>;
 type BoxedActivationStream = BoxStream<'static, Result<WorkflowStreamAction, PollError>>;
@@ -162,7 +176,7 @@ pub(crate) struct RunBasics<'a> {
     pub(crate) capabilities: &'a get_system_info_response::Capabilities,
     pub(crate) sdk_name: &'a str,
     pub(crate) sdk_version: &'a str,
-    pub(crate) record_first_wft_flags: bool,
+    pub(crate) record_wft_chunking_v2: bool,
 }
 
 impl Workflows {
@@ -179,11 +193,14 @@ impl Workflows {
         activity_tasks_handle: Option<ActivitiesFromWFTsHandle>,
         tracing_sub: Option<Arc<dyn Subscriber + Send + Sync>>,
     ) -> Self {
-        if use_wft_chunking_v2_opt_in() && !basics.server_capabilities.sdk_metadata {
+        let wft_chunking_v2_opt_in = use_wft_chunking_v2_opt_in();
+        if wft_chunking_v2_opt_in && !basics.server_capabilities.sdk_metadata {
             warn!(
                 "TEMPORAL_USE_WFT_CHUNKING_V2 is enabled, but the server does not advertise SDK metadata support; new workflow runs will remain on WFT chunking v1"
             );
         }
+        let may_record_wft_chunking_v2 =
+            wft_chunking_v2_opt_in && basics.server_capabilities.sdk_metadata;
         let (local_tx, local_rx) = unbounded_channel();
         let (fetch_tx, fetch_rx) = unbounded_channel();
         let shutdown_tok = basics.shutdown_token.clone();
@@ -240,6 +257,7 @@ impl Workflows {
 
                     let mut stream = WFStream::build(
                         basics,
+                        may_record_wft_chunking_v2,
                         extracted_wft_stream,
                         locals_stream,
                         local_activity_request_sink,
@@ -1921,6 +1939,16 @@ mod tests {
         payload_limits::{LimitClass, LimitSeverity},
         protos::coresdk::workflow_activation::SignalWorkflow,
     };
+
+    #[test]
+    fn chunking_v2_opt_in_requires_explicit_truthy_value() {
+        for value in [Some("true"), Some("TRUE"), Some("1")] {
+            assert!(parse_wft_chunking_v2_opt_in(value));
+        }
+        for value in [None, Some(""), Some("false"), Some("0"), Some("yes")] {
+            assert!(!parse_wft_chunking_v2_opt_in(value));
+        }
+    }
 
     #[test]
     fn task_storage_metrics_from_completion_keeps_directions_distinct() {

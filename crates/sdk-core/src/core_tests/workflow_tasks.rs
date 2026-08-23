@@ -1,6 +1,6 @@
 use crate::{
     PollError, PollWorkflowOptions, Worker, advance_fut,
-    internal_flags::{CoreInternalFlags, use_wft_chunking_v2_opt_in},
+    internal_flags::CoreInternalFlags,
     job_assert,
     replay::{TestHistoryBuilder, canned_histories, default_act_sched, default_wes_attribs},
     test_help::{
@@ -2612,7 +2612,10 @@ async fn core_internal_flags() {
         let mut expected: HashSet<_> = CoreInternalFlags::all_cumulative_default_enabled()
             .map(|f| f as u32)
             .collect();
-        if use_wft_chunking_v2_opt_in() {
+        if std::env::var("TEMPORAL_USE_WFT_CHUNKING_V2")
+            .ok()
+            .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "true" | "1"))
+        {
             expected.insert(CoreInternalFlags::WftChunkingV2 as u32);
         }
         assert_eq!(
