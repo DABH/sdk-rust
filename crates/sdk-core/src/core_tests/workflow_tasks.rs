@@ -15,6 +15,7 @@ use crate::{
         PollerBehavior, SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext,
         SlotSupplier, SlotSupplierPermit, TunerBuilder, WorkflowSlotKind,
         client::mocks::{mock_manual_worker_client, mock_worker_client},
+        parse_wft_chunking_v2_opt_in,
     },
 };
 use futures_util::{FutureExt, stream};
@@ -2612,10 +2613,11 @@ async fn core_internal_flags() {
         let mut expected: HashSet<_> = CoreInternalFlags::all_cumulative_default_enabled()
             .map(|f| f as u32)
             .collect();
-        if std::env::var("TEMPORAL_USE_WFT_CHUNKING_V2")
-            .ok()
-            .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "true" | "1"))
-        {
+        if parse_wft_chunking_v2_opt_in(
+            std::env::var("TEMPORAL_USE_WFT_CHUNKING_V2")
+                .ok()
+                .as_deref(),
+        ) {
             expected.insert(CoreInternalFlags::WftChunkingV2 as u32);
         }
         assert_eq!(

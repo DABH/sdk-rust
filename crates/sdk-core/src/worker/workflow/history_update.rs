@@ -34,6 +34,7 @@ static EMPTY_TASK_ERR: LazyLock<tonic::Status> = LazyLock::new(|| {
 });
 // A server RPC may use the same tonic code, so only errors marked locally are nondeterminism.
 const INCOMPATIBLE_HISTORY_STATUS_KEY: &str = "temporal-incompatible-history";
+const CHUNKING_VERSION_REGISTRY_PRUNE_INTERVAL: usize = 1024;
 
 pub(crate) fn is_incompatible_history_status(status: &tonic::Status) -> bool {
     status
@@ -112,8 +113,10 @@ enum WFTChunkingVersion {
 
 type WFTChunkingVersionLatch = Arc<Mutex<WFTChunkingVersion>>;
 
-/// Keeps the one-time version choice available while a run is cached. Dead entries are pruned on
-/// lookup so the registry does not retain completed run IDs.
+/// Shares the one-time version choice among same-run paginators and the successful-completion
+/// path. Cached and in-flight paginators own the strong references so the registry cannot keep
+/// completed runs alive; periodic pruning removes the run IDs left behind by expired weak
+/// references.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WFTChunkingVersionRegistry {
     inner: Arc<Mutex<WFTChunkingVersionRegistryInner>>,
@@ -129,10 +132,9 @@ impl WFTChunkingVersionRegistry {
     fn get_or_create(&self, run_id: &str) -> WFTChunkingVersionLatch {
         let mut inner = self.inner.lock();
         inner.lookups_since_prune += 1;
-        // Most entries are live for the cache lifetime, so scanning the entire registry on every
-        // poll would make task intake quadratic in cache size. Periodic pruning bounds stale IDs
-        // while keeping the ordinary lookup constant-time.
-        if inner.lookups_since_prune >= 1024 {
+        // A full scan on every poll would make task intake quadratic in cache size. Amortizing it
+        // bounds newly accumulated dead IDs while keeping ordinary lookups constant-time.
+        if inner.lookups_since_prune >= CHUNKING_VERSION_REGISTRY_PRUNE_INTERVAL {
             inner
                 .versions
                 .retain(|_, version| version.strong_count() > 0);
@@ -1191,8 +1193,8 @@ fn find_end_index_of_next_wft_seq_v2(
             continue;
         }
 
-        // At this point `ix` identifies a WFT Started event. Its outcome is the immediately
-        // following event; looking beyond that pair is safe only after matching the outcome.
+        // The WFT outcome is adjacent at `ix + 1`. Failed and timed-out attempts have no durable
+        // workflow decision, so their retry remains in the same logical sequence.
         let started_ix = ix;
         match events.get(ix + 1).map(HistoryEvent::event_type) {
             None => {
@@ -1203,8 +1205,6 @@ fn find_end_index_of_next_wft_seq_v2(
                 };
             }
             Some(WorkflowTaskFailed | WorkflowTaskTimedOut) => {
-                // A failed attempt has no command batch or durable workflow decision. Consume its
-                // Started/outcome pair and keep scanning into the retry's logical WFT.
                 ix += 2;
                 continue;
             }
@@ -1212,8 +1212,8 @@ fn find_end_index_of_next_wft_seq_v2(
             Some(_) => return NextWFTSeqEndIndex::Complete(started_ix),
         }
 
-        // The match above proved `ix + 1` is this attempt's Completed event, making `ix + 2` the
-        // first event after the completion.
+        // Commands, if any, begin at `ix + 2`; defer at a page edge until their contiguous batch
+        // is bounded.
         let after_completion = ix + 2;
         let Some(after_type) = events.get(after_completion).map(HistoryEvent::event_type) else {
             return if has_last_wft {
@@ -1243,8 +1243,8 @@ fn find_end_index_of_next_wft_seq_v2(
             return NextWFTSeqEndIndex::Complete(started_ix);
         }
 
-        // Reaching here proved `after_completion` is Scheduled, whose matching Started event must
-        // immediately follow it.
+        // An empty completion is a heartbeat candidate only when the next WFT is immediately
+        // Scheduled then Started; an intervening event preserves the current boundary.
         let successor_ix = after_completion + 1;
         if events.get(successor_ix).map(HistoryEvent::event_type) != Some(WorkflowTaskStarted) {
             return if successor_ix == events.len() && !has_last_wft {
@@ -1267,8 +1267,8 @@ fn find_end_index_of_next_wft_seq_v2(
             Some(_) => return NextWFTSeqEndIndex::Complete(started_ix),
         }
 
-        // The preceding match proved `successor_ix + 1` is Completed, so commands emitted by that
-        // successor begin at `successor_ix + 2`.
+        // Successor commands begin at `successor_ix + 2`; scan the whole batch because a later
+        // UpdateAccepted—or unknown event treated conservatively like one—preserves this boundary.
         let mut command_ix = successor_ix + 2;
         let mut preserve_boundary = false;
         while let Some(command) = events.get(command_ix) {
@@ -1303,6 +1303,7 @@ mod tests {
         worker::client::mocks::mock_worker_client,
     };
     use futures_util::TryStreamExt;
+    use std::{sync::Barrier, thread};
     use temporalio_common::protos::temporal::api::{
         common::v1::WorkflowExecution, enums::v1::WorkflowTaskFailedCause,
         sdk::v1::WorkflowTaskCompletedMetadata,
@@ -1349,6 +1350,70 @@ mod tests {
     const SCHEDULED: EventType = EventType::WorkflowTaskScheduled;
     const STARTED: EventType = EventType::WorkflowTaskStarted;
     const COMPLETED: EventType = EventType::WorkflowTaskCompleted;
+
+    #[test]
+    fn chunking_version_registry_shares_and_releases_latches() {
+        let registry = WFTChunkingVersionRegistry::default();
+        let first = registry.get_or_create("run");
+        let second = registry.get_or_create("run");
+        let first_weak = Arc::downgrade(&first);
+
+        assert!(Arc::ptr_eq(&first, &second));
+        registry.record_successful_completion("run", true);
+        assert_eq!(*first.lock(), WFTChunkingVersion::V2);
+        assert_eq!(*second.lock(), WFTChunkingVersion::V2);
+
+        drop(first);
+        drop(second);
+        assert!(first_weak.upgrade().is_none());
+        assert_eq!(
+            *registry.get_or_create("run").lock(),
+            WFTChunkingVersion::Unknown
+        );
+
+        let registry = WFTChunkingVersionRegistry::default();
+        let live = registry.get_or_create("live");
+        for index in 0..CHUNKING_VERSION_REGISTRY_PRUNE_INTERVAL - 1 {
+            drop(registry.get_or_create(&format!("dead-{index}")));
+        }
+        let inner = registry.inner.lock();
+        assert!(inner.versions.contains_key("live"));
+        assert!(!inner.versions.contains_key("dead-0"));
+        assert!(inner.versions.len() <= 2);
+        drop(inner);
+        drop(live);
+    }
+
+    #[test]
+    fn chunking_version_registry_atomically_creates_latches() {
+        const LOOKUPS: usize = 8;
+
+        let registry = WFTChunkingVersionRegistry::default();
+        let barrier = Arc::new(Barrier::new(LOOKUPS));
+        let lookups = (0..LOOKUPS)
+            .map(|_| {
+                let registry = registry.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    registry.get_or_create("run")
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let lookups = lookups
+            .into_iter()
+            .map(|lookup| lookup.join().unwrap())
+            .collect::<Vec<_>>();
+        for lookup in &lookups[1..] {
+            assert!(Arc::ptr_eq(&lookups[0], lookup));
+        }
+
+        registry.record_successful_completion("run", true);
+        for lookup in lookups {
+            assert_eq!(*lookup.lock(), WFTChunkingVersion::V2);
+        }
+    }
 
     fn history(types: &[EventType]) -> Vec<HistoryEvent> {
         types

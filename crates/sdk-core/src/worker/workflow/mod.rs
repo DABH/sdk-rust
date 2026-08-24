@@ -113,7 +113,7 @@ pub const LEGACY_QUERY_ID: &str = "legacy_query";
 const WFT_HEARTBEAT_TIMEOUT_FRACTION: f32 = 0.8;
 const USE_WFT_CHUNKING_V2_ENV_VAR: &str = "TEMPORAL_USE_WFT_CHUNKING_V2";
 
-fn parse_wft_chunking_v2_opt_in(value: Option<&str>) -> bool {
+pub(crate) fn parse_wft_chunking_v2_opt_in(value: Option<&str>) -> bool {
     value.is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "true" | "1"))
 }
 
