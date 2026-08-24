@@ -754,9 +754,9 @@ impl WorkflowMachines {
         }
         let mut delayed_actions = vec![];
         // Pre-resolve the contiguous command batch following the just-consumed completion so its
-        // effects appear in the same replay activation as they did during initial execution. V2
-        // can retain later events only to prove the chunk boundary, and those must not leak into
-        // the current activation.
+        // effects appear in the same replay activation as they did during initial execution. WFT
+        // chunking V2 can retain later events only to prove the chunk boundary, and those must
+        // not leak into the current activation.
         for e in self
             .last_history_from_server
             .peek_next_wft_commands(last_handled_wft_started_id)

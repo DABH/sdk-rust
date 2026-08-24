@@ -63,6 +63,8 @@ relevant information.
   heartbeat tasks, and paginated history. Deploy reader support before enabling
   `TEMPORAL_USE_WFT_CHUNKING_V2`; runs whose first successful Workflow Task is already complete
   remain on v1 and can adopt v2 via Continue-As-New.
+* Workflow Task chunking version state now follows cached workflow runs across sticky tasks, while
+  cache misses and evictions safely fall back to full-history replay.
 
 ## [0.7.0] - 2026-08-17
 

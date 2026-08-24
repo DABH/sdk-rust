@@ -8,15 +8,14 @@ use crate::{
 };
 use futures_util::{FutureExt, Stream, TryFutureExt, future::BoxFuture};
 use itertools::Itertools;
-use parking_lot::Mutex;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     fmt::Debug,
     future::Future,
     mem,
     mem::transmute,
     pin::Pin,
-    sync::{Arc, LazyLock, Weak},
+    sync::{Arc, LazyLock},
     task::{Context, Poll},
 };
 use temporalio_common::protos::temporal::api::{
@@ -34,7 +33,6 @@ static EMPTY_TASK_ERR: LazyLock<tonic::Status> = LazyLock::new(|| {
 });
 // A server RPC may use the same tonic code, so only errors marked locally are nondeterminism.
 const INCOMPATIBLE_HISTORY_STATUS_KEY: &str = "temporal-incompatible-history";
-const CHUNKING_VERSION_REGISTRY_PRUNE_INTERVAL: usize = 1024;
 
 pub(crate) fn is_incompatible_history_status(status: &tonic::Status) -> bool {
     status
@@ -103,72 +101,15 @@ pub(crate) enum NextWFT {
 
 /// Immutable, run-wide chunker choice. Only the first successful WFT completion can move this
 /// from `Unknown`; failed attempts do not select a version, and later metadata cannot change it.
+/// The value is owned by the cached run. Paginators carry a copy while they are in flight so they
+/// can chunk history outside the serialized workflow stream, then the run records any discovery
+/// made while reconstructing that history.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum WFTChunkingVersion {
+pub(super) enum WFTChunkingVersion {
     #[default]
     Unknown,
     V1,
     V2,
-}
-
-type WFTChunkingVersionLatch = Arc<Mutex<WFTChunkingVersion>>;
-
-/// Shares the one-time version choice among same-run paginators and the successful-completion
-/// path. Cached and in-flight paginators own the strong references so the registry cannot keep
-/// completed runs alive; periodic pruning removes the run IDs left behind by expired weak
-/// references.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct WFTChunkingVersionRegistry {
-    inner: Arc<Mutex<WFTChunkingVersionRegistryInner>>,
-}
-
-#[derive(Debug, Default)]
-struct WFTChunkingVersionRegistryInner {
-    versions: HashMap<String, Weak<Mutex<WFTChunkingVersion>>>,
-    lookups_since_prune: usize,
-}
-
-impl WFTChunkingVersionRegistry {
-    fn get_or_create(&self, run_id: &str) -> WFTChunkingVersionLatch {
-        let mut inner = self.inner.lock();
-        inner.lookups_since_prune += 1;
-        // A full scan on every poll would make task intake quadratic in cache size. Amortizing it
-        // bounds newly accumulated dead IDs while keeping ordinary lookups constant-time.
-        if inner.lookups_since_prune >= CHUNKING_VERSION_REGISTRY_PRUNE_INTERVAL {
-            inner
-                .versions
-                .retain(|_, version| version.strong_count() > 0);
-            inner.lookups_since_prune = 0;
-        }
-        if let Some(version) = inner.versions.get(run_id).and_then(Weak::upgrade) {
-            return version;
-        }
-        let version = Arc::new(Mutex::new(WFTChunkingVersion::Unknown));
-        inner
-            .versions
-            .insert(run_id.to_string(), Arc::downgrade(&version));
-        version
-    }
-
-    /// Avoids an event-1 fetch on the next sticky task after this worker successfully records the
-    /// first completion. An ambiguous response must not call this; history remains authoritative.
-    pub(crate) fn record_successful_completion(&self, run_id: &str, used_v2: bool) {
-        let version = {
-            let inner = self.inner.lock();
-            inner.versions.get(run_id).and_then(Weak::upgrade)
-        };
-        let Some(version) = version else {
-            return;
-        };
-        let mut version = version.lock();
-        if *version == WFTChunkingVersion::Unknown {
-            *version = if used_v2 {
-                WFTChunkingVersion::V2
-            } else {
-                WFTChunkingVersion::V1
-            };
-        }
-    }
 }
 
 #[derive(derive_more::Debug)]
@@ -188,10 +129,9 @@ pub(crate) struct HistoryPaginator {
     final_events: Vec<HistoryEvent>,
     has_pending_speculative_updates: bool,
     use_chunking_v2: bool,
-    chunking_version: WFTChunkingVersionLatch,
+    chunking_version: WFTChunkingVersion,
     can_select_chunking_version: bool,
     should_record_first_wft_flags: bool,
-    requires_full_history_for_chunking_version: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -221,7 +161,7 @@ impl HistoryPaginator {
     pub(super) async fn from_poll(
         wft: ValidPollWFTQResponse,
         client: Arc<dyn WorkerClient>,
-        chunking_versions: WFTChunkingVersionRegistry,
+        cached_chunking_version: Option<WFTChunkingVersion>,
     ) -> Result<(Self, PreparedWFT), tonic::Status> {
         let empty_hist = wft.history.events.is_empty();
         let npt = if empty_hist {
@@ -230,7 +170,7 @@ impl HistoryPaginator {
             wft.next_page_token.into()
         };
         let has_pending_speculative_updates = !wft.messages.is_empty();
-        let mut paginator = HistoryPaginator::new_with_registry(
+        let mut paginator = HistoryPaginator::new_with_version(
             wft.history,
             wft.previous_started_event_id,
             wft.started_event_id,
@@ -239,23 +179,12 @@ impl HistoryPaginator {
             npt,
             client,
             has_pending_speculative_updates,
-            Some(chunking_versions),
+            cached_chunking_version,
         );
         if empty_hist && wft.legacy_query.is_none() && wft.query_requests.is_empty() {
             return Err(EMPTY_TASK_ERR.clone());
         }
-        let update = if paginator.requires_full_history_for_chunking_version {
-            // Preserve the suffix verbatim until event 1 establishes the immutable version.
-            HistoryUpdate {
-                events: mem::take(&mut paginator.final_events),
-                previous_wft_started_id: wft.previous_started_event_id,
-                wft_started_id: wft.started_event_id,
-                has_last_wft: false,
-                wft_count: 0,
-                has_pending_speculative_updates,
-                use_chunking_v2: false,
-            }
-        } else if empty_hist {
+        let update = if empty_hist {
             HistoryUpdate::from_events(
                 [],
                 wft.previous_started_event_id,
@@ -283,8 +212,6 @@ impl HistoryPaginator {
         mut req: Box<CacheMissFetchReq>,
         client: Arc<dyn WorkerClient>,
     ) -> Result<PermittedWFT, tonic::Status> {
-        let chunking_version = req.original_wft.paginator.chunking_version.clone();
-        let use_chunking_v2 = *chunking_version.lock() == WFTChunkingVersion::V2;
         let mut paginator = Self {
             wf_id: req.original_wft.work.execution.workflow_id.clone(),
             run_id: req.original_wft.work.execution.run_id.clone(),
@@ -299,11 +226,10 @@ impl HistoryPaginator {
             next_page_token: NextPageToken::FetchFromStart,
             final_events: req.original_wft.work.update.events,
             has_pending_speculative_updates: !req.original_wft.work.messages.is_empty(),
-            use_chunking_v2,
-            chunking_version,
+            use_chunking_v2: false,
+            chunking_version: WFTChunkingVersion::Unknown,
             can_select_chunking_version: true,
             should_record_first_wft_flags: false,
-            requires_full_history_for_chunking_version: false,
         };
         let first_update = paginator.extract_next_update().await?;
         req.original_wft.work.update = first_update;
@@ -321,7 +247,7 @@ impl HistoryPaginator {
         next_page_token: impl Into<NextPageToken>,
         client: Arc<dyn WorkerClient>,
     ) -> Self {
-        Self::new_with_registry(
+        Self::new_with_version(
             initial_history,
             previous_wft_started_id,
             wft_started_event_id,
@@ -330,12 +256,12 @@ impl HistoryPaginator {
             next_page_token,
             client,
             false,
-            None,
+            Some(WFTChunkingVersion::Unknown),
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn new_with_registry(
+    fn new_with_version(
         initial_history: History,
         previous_wft_started_id: i64,
         wft_started_event_id: i64,
@@ -344,26 +270,23 @@ impl HistoryPaginator {
         next_page_token: impl Into<NextPageToken>,
         client: Arc<dyn WorkerClient>,
         has_pending_speculative_updates: bool,
-        chunking_versions: Option<WFTChunkingVersionRegistry>,
+        cached_chunking_version: Option<WFTChunkingVersion>,
     ) -> Self {
         let mut next_page_token = next_page_token.into();
-        let chunking_version = chunking_versions.map_or_else(
-            || Arc::new(Mutex::new(WFTChunkingVersion::Unknown)),
-            |versions| versions.get_or_create(&run_id),
-        );
+        let chunking_version = cached_chunking_version.unwrap_or_default();
         let starts_at_beginning = initial_history
             .events
             .first()
             .is_some_and(|event| event.event_id == 1);
-        let version = *chunking_version.lock();
-        let requires_full_history_for_chunking_version = version == WFTChunkingVersion::Unknown
-            && !starts_at_beginning
-            && !matches!(next_page_token, NextPageToken::FetchFromStart);
-        if requires_full_history_for_chunking_version {
+        // A cache miss cannot use a suffix to select a version: the first completion may be in the
+        // omitted prefix. Retain the suffix and rebuild from event 1. A cached Unknown run is
+        // different: its cached prefix proves that no successful completion has selected a
+        // version, so the suffix can continue discovery without replaying the prefix.
+        if cached_chunking_version.is_none() && !starts_at_beginning {
             next_page_token = NextPageToken::FetchFromStart;
         }
         let can_select_chunking_version =
-            starts_at_beginning || matches!(next_page_token, NextPageToken::FetchFromStart);
+            cached_chunking_version.is_none_or(|version| version == WFTChunkingVersion::Unknown);
         let (event_queue, final_events) =
             if matches!(next_page_token, NextPageToken::FetchFromStart) {
                 (VecDeque::new(), initial_history.events)
@@ -381,24 +304,23 @@ impl HistoryPaginator {
             wft_started_event_id,
             id_of_last_event_in_last_extracted_update: None,
             has_pending_speculative_updates,
-            use_chunking_v2: version == WFTChunkingVersion::V2,
+            use_chunking_v2: chunking_version == WFTChunkingVersion::V2,
             chunking_version,
             can_select_chunking_version,
             should_record_first_wft_flags: false,
-            requires_full_history_for_chunking_version,
         }
     }
 
-    /// Mutates the shared selector only from an authoritative prefix beginning at event 1. Until
-    /// the first successful completion or end of history is visible, no page may be chunked: a v2
-    /// flag on a later page applies to the entire run.
+    /// Selects a local copy only when the cached run is still Unknown or reconstruction starts at
+    /// event 1. Until the first successful completion or end of history is visible, no page may be
+    /// chunked: a v2 flag on a later page applies to the entire run.
     fn discover_chunking_version(
         &mut self,
         events: &VecDeque<HistoryEvent>,
         at_end: bool,
     ) -> Result<(), tonic::Status> {
         if !self.can_select_chunking_version {
-            self.use_chunking_v2 = *self.chunking_version.lock() == WFTChunkingVersion::V2;
+            self.use_chunking_v2 = self.chunking_version == WFTChunkingVersion::V2;
             return Ok(());
         }
         let first_completion = events.iter().find_map(|event| match &event.attributes {
@@ -427,11 +349,10 @@ impl HistoryPaginator {
             } else {
                 WFTChunkingVersion::V1
             };
-            let mut shared = self.chunking_version.lock();
-            if *shared == WFTChunkingVersion::Unknown {
-                *shared = selected;
+            if self.chunking_version == WFTChunkingVersion::Unknown {
+                self.chunking_version = selected;
             }
-            self.use_chunking_v2 = *shared == WFTChunkingVersion::V2;
+            self.use_chunking_v2 = self.chunking_version == WFTChunkingVersion::V2;
             self.can_select_chunking_version = false;
         } else if at_end {
             self.should_record_first_wft_flags = true;
@@ -440,12 +361,11 @@ impl HistoryPaginator {
     }
 
     pub(crate) fn should_record_first_wft_flags(&self) -> bool {
-        self.should_record_first_wft_flags
-            && *self.chunking_version.lock() == WFTChunkingVersion::Unknown
+        self.should_record_first_wft_flags && self.chunking_version == WFTChunkingVersion::Unknown
     }
 
-    pub(crate) fn requires_full_history_for_chunking_version(&self) -> bool {
-        self.requires_full_history_for_chunking_version
+    pub(super) fn chunking_version(&self) -> WFTChunkingVersion {
+        self.chunking_version
     }
 
     /// Return at least the next two WFT sequences (as determined by the passed-in ID) as a
@@ -464,10 +384,11 @@ impl HistoryPaginator {
             self.discover_chunking_version(&current_events, no_next_page)?;
             if !no_next_page
                 && self.can_select_chunking_version
-                && *self.chunking_version.lock() == WFTChunkingVersion::Unknown
+                && self.chunking_version == WFTChunkingVersion::Unknown
             {
-                // V2 applies from event 1, so no replay boundary may escape before the first
-                // successful completion has selected the run's immutable version.
+                // The version applies from the beginning of the run, so no replay boundary may
+                // escape before the first successful completion has selected the run's immutable
+                // version.
                 self.event_queue = current_events;
                 continue;
             }
@@ -1303,7 +1224,6 @@ mod tests {
         worker::client::mocks::mock_worker_client,
     };
     use futures_util::TryStreamExt;
-    use std::{sync::Barrier, thread};
     use temporalio_common::protos::temporal::api::{
         common::v1::WorkflowExecution, enums::v1::WorkflowTaskFailedCause,
         sdk::v1::WorkflowTaskCompletedMetadata,
@@ -1350,70 +1270,6 @@ mod tests {
     const SCHEDULED: EventType = EventType::WorkflowTaskScheduled;
     const STARTED: EventType = EventType::WorkflowTaskStarted;
     const COMPLETED: EventType = EventType::WorkflowTaskCompleted;
-
-    #[test]
-    fn chunking_version_registry_shares_and_releases_latches() {
-        let registry = WFTChunkingVersionRegistry::default();
-        let first = registry.get_or_create("run");
-        let second = registry.get_or_create("run");
-        let first_weak = Arc::downgrade(&first);
-
-        assert!(Arc::ptr_eq(&first, &second));
-        registry.record_successful_completion("run", true);
-        assert_eq!(*first.lock(), WFTChunkingVersion::V2);
-        assert_eq!(*second.lock(), WFTChunkingVersion::V2);
-
-        drop(first);
-        drop(second);
-        assert!(first_weak.upgrade().is_none());
-        assert_eq!(
-            *registry.get_or_create("run").lock(),
-            WFTChunkingVersion::Unknown
-        );
-
-        let registry = WFTChunkingVersionRegistry::default();
-        let live = registry.get_or_create("live");
-        for index in 0..CHUNKING_VERSION_REGISTRY_PRUNE_INTERVAL - 1 {
-            drop(registry.get_or_create(&format!("dead-{index}")));
-        }
-        let inner = registry.inner.lock();
-        assert!(inner.versions.contains_key("live"));
-        assert!(!inner.versions.contains_key("dead-0"));
-        assert!(inner.versions.len() <= 2);
-        drop(inner);
-        drop(live);
-    }
-
-    #[test]
-    fn chunking_version_registry_atomically_creates_latches() {
-        const LOOKUPS: usize = 8;
-
-        let registry = WFTChunkingVersionRegistry::default();
-        let barrier = Arc::new(Barrier::new(LOOKUPS));
-        let lookups = (0..LOOKUPS)
-            .map(|_| {
-                let registry = registry.clone();
-                let barrier = barrier.clone();
-                thread::spawn(move || {
-                    barrier.wait();
-                    registry.get_or_create("run")
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let lookups = lookups
-            .into_iter()
-            .map(|lookup| lookup.join().unwrap())
-            .collect::<Vec<_>>();
-        for lookup in &lookups[1..] {
-            assert!(Arc::ptr_eq(&lookups[0], lookup));
-        }
-
-        registry.record_successful_completion("run", true);
-        for lookup in lookups {
-            assert_eq!(*lookup.lock(), WFTChunkingVersion::V2);
-        }
-    }
 
     fn history(types: &[EventType]) -> Vec<HistoryEvent> {
         types
@@ -1673,8 +1529,6 @@ mod tests {
             7,
             vec![CoreInternalFlags::WftChunkingV2 as u32],
         );
-        let mut selected_registry = None;
-        let mut selected_latch = None;
         for cut in 1..=events.len() {
             let mut client = mock_worker_client();
             if cut == 1 {
@@ -1715,8 +1569,7 @@ mod tests {
                         })
                     });
             }
-            let registry = WFTChunkingVersionRegistry::default();
-            let mut paginator = HistoryPaginator::new_with_registry(
+            let mut paginator = HistoryPaginator::new_with_version(
                 History {
                     events: events[..cut].to_vec(),
                 },
@@ -1727,21 +1580,18 @@ mod tests {
                 NextPageToken::Next(vec![1]),
                 Arc::new(client),
                 false,
-                Some(registry.clone()),
+                Some(WFTChunkingVersion::Unknown),
             );
             paginator.extract_next_update().await.unwrap();
             assert_eq!(
-                *paginator.chunking_version.lock(),
+                paginator.chunking_version(),
                 WFTChunkingVersion::V2,
                 "page cut {cut}"
             );
             assert!(!paginator.should_record_first_wft_flags());
-            selected_latch = Some(paginator.chunking_version.clone());
-            selected_registry = Some(registry);
         }
-        let _selected_latch = selected_latch.unwrap();
 
-        let suffix = HistoryPaginator::new_with_registry(
+        let suffix = HistoryPaginator::new_with_version(
             History {
                 events: events[4..].to_vec(),
             },
@@ -1752,10 +1602,9 @@ mod tests {
             NextPageToken::Done,
             Arc::new(mock_worker_client()),
             false,
-            selected_registry,
+            Some(WFTChunkingVersion::V2),
         );
         assert!(suffix.use_chunking_v2);
-        assert!(!suffix.requires_full_history_for_chunking_version());
 
         let mut late_flag = history(&[
             WES, SCHEDULED, STARTED, COMPLETED, SCHEDULED, STARTED, COMPLETED,
@@ -1766,8 +1615,7 @@ mod tests {
             7,
             vec![CoreInternalFlags::WftChunkingV2 as u32],
         );
-        let registry = WFTChunkingVersionRegistry::default();
-        let mut paginator = HistoryPaginator::new_with_registry(
+        let mut paginator = HistoryPaginator::new_with_version(
             History {
                 events: late_flag.clone(),
             },
@@ -1778,10 +1626,10 @@ mod tests {
             NextPageToken::Done,
             Arc::new(mock_worker_client()),
             false,
-            Some(registry),
+            Some(WFTChunkingVersion::Unknown),
         );
         paginator.extract_next_update().await.unwrap();
-        assert_eq!(*paginator.chunking_version.lock(), WFTChunkingVersion::V1);
+        assert_eq!(paginator.chunking_version(), WFTChunkingVersion::V1);
 
         set_wft_flags(&mut late_flag, 4, vec![1_000_000]);
         let mut paginator = HistoryPaginator::new(
@@ -1799,6 +1647,117 @@ mod tests {
         assert!(!is_incompatible_history_status(
             &tonic::Status::failed_precondition("server precondition")
         ));
+    }
+
+    #[tokio::test]
+    async fn cached_chunking_version_applies_to_suffix_without_fetching() {
+        let events = history(&[WES, SCHEDULED, STARTED, COMPLETED, SCHEDULED, STARTED]);
+        for version in [WFTChunkingVersion::V1, WFTChunkingVersion::V2] {
+            let mut paginator = HistoryPaginator::new_with_version(
+                History {
+                    events: events[3..].to_vec(),
+                },
+                3,
+                6,
+                "wfid".into(),
+                "runid".into(),
+                NextPageToken::Done,
+                Arc::new(mock_worker_client()),
+                false,
+                Some(version),
+            );
+            let update = paginator.extract_next_update().await.unwrap();
+            assert_eq!(paginator.chunking_version(), version);
+            assert_eq!(update.use_chunking_v2, version == WFTChunkingVersion::V2);
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_unknown_discovers_from_suffix_after_pagination() {
+        let mut events = history(&[
+            WES,
+            SCHEDULED,
+            STARTED,
+            EventType::WorkflowTaskFailed,
+            SCHEDULED,
+            STARTED,
+            COMPLETED,
+        ]);
+        set_wft_flags(
+            &mut events,
+            7,
+            vec![CoreInternalFlags::WftChunkingV2 as u32],
+        );
+        let page = events[6..].to_vec();
+        let suffix = events[4..6].to_vec();
+        let mut client = mock_worker_client();
+        client
+            .expect_get_workflow_execution_history()
+            .times(1)
+            .return_once(move |_, _, page_token| {
+                assert_eq!(page_token, vec![9]);
+                Ok(GetWorkflowExecutionHistoryResponse {
+                    history: Some(History { events: page }),
+                    ..Default::default()
+                })
+            });
+        let mut paginator = HistoryPaginator::new_with_version(
+            History { events: suffix },
+            3,
+            6,
+            "wfid".into(),
+            "runid".into(),
+            NextPageToken::Next(vec![9]),
+            Arc::new(client),
+            false,
+            Some(WFTChunkingVersion::Unknown),
+        );
+
+        let update = paginator.extract_next_update().await.unwrap();
+        assert_eq!(paginator.chunking_version(), WFTChunkingVersion::V2);
+        assert!(update.use_chunking_v2);
+        assert!(!paginator.should_record_first_wft_flags());
+    }
+
+    #[tokio::test]
+    async fn uncached_suffix_replays_from_event_one() {
+        let mut events = history(&[WES, SCHEDULED, STARTED, COMPLETED, SCHEDULED, STARTED]);
+        set_wft_flags(
+            &mut events,
+            4,
+            vec![CoreInternalFlags::WftChunkingV2 as u32],
+        );
+        let full_history = events.clone();
+        let mut client = mock_worker_client();
+        client
+            .expect_get_workflow_execution_history()
+            .times(1)
+            .return_once(move |_, _, page_token| {
+                assert!(page_token.is_empty());
+                Ok(GetWorkflowExecutionHistoryResponse {
+                    history: Some(History {
+                        events: full_history,
+                    }),
+                    ..Default::default()
+                })
+            });
+        let mut paginator = HistoryPaginator::new_with_version(
+            History {
+                events: events[4..].to_vec(),
+            },
+            3,
+            6,
+            "wfid".into(),
+            "runid".into(),
+            NextPageToken::Done,
+            Arc::new(client),
+            false,
+            None,
+        );
+
+        let update = paginator.extract_next_update().await.unwrap();
+        assert_eq!(update.first_event_id(), Some(1));
+        assert_eq!(paginator.chunking_version(), WFTChunkingVersion::V2);
     }
 
     #[test]

@@ -52,6 +52,18 @@ flagless first completion, it has no effect and the run remains on v1. When a pa
 not include the selection point and Core has not already latched the version for that run, it must
 fetch history from event 1 before chunking.
 
+The cached `ManagedRun` is the sole owner of the local version state (`Unknown`, `V1`, or `V2`).
+Before a poll response is chunked, WFT extraction asks the serialized workflow stream for that
+run's state through a small local request. A cached `V1` or `V2` is used immediately. A cached
+`Unknown` means the cached prefix is authoritative that no successful completion has been applied,
+so a suffix can continue discovery. A cache miss rebuilds from event 1. If eviction occurs after
+the lookup, the ordinary cache-miss check discards the suffix-shaped result and takes that same
+full-replay path.
+
+After a completion is accepted, the serialized workflow state records the selected version before
+any completion-returned WFT is paginated. This keeps eager and completion-returned tasks on the
+same cache-owned path without a process-wide or run-ID registry.
+
 The flag in durable history is authoritative. Worker configuration and an attempted completion do
 not select a version because the completion may fail or lose a race.
 

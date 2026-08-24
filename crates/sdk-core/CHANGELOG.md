@@ -56,6 +56,8 @@ relevant information.
   `TEMPORAL_USE_WFT_CHUNKING_V2`, requires server SDK metadata support, and must be enabled only
   after every active, standby, and rollback worker has the v2 reader. Runs whose first successful
   Workflow Task is already complete remain on v1.
+* Core now keeps the Workflow Task chunking version with cached workflow state, preserving sticky
+  task behavior while safely replaying from the beginning after cache misses and evictions.
 * Workers now warn when autoscaling task polling encounters errors continuously for one minute.
   Repeated warnings use exponential backoff up to 15-minute intervals and stop after polling
   recovers.

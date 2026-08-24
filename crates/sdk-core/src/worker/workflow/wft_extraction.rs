@@ -1,3 +1,7 @@
+use super::{
+    GetChunkingVersionMsg,
+    workflow_stream::{LocalInput, LocalInputs},
+};
 use crate::{
     abstractions::OwnedMeteredSemPermit,
     protosext::ValidPollWFTQResponse,
@@ -6,13 +10,14 @@ use crate::{
         client::WorkerClient,
         workflow::{
             AutoReplyTask, CacheMissFetchReq, HistoryUpdate, NextPageReq, PermittedWFT,
-            history_update::{HistoryPaginator, WFTChunkingVersionRegistry},
+            history_update::{HistoryPaginator, WFTChunkingVersion},
         },
     },
 };
 use futures_util::{FutureExt, Stream, StreamExt, stream, stream::PollNext};
 use std::{future, sync::Arc};
 use temporalio_common::protos::coresdk::WorkflowSlotInfo;
+use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tracing::Span;
 
 /// Transforms incoming validated WFTs and history fetching requests into [PermittedWFT]s ready
@@ -57,18 +62,38 @@ pub(super) enum HistoryFetchReq {
 pub(super) struct HistfetchRC {}
 
 impl WFTExtractor {
+    /// Querying through the workflow stream keeps cache lookup ordered with eviction and
+    /// completion processing. A missing response is treated as a cache miss so the normal replay
+    /// path remains the source of truth if workflow processing has already shut down.
+    pub(super) async fn get_chunking_version(
+        local_tx: &UnboundedSender<LocalInput>,
+        run_id: String,
+    ) -> Option<WFTChunkingVersion> {
+        let (response_tx, response_rx) = oneshot::channel();
+        local_tx
+            .send(LocalInput {
+                input: LocalInputs::GetChunkingVersion(GetChunkingVersionMsg {
+                    run_id,
+                    response_tx,
+                }),
+                span: Span::current(),
+            })
+            .ok()?;
+        response_rx.await.ok().flatten()
+    }
+
     pub(super) fn build(
         client: Arc<dyn WorkerClient>,
         max_fetch_concurrency: usize,
         wft_stream: impl Stream<Item = WFTStreamIn> + Send + 'static,
         fetch_stream: impl Stream<Item = HistoryFetchReq> + Send + 'static,
-        chunking_versions: WFTChunkingVersionRegistry,
+        local_tx: UnboundedSender<LocalInput>,
     ) -> impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static {
         let fetch_client = client.clone();
         let wft_stream = wft_stream
             .map(move |stream_in| {
                 let client = client.clone();
-                let chunking_versions = chunking_versions.clone();
+                let local_tx = local_tx.clone();
                 async move {
                     match stream_in {
                         Ok((wft, permit)) => {
@@ -78,8 +103,10 @@ impl WFTExtractor {
                             } else {
                                 AutoReplyTask::Workflow(wft.task_token.clone())
                             };
+                            let chunking_version =
+                                Self::get_chunking_version(&local_tx, run_id.clone()).await;
                             let page =
-                                HistoryPaginator::from_poll(wft, client, chunking_versions).await;
+                                HistoryPaginator::from_poll(wft, client, chunking_version).await;
                             Ok(match page {
                                 Ok((pag, prep)) => WFTExtractorOutput::NewWFT(PermittedWFT {
                                     permit: permit.into_used(WorkflowSlotInfo {
@@ -99,15 +126,17 @@ impl WFTExtractor {
                         Err(e) => Err(e),
                     }
                 }
-                // This is... unattractive, but lets us avoid boxing all the futs in the stream
-                .left_future()
-                .left_future()
+                .boxed()
             })
+            // The sentinel must wait for every WFT future. Cache lookup is itself asynchronous,
+            // so placing it before the final buffer would let PollerDead shut down the workflow
+            // stream while an already-polled WFT is still waiting for its lookup response.
+            .buffer_unordered(max_fetch_concurrency)
+            .map(|output| future::ready(output).boxed())
             .chain(stream::iter([future::ready(Ok(
                 WFTExtractorOutput::PollerDead,
             ))
-            .right_future()
-            .left_future()]));
+            .boxed()]));
 
         stream::select_with_strategy(
             wft_stream,
@@ -155,7 +184,7 @@ impl WFTExtractor {
                         }
                     })
                 }
-                .right_future()
+                .boxed()
             }),
             // Priority always goes to the fetching stream
             |_: &mut ()| PollNext::Right,

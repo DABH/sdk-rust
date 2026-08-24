@@ -14,7 +14,7 @@ use crate::{
             OutstandingTask, PermittedWFT, RequestEvictMsg, RunBasics,
             ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand, WFCommandVariant,
             WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus, WorkflowTaskInfo,
-            history_update::HistoryPaginator,
+            history_update::{HistoryPaginator, WFTChunkingVersion},
             machines::{MachinesWFTResponseContent, WorkflowMachines},
         },
     },
@@ -97,6 +97,9 @@ pub(super) struct ManagedRun {
     /// is fixed.
     recorded_span_ids: HashSet<tracing::Id>,
     metrics: MetricsContext,
+    /// The first successful completion fixes the chunking rules for this run. Keeping this value
+    /// on the cached run makes cache eviction naturally discard the only local copy of the choice.
+    chunking_version: WFTChunkingVersion,
     /// We store the paginator used for our own run's history fetching
     paginator: Option<HistoryPaginator>,
     completion_waiting_on_page_fetch: Option<RunActivationCompletion>,
@@ -122,6 +125,7 @@ impl ManagedRun {
             trying_to_evict: None,
             recorded_span_ids: Default::default(),
             metrics,
+            chunking_version: WFTChunkingVersion::Unknown,
             paginator: None,
             completion_waiting_on_page_fetch: None,
             config,
@@ -157,6 +161,22 @@ impl ManagedRun {
         self.wft.as_ref()
     }
 
+    pub(super) fn chunking_version(&self) -> WFTChunkingVersion {
+        self.chunking_version
+    }
+
+    pub(super) fn record_successful_completion(&mut self, version: WFTChunkingVersion) {
+        if self.chunking_version == WFTChunkingVersion::Unknown {
+            self.chunking_version = version;
+        } else if self.chunking_version != version {
+            dbg_panic!(
+                "Workflow Task chunking version changed from {:?} to {:?}",
+                self.chunking_version,
+                version
+            );
+        }
+    }
+
     /// Returns a ref to info about the currently tracked workflow activation, if any.
     pub(super) fn activation(&self) -> Option<&OutstandingActivation> {
         self.activation.as_ref()
@@ -181,6 +201,10 @@ impl ManagedRun {
             dbg_panic!("Trying to send a new WFT for a run which already has one!");
         }
         let start_time = Instant::now();
+
+        if self.chunking_version == WFTChunkingVersion::Unknown {
+            self.chunking_version = pwft.paginator.chunking_version();
+        }
 
         let work = pwft.work;
         debug!(
@@ -576,6 +600,9 @@ impl ManagedRun {
         update: HistoryUpdate,
         paginator: HistoryPaginator,
     ) -> Result<Option<FulfillableActivationComplete>, RunUpdateErr> {
+        if self.chunking_version == WFTChunkingVersion::Unknown {
+            self.chunking_version = paginator.chunking_version();
+        }
         self.paginator = Some(paginator);
         if let Some(d) = self.completion_waiting_on_page_fetch.take() {
             self._process_completion(d, Some(update))

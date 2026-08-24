@@ -33,7 +33,7 @@ use crate::{
         activities::{ActivitiesFromWFTsHandle, LocalActivityManager},
         client::{LegacyQueryResult, WorkerClient, WorkflowTaskCompletion},
         workflow::{
-            history_update::{HistoryPaginator, WFTChunkingVersionRegistry},
+            history_update::{HistoryPaginator, WFTChunkingVersion},
             machines::MachineError,
             managed_run::RunUpdateAct,
             wft_extraction::{HistoryFetchReq, WFTExtractor, WFTStreamIn},
@@ -153,7 +153,6 @@ pub(crate) struct Workflows {
     local_act_mgr: Option<Arc<LocalActivityManager>>,
     ever_polled: AtomicBool,
     default_versioning_behavior: Option<VersioningBehavior>,
-    chunking_versions: WFTChunkingVersionRegistry,
 }
 
 pub(crate) struct WorkflowBasics {
@@ -209,13 +208,12 @@ impl Workflows {
             .worker_config
             .max_eager_activity_reservations_per_workflow_task;
         let default_versioning_behavior = basics.default_versioning_behavior;
-        let chunking_versions = WFTChunkingVersionRegistry::default();
         let extracted_wft_stream = WFTExtractor::build(
             client.clone(),
             basics.worker_config.fetching_concurrency,
             wft_stream,
             UnboundedReceiverStream::new(fetch_rx),
-            chunking_versions.clone(),
+            local_tx.clone(),
         );
         let locals_stream = if let Some(hb_rx) = heartbeat_timeout_rx {
             Either::Left(stream::select(
@@ -303,7 +301,6 @@ impl Workflows {
             local_act_mgr,
             ever_polled: AtomicBool::new(false),
             default_versioning_behavior,
-            chunking_versions,
         }
     }
 
@@ -463,8 +460,8 @@ impl Workflows {
                             if response.reset_history_event_id > 0 {
                                 reset_last_started_to = Some(response.reset_history_event_id);
                             } else {
-                                self.chunking_versions
-                                    .record_successful_completion(run_id, used_chunking_v2);
+                                self.record_successful_completion(run_id, used_chunking_v2)
+                                    .await;
                             }
                             if let Some(wft) = response.workflow_task {
                                 *wft_from_complete = Some(validate_wft(wft)?);
@@ -531,6 +528,21 @@ impl Workflows {
                     completion_time,
                 }
             }
+        }
+    }
+
+    async fn record_successful_completion(&self, run_id: &str, used_v2: bool) {
+        let (response_tx, response_rx) = oneshot::channel();
+        if self.send_local(RecordSuccessfulCompletionMsg {
+            run_id: run_id.to_string(),
+            version: if used_v2 {
+                WFTChunkingVersion::V2
+            } else {
+                WFTChunkingVersion::V1
+            },
+            response_tx,
+        }) {
+            let _ = response_rx.await;
         }
     }
 
@@ -649,13 +661,12 @@ impl Workflows {
             .await;
 
         let maybe_pwft = if let Some(wft) = wft_from_complete {
-            match HistoryPaginator::from_poll(
-                wft,
-                self.client.clone(),
-                self.chunking_versions.clone(),
+            let chunking_version = WFTExtractor::get_chunking_version(
+                &self.local_tx,
+                wft.workflow_execution.run_id.clone(),
             )
-            .await
-            {
+            .await;
+            match HistoryPaginator::from_poll(wft, self.client.clone(), chunking_version).await {
                 Ok((paginator, wft)) => Some(WFTWithPaginator { wft, paginator }),
                 Err(e) => {
                     self.request_eviction(
@@ -814,7 +825,10 @@ impl Workflows {
     fn send_local(&self, msg: impl Into<LocalInputs>) -> bool {
         let msg = msg.into();
         let print_err = match &msg {
-            LocalInputs::GetStateInfo(_) | LocalInputs::BumpStream => false,
+            LocalInputs::GetChunkingVersion(_)
+            | LocalInputs::RecordSuccessfulCompletion(_)
+            | LocalInputs::GetStateInfo(_)
+            | LocalInputs::BumpStream => false,
             LocalInputs::LocalResolution(lr) if lr.res.is_la_cancel_confirmation() => false,
             _ => true,
         };
@@ -1262,6 +1276,17 @@ pub(crate) struct HeartbeatTimeoutMsg {
 #[derive(Debug)]
 struct GetStateInfoMsg {
     response_tx: oneshot::Sender<WorkflowStateInfo>,
+}
+#[derive(Debug)]
+struct GetChunkingVersionMsg {
+    run_id: String,
+    response_tx: oneshot::Sender<Option<WFTChunkingVersion>>,
+}
+#[derive(Debug)]
+struct RecordSuccessfulCompletionMsg {
+    run_id: String,
+    version: WFTChunkingVersion,
+    response_tx: oneshot::Sender<()>,
 }
 
 /// Each activation completion produces one of these

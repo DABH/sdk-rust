@@ -151,6 +151,21 @@ impl WFStream {
                             LocalInputs::RequestEviction(evict) => {
                                 state.request_eviction(evict).into_run_update_resp()
                             }
+                            LocalInputs::GetChunkingVersion(query) => {
+                                let version = state
+                                    .runs
+                                    .get(&query.run_id)
+                                    .map(|run| run.chunking_version());
+                                let _ = query.response_tx.send(version);
+                                None
+                            }
+                            LocalInputs::RecordSuccessfulCompletion(completion) => {
+                                if let Some(run) = state.runs.get_mut(&completion.run_id) {
+                                    run.record_successful_completion(completion.version);
+                                }
+                                let _ = completion.response_tx.send(());
+                                None
+                            }
                             LocalInputs::GetStateInfo(gsi) => {
                                 let _ = gsi.response_tx.send(WorkflowStateInfo {
                                     cached_workflows: state.runs.len(),
@@ -270,15 +285,6 @@ impl WFStream {
         &mut self,
         pwft: PermittedWFT,
     ) -> Result<RunUpdateAct, HistoryFetchReq> {
-        if pwft.paginator.requires_full_history_for_chunking_version() {
-            if !self.runs.has_run(&pwft.work.execution.run_id) {
-                self.metrics.sticky_cache_miss();
-            }
-            return Err(HistoryFetchReq::Full(
-                Box::new(CacheMissFetchReq { original_wft: pwft }),
-                self.history_fetch_refcounter.clone(),
-            ));
-        }
         // If the run already exists, possibly buffer the work and return early if we can't handle
         // it yet.
         let pwft = if let Some(rh) = self.runs.get_mut(&pwft.work.execution.run_id) {
@@ -706,6 +712,8 @@ pub(super) enum LocalInputs {
     PostActivation(Box<PostActivationMsg>),
     RequestEviction(RequestEvictMsg),
     HeartbeatTimeout(String),
+    GetChunkingVersion(GetChunkingVersionMsg),
+    RecordSuccessfulCompletion(RecordSuccessfulCompletionMsg),
     GetStateInfo(GetStateInfoMsg),
     BumpStream,
 }
@@ -718,6 +726,8 @@ impl LocalInputs {
             LocalInputs::PostActivation(pa) => &pa.run_id,
             LocalInputs::RequestEviction(re) => &re.run_id,
             LocalInputs::HeartbeatTimeout(hb) => hb,
+            LocalInputs::GetChunkingVersion(query) => &query.run_id,
+            LocalInputs::RecordSuccessfulCompletion(completion) => &completion.run_id,
             LocalInputs::GetStateInfo(_) | LocalInputs::BumpStream => return None,
         })
     }
