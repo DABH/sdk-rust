@@ -21,6 +21,16 @@ integ-test = [
     "integ_runner",
     "--",
 ]
+cloud-namespace = [
+    "test",
+    "--features",
+    "test-utilities",
+    "--package",
+    "temporalio-sdk-core",
+    "--test",
+    "cloud_namespace",
+    "--",
+]
 lint = [
     "clippy",
     "--workspace",
@@ -36,6 +46,8 @@ lint = [
     "wasm_workflow_tests",
     "--test",
     "cloud_tests",
+    "--test",
+    "cloud_namespace",
     "--test",
     "integ_runner",
     "--test",
@@ -59,6 +71,8 @@ lint-fix = [
     "wasm_workflow_tests",
     "--test",
     "cloud_tests",
+    "--test",
+    "cloud_namespace",
     "--test",
     "integ_runner",
     "--test",
