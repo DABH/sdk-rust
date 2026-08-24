@@ -5,7 +5,7 @@ mod common;
 use crate::common::integ_dev_server_config;
 use anyhow::{anyhow, bail};
 use clap::Parser;
-use common::INTEG_SERVER_TARGET_ENV_VAR;
+use common::{INTEG_SERVER_TARGET_ENV_VAR, TEST_ENV_CONFIG_SERVER_ENV_VAR};
 use std::{
     env,
     path::{Path, PathBuf},
@@ -54,6 +54,9 @@ enum ServerKind {
     TestServer,
     /// Do not automatically start any server
     External,
+    /// Load the server connection configuration from envconfig without starting a server
+    #[value(name = "envconfig")]
+    EnvConfig,
 }
 
 #[tokio::main]
@@ -135,6 +138,12 @@ async fn main() -> Result<(), anyhow::Error> {
             println!("========================================================");
             (None, vec![])
         }
+        ServerKind::EnvConfig => {
+            println!("========================================================");
+            println!("Not starting up a server. Loading its configuration from envconfig.");
+            println!("========================================================");
+            (None, vec![(TEST_ENV_CONFIG_SERVER_ENV_VAR, "true")])
+        }
     };
 
     let mut cmd = if let Some(test_executable) = test_executable {
@@ -159,7 +168,12 @@ async fn main() -> Result<(), anyhow::Error> {
             format!("http://{}", &srv.target),
         );
     }
-    let status = cmd.envs(envs).current_dir(project_root()).status().await?;
+    let status = cmd
+        .env_remove(TEST_ENV_CONFIG_SERVER_ENV_VAR)
+        .envs(envs)
+        .current_dir(project_root())
+        .status()
+        .await?;
 
     if let Some(mut srv) = server {
         srv.shutdown().await?;

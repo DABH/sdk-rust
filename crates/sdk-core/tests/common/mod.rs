@@ -23,7 +23,7 @@ use std::{
     path::PathBuf,
     str::FromStr,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -32,6 +32,7 @@ use temporalio_client::{
     Client, ClientOptions, ClientTlsOptions, Connection, ConnectionOptions, GrpcCompression,
     NamespacedClient, TlsOptions, UntypedWorkflow, UntypedWorkflowHandle, WorkflowExecutionInfo,
     WorkflowGetResultOptions, WorkflowHandle, WorkflowStartOptions,
+    envconfig::LoadClientConfigProfileOptions,
     errors::{WorkflowGetResultError, WorkflowStartError},
     grpc::WorkflowService,
 };
@@ -77,6 +78,7 @@ pub(crate) const INTEG_SERVER_TARGET_ENV_VAR: &str = "TEMPORAL_SERVICE_ADDRESS";
 pub(crate) const INTEG_NAMESPACE_ENV_VAR: &str = "TEMPORAL_NAMESPACE";
 pub(crate) const INTEG_USE_TLS_ENV_VAR: &str = "TEMPORAL_USE_TLS";
 pub(crate) const INTEG_API_KEY: &str = "TEMPORAL_API_KEY_PATH";
+pub(crate) const TEST_ENV_CONFIG_SERVER_ENV_VAR: &str = "TEMPORAL_TEST_ENV_CONFIG_SERVER";
 pub(crate) static SEARCH_ATTR_TXT: &str = "CustomTextField";
 pub(crate) static SEARCH_ATTR_INT: &str = "CustomIntField";
 /// If set, turn export traces and metrics to the OTel collector at the given URL
@@ -91,6 +93,16 @@ pub(crate) const INTEG_CLIENT_IDENTITY: &str = "integ_tester";
 pub(crate) const INTEG_CLIENT_NAME: &str = "temporal-core";
 pub(crate) const INTEG_CLIENT_VERSION: &str = "0.1.0";
 
+// Envconfig can read TOML and TLS files. Load one immutable snapshot so concurrently-created
+// clients and workers cannot observe different configuration during a test run.
+static ENV_CONFIG_CLIENT_CONFIG: LazyLock<(ConnectionOptions, String)> = LazyLock::new(|| {
+    let (mut connection_options, client_options) =
+        ClientOptions::load_from_config(LoadClientConfigProfileOptions::default())
+            .unwrap_or_else(|err| panic!("Failed to load integration test envconfig: {err}"));
+    connection_options.identity = INTEG_CLIENT_IDENTITY.to_string();
+    (connection_options, client_options.namespace)
+});
+
 /// Create a worker instance which will use the provided test name to base the task queue and wf id
 /// upon. Returns the instance.
 pub(crate) async fn init_core_and_create_wf(test_name: &str) -> CoreWfStarter {
@@ -101,7 +113,12 @@ pub(crate) async fn init_core_and_create_wf(test_name: &str) -> CoreWfStarter {
 }
 
 pub(crate) fn integ_namespace() -> String {
-    env::var(INTEG_NAMESPACE_ENV_VAR).unwrap_or(NAMESPACE.to_string())
+    if env::var_os(TEST_ENV_CONFIG_SERVER_ENV_VAR).is_some() {
+        let (_, namespace) = &*ENV_CONFIG_CLIENT_CONFIG;
+        namespace.clone()
+    } else {
+        env::var(INTEG_NAMESPACE_ENV_VAR).unwrap_or(NAMESPACE.to_string())
+    }
 }
 
 pub(crate) fn integ_worker_config(tq: &str) -> WorkerConfig {
@@ -908,6 +925,11 @@ impl TestWorkerCompletionIceptor {
 }
 /// Returns the connection options used to connect to the server used for integration tests.
 pub(crate) fn get_integ_server_options() -> ConnectionOptions {
+    if env::var_os(TEST_ENV_CONFIG_SERVER_ENV_VAR).is_some() {
+        let (connection_options, _) = &*ENV_CONFIG_CLIENT_CONFIG;
+        return connection_options.clone();
+    }
+
     let temporal_server_address = env::var(INTEG_SERVER_TARGET_ENV_VAR)
         .unwrap_or_else(|_| "http://localhost:7233".to_owned());
     let url = Url::try_from(&*temporal_server_address).unwrap();
