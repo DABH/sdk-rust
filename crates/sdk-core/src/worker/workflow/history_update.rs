@@ -1062,9 +1062,9 @@ fn is_command_or_ignorable_unknown(event: &HistoryEvent) -> bool {
         || (event.event_type() == EventType::Unspecified && event.is_ignorable())
 }
 
-/// V2 collapses an empty WFT only after its successor's complete command batch proves that no
-/// accepted Update created a distinct activation. An unbounded batch therefore requires another
-/// page rather than a provisional boundary.
+/// V2 merges an empty WFT with its successor only after the successor's command batch is complete.
+/// If the batch continues on the next history page, wait for that page before choosing the
+/// boundary.
 fn find_end_index_of_next_wft_seq_v2(
     events: &[HistoryEvent],
     from_event_id: i64,
