@@ -486,6 +486,7 @@ impl LocalActivityOptions {
                     .timer_backoff_threshold
                     .and_then(|duration| duration.try_into().ok()),
                 cancellation_type: ProtoActivityCancellationType::from(self.cancel_type).into(),
+                include_arguments_into_marker: false,
                 schedule_to_close_timeout: self
                     .schedule_to_close_timeout
                     .and_then(|duration| duration.try_into().ok()),
