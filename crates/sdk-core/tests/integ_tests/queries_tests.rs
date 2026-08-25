@@ -49,6 +49,13 @@ async fn simple_query_legacy() {
     .unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;
     // Query after timer should have fired and there should be new WFT
+    let timer_task = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        timer_task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::FireTimer(_)),
+        }]
+    );
     let query_fut = async {
         WorkflowExecutionInfo {
             namespace: starter.get_core_client().await.namespace(),
@@ -66,19 +73,11 @@ async fn simple_query_legacy() {
         .unwrap()
     };
     let workflow_completions_future = async {
-        // Give query a beat to get going
+        // Let the query reach the server before completing the outstanding timer task so the
+        // server sends the query activation next.
         tokio::time::sleep(Duration::from_millis(400)).await;
-        // This poll *should* have the `queries` field populated, but doesn't, seemingly due to
-        // a server bug. So, complete the WF task of the first timer firing with empty commands
-        let task = core.poll_workflow_activation().await.unwrap();
-        assert_matches!(
-            task.jobs.as_slice(),
-            [WorkflowActivationJob {
-                variant: Some(workflow_activation_job::Variant::FireTimer(_)),
-            }]
-        );
         core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
-            task.run_id,
+            timer_task.run_id,
             vec![],
         ))
         .await

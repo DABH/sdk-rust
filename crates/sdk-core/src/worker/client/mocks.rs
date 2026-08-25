@@ -23,6 +23,7 @@ pub(crate) static DEFAULT_TEST_CAPABILITIES: &Capabilities = &Capabilities {
 /// Create a mock client primed with basic necessary expectations
 pub fn mock_worker_client() -> MockWorkerClient {
     let mut r = MockWorkerClient::new();
+    r.expect_payload_error_limits().returning(|| None);
     let workers = Arc::new(ClientWorkerSet::new());
     r.expect_capabilities()
         .returning(|| Some(*DEFAULT_TEST_CAPABILITIES));
@@ -113,6 +114,7 @@ mockall::mock! {
         fn fail_activity_task<'a, 'b>(
             &self,
             task_token: TaskToken,
+            cause: ActivityTaskFailedCause,
             failure: Option<Failure>,
             last_heartbeat_details: Option<Payloads>,
         ) -> impl Future<Output = Result<RespondActivityTaskFailedResponse>> + Send + 'b

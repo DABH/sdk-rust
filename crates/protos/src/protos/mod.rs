@@ -746,6 +746,7 @@ pub mod coresdk {
                     Self {
                         status: Some(aer::Status::Failed(Failure {
                             failure: Some(fail),
+                            cause: ActivityTaskFailedCause::ActivityWorkerUnhandledFailure as i32,
                         })),
                     }
                 }
@@ -830,7 +831,11 @@ pub mod coresdk {
                     Self {
                         status: match r {
                             Ok(p) => Some(aer::Status::Completed(Success { result: Some(p) })),
-                            Err(f) => Some(aer::Status::Failed(Failure { failure: Some(f) })),
+                            Err(f) => Some(aer::Status::Failed(Failure {
+                                failure: Some(f),
+                                cause: ActivityTaskFailedCause::ActivityWorkerUnhandledFailure
+                                    as i32,
+                            })),
                         },
                     }
                 }
@@ -866,6 +871,7 @@ pub mod coresdk {
                     match self.status {
                         Some(activity_resolution::Status::Failed(Failure {
                             failure: Some(ref f),
+                            ..
                         })) => f.is_timeout(),
                         _ => None,
                     }
