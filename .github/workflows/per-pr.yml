@@ -211,15 +211,13 @@ jobs:
         env:
           TEMPORAL_CLIENT_CLOUD_API_KEY: ${{ secrets.TEMPORAL_CLIENT_CLOUD_API_KEY }}
         run: cargo cloud-namespace create
-      - name: Run existing integration test against Cloud
+      - name: Run Cloud-eligible integration tests
         timeout-minutes: 20
         env:
           TEMPORAL_ADDRESS: ${{ steps.create-cloud-namespace.outputs.namespace }}.tmprl.cloud:7233
           TEMPORAL_NAMESPACE: ${{ steps.create-cloud-namespace.outputs.namespace }}
         run: |
-          cargo integ-test -s envconfig -- \
-            integ_tests::workflow_tests::timers::timer_workflow_workflow_driver --exact \
-            2>&1 | tee cloud-integration.log
+          cargo integ-test -s envconfig --cloud 2>&1 | tee cloud-integration.log
       - name: Delete Cloud namespace
         id: delete-cloud-namespace
         if: ${{ always() && steps.create-cloud-namespace.outputs.namespace != '' }}
