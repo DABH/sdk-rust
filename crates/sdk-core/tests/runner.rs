@@ -3,7 +3,7 @@
 mod common;
 
 use crate::common::integ_dev_server_config;
-use anyhow::{anyhow, bail};
+use anyhow::{Context, anyhow, bail};
 use clap::Parser;
 use common::{INTEG_SERVER_TARGET_ENV_VAR, TEST_ENV_CONFIG_SERVER_ENV_VAR};
 use std::{
@@ -42,6 +42,10 @@ struct Cli {
     /// If set, only run the build, not any tests
     just_build: bool,
 
+    /// Run only tests that are eligible for Temporal Cloud
+    #[arg(long)]
+    cloud: bool,
+
     /// The rest of the arguments will be passed through to the test harness
     harness_args: Vec<String>,
 }
@@ -67,12 +71,19 @@ async fn main() -> Result<(), anyhow::Error> {
         cargo_test_args,
         test_executable,
         just_build,
+        cloud,
         harness_args,
     } = Cli::parse();
+    if cloud && test_name != "integ_tests" {
+        bail!("Cloud filtering is only defined for the integ_tests target");
+    }
+    if cloud && test_executable.is_some() {
+        bail!("Cloud filtering requires Cargo to build the test target with cloud-test-mode");
+    }
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     // Try building first, so that we error early on build failures & don't start server
     // Unclear why --all-features doesn't work here
-    let test_args_preamble = [
+    let mut test_args_preamble = [
         "test",
         "--features",
         "temporalio-common/serde_serialize",
@@ -82,13 +93,15 @@ async fn main() -> Result<(), anyhow::Error> {
         "ephemeral-server",
         "--features",
         "temporalio-sdk-core/otel",
-        "--test",
-        &test_name,
     ]
     .into_iter()
     .map(ToString::to_string)
-    .chain(cargo_test_args)
     .collect::<Vec<_>>();
+    if cloud {
+        test_args_preamble.extend(["--features".to_owned(), "cloud-test-mode".to_owned()]);
+    }
+    test_args_preamble.extend(["--test".to_owned(), test_name.clone()]);
+    test_args_preamble.extend(cargo_test_args);
     if test_executable.is_none() {
         let mut build_cmd = Command::new(&cargo);
         strip_cargo_env_vars(&mut build_cmd);
@@ -102,6 +115,14 @@ async fn main() -> Result<(), anyhow::Error> {
     }
     if just_build {
         return Ok(());
+    }
+    if cloud {
+        let test_names = list_tests(&cargo, &test_args_preamble).await?;
+        println!("Cloud test inventory: {} eligible", test_names.len());
+        println!("Cloud-eligible tests:");
+        for test_name in test_names {
+            println!("  {test_name}");
+        }
     }
 
     let (server, envs) = match server_kind {
@@ -183,6 +204,29 @@ async fn main() -> Result<(), anyhow::Error> {
     } else {
         Err(anyhow!("Integ tests failed!"))
     }
+}
+
+async fn list_tests(cargo: &str, test_args_preamble: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut cmd = Command::new(cargo);
+    strip_cargo_env_vars(&mut cmd);
+    cmd.args(test_args_preamble).args(["--", "--list"]);
+    let output = cmd.current_dir(project_root()).output().await?;
+    if !output.status.success() {
+        bail!(
+            "Listing integration tests failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let stdout = String::from_utf8(output.stdout).context("Test list was not valid UTF-8")?;
+    let test_names = stdout
+        .lines()
+        .filter_map(|line| line.strip_suffix(": test"))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if test_names.is_empty() {
+        bail!("The integration test target did not list any tests");
+    }
+    Ok(test_names)
 }
 
 /// Some env vars inherited from the fact that this is called with cargo can cause the *nested*
