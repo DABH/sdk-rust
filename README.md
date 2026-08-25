@@ -79,6 +79,30 @@ cargo integ-test -s envconfig -- \
 `TEMPORAL_CONFIG_FILE` and `TEMPORAL_PROFILE` can select a TOML profile instead. The harness does
 not start, configure, or clean up the target server or namespace in this mode.
 
+Pass `--cloud` to exclude integration tests that are not yet eligible to run against Temporal
+Cloud. This filtering is independent of server selection, so the selected tests can be listed
+without connecting to a server or run against an envconfig target:
+
+```bash
+cargo integ-test -s external --cloud -- --list
+cargo integ-test -s envconfig --cloud
+```
+
+Tests are eligible by default. Tests that are not ready for Cloud carry a source-local exclusion:
+
+```rust
+temporalio_macros::cloud_test_module_exclusion!(
+    RequiresLocalServer,
+    polling_tests,
+    "Starts a local Temporal server."
+);
+```
+
+The note is optional. The supported reasons are `RequiresLocalServer`,
+`RequiresCloudProvisioning`, and `NeedsCloudAdaptation`. Use `cloud_test_module_exclusion!` for an
+entire module or `#[cloud_test_exclusion(...)]` for an individual test. Cloud mode omits marked
+items from the test target, so `--list` shows only the eligible tests.
+
 Run load tests with `cargo test --test heavy_tests`.
 
 NOTE: Integration tests should pass locally, if running on MacOS and you see integration tests consistently failing

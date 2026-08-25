@@ -52,7 +52,7 @@ async fn timer_workflow_workflow_driver() {
         .unwrap();
     worker.run_until_done().await.unwrap();
 }
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 async fn timer_workflow_manual() {
     let mut starter = init_core_and_create_wf("timer_workflow").await;
@@ -75,7 +75,7 @@ async fn timer_workflow_manual() {
     core.handle_eviction().await;
     drain_pollers_and_shutdown(&core).await;
 }
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 async fn timer_cancel_workflow() {
     let mut starter = init_core_and_create_wf("timer_cancel_workflow").await;
@@ -109,7 +109,7 @@ async fn timer_cancel_workflow() {
     .await
     .unwrap();
 }
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 async fn timer_immediate_cancel_workflow() {
     let mut starter = init_core_and_create_wf("timer_immediate_cancel_workflow").await;
@@ -141,7 +141,7 @@ impl ParallelTimerWf {
         Ok(())
     }
 }
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 async fn parallel_timers() {
     let wf_name = "parallel_timers";
@@ -174,7 +174,7 @@ impl CancelAlreadyFiredTimerWf {
         Ok(())
     }
 }
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 async fn cancel_unpolled_timer_after_both_timers_fire_same_activation() {
     let mut t = canned_histories::parallel_timer("1", "2");
@@ -202,7 +202,7 @@ impl HappyTimerWf {
         Ok(())
     }
 }
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 async fn test_fire_happy_path_inc() {
     let t = canned_histories::single_timer("1");
@@ -240,7 +240,7 @@ impl MismatchedTimerWf {
         Ok(())
     }
 }
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 async fn mismatched_timer_ids_errors() {
     let t = canned_histories::single_timer("badid");
@@ -272,7 +272,7 @@ impl CancelTimerWf {
         Ok(())
     }
 }
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 async fn incremental_cancellation() {
     let t = canned_histories::cancel_timer("2", "1");
@@ -314,7 +314,7 @@ impl CancelBeforeSentWf {
         Ok(())
     }
 }
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 async fn cancel_before_sent_to_server() {
     let mut t = TestHistoryBuilder::default();
@@ -369,7 +369,7 @@ impl WaitConditionWakerWf {
         Ok(())
     }
 }
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 async fn wait_condition_waker_in_futures_unordered() {
     let t = canned_histories::single_timer_wf_completes("1");

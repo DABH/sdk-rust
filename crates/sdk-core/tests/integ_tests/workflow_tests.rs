@@ -1,34 +1,32 @@
-mod activities;
-mod cancel_external;
-mod cancel_wf;
-mod child_workflows;
-mod client_interactions;
-mod continue_as_new;
-mod determinism;
-mod eager;
-mod event_groups;
-mod interceptors;
-mod local_activities;
-mod modify_wf_properties;
-mod nexus;
-mod patches;
-mod priority;
-mod queries;
-mod replay;
-mod resets;
-mod signals;
-mod stickyness;
+temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, activities);
+temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, cancel_external);
+temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, cancel_wf);
+temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, child_workflows);
+temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, client_interactions);
+temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, continue_as_new);
+temporalio_macros::cloud_test_module_exclusion!(RequiresLocalServer, determinism);
+temporalio_macros::cloud_test_module_exclusion!(RequiresCloudProvisioning, eager);
+temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, event_groups);
+temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, interceptors);
+temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, local_activities);
+temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, modify_wf_properties);
+temporalio_macros::cloud_test_module_exclusion!(RequiresCloudProvisioning, nexus);
+temporalio_macros::cloud_test_module_exclusion!(RequiresLocalServer, patches);
+temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, priority);
+temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, queries);
+temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, replay);
+temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, resets);
+temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, signals);
+temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, stickyness);
 mod timers;
-mod upsert_search_attrs;
+temporalio_macros::cloud_test_module_exclusion!(RequiresCloudProvisioning, upsert_search_attrs);
 
-use crate::{
-    common::{
-        CoreWfStarter, activity_functions::StdActivities, get_integ_runtime_options,
-        history_from_proto_binary, init_core_and_create_wf, init_core_replay_preloaded,
-        prom_metrics,
-    },
-    integ_tests::metrics_tests,
+use crate::common::{
+    CoreWfStarter, activity_functions::StdActivities, get_integ_runtime_options,
+    history_from_proto_binary, init_core_and_create_wf, init_core_replay_preloaded, prom_metrics,
 };
+#[cfg(any(not(feature = "cloud-test-mode"), clippy))]
+use crate::integ_tests::metrics_tests;
 use assert_matches::assert_matches;
 use std::{
     collections::{HashMap, HashSet},
@@ -93,7 +91,7 @@ impl ParallelWorkflowsWf {
         Ok(())
     }
 }
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 async fn parallel_workflows_same_queue() {
     let wf_name = "parallel_workflows_same_queue";
@@ -119,6 +117,7 @@ async fn parallel_workflows_same_queue() {
 // Ideally this would be a unit test, but returning a pending future with mockall bloats the mock
 // code a bunch and just isn't worth it. Do it when https://github.com/asomers/mockall/issues/189 is
 // fixed.
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 async fn shutdown_aborts_actively_blocked_poll() {
     let mut starter = CoreWfStarter::new("shutdown_aborts_actively_blocked_poll");
@@ -141,7 +140,7 @@ async fn shutdown_aborts_actively_blocked_poll() {
         PollError::ShutDown
     );
 }
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[rstest::rstest]
 #[tokio::test]
 async fn fail_wf_task(#[values(true, false)] replay: bool) {
@@ -198,7 +197,7 @@ async fn fail_wf_task(#[values(true, false)] replay: bool) {
     let task = core.poll_workflow_activation().await.unwrap();
     core.complete_execution(&task.run_id).await;
 }
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 async fn fail_workflow_execution() {
     let core = init_core_and_create_wf("fail_workflow_execution")
@@ -221,7 +220,7 @@ async fn fail_workflow_execution() {
     .await
     .unwrap();
 }
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 async fn signal_workflow() {
     let mut starter = init_core_and_create_wf("signal_workflow").await;
@@ -303,7 +302,7 @@ async fn signal_workflow() {
     }
     core.complete_execution(&res.run_id).await;
 }
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 async fn signal_workflow_signal_not_handled_on_workflow_completion() {
     let mut starter =
@@ -381,7 +380,7 @@ async fn signal_workflow_signal_not_handled_on_workflow_completion() {
         core.complete_execution(&res.run_id).await;
     }
 }
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 async fn wft_timeout_doesnt_create_unsolvable_autocomplete() {
     let activity_id = "act-1";
@@ -515,7 +514,7 @@ impl SlowCompletesWf {
         Ok(())
     }
 }
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 async fn slow_completes_with_small_cache() {
     let wf_name = "slow_completes_with_small_cache";
@@ -554,7 +553,7 @@ async fn slow_completes_with_small_cache() {
         .await
         .unwrap();
 }
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 #[rstest::rstest]
 async fn deployment_version_correct_in_wf_info(#[values(true, false)] use_only_build_id: bool) {
@@ -795,7 +794,7 @@ async fn deployment_version_correct_in_wf_info(#[values(true, false)] use_only_b
 }
 
 const NONDETERMINISM_WF_NAME: &str = "nondeterminism_errors_fail_workflow_when_configured_to";
-
+#[temporalio_macros::cloud_test_exclusion(RequiresCloudProvisioning)]
 #[rstest::rstest]
 #[tokio::test]
 async fn nondeterminism_errors_fail_workflow_when_configured_to(
@@ -922,7 +921,7 @@ async fn nondeterminism_errors_fail_workflow_when_configured_to(
 }
 
 const HISTORY_OUT_OF_ORDER_WF_NAME: &str = "history_out_of_order_on_restart";
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 async fn history_out_of_order_on_restart() {
     let wf_name = HISTORY_OUT_OF_ORDER_WF_NAME;
@@ -1037,7 +1036,7 @@ async fn history_out_of_order_on_restart() {
     let res = handle.get_result(Default::default()).await;
     assert_matches!(res, Err(WorkflowGetResultError::Failed(_)));
 }
-
+#[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
 #[tokio::test]
 async fn pass_timer_summary_to_metadata() {
     let t = canned_histories::single_timer("1");

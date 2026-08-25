@@ -1,3 +1,9 @@
+// Cloud mode intentionally leaves shared integration-test helpers unused.
+#![cfg_attr(
+    all(feature = "cloud-test-mode", not(clippy)),
+    allow(dead_code, unused_imports)
+)]
+
 //! Integration tests
 
 #[macro_use]
@@ -12,26 +18,35 @@ mod shared_tests;
 
 #[cfg(test)]
 mod integ_tests {
-    mod async_activity_client_tests;
-    mod client_tests;
-    mod data_converter_tests;
-    mod ephemeral_server_tests;
-    mod heartbeat_tests;
-    mod metrics_tests;
-    mod pagination_tests;
-    mod plugin_tests;
-    mod poll_loop_tests;
-    mod polling_tests;
-    mod queries_tests;
-    mod schedule_tests;
-    mod standalone_activity_tests;
-    mod update_tests;
-    mod visibility_tests;
-    mod worker_heartbeat_tests;
-    mod worker_tests;
-    mod worker_versioning_tests;
-    mod workflow_client_tests;
-    mod workflow_replayer_tests;
+    temporalio_macros::cloud_test_module_exclusion!(
+        NeedsCloudAdaptation,
+        async_activity_client_tests
+    );
+    temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, client_tests);
+    temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, data_converter_tests);
+    temporalio_macros::cloud_test_module_exclusion!(RequiresLocalServer, ephemeral_server_tests);
+    temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, heartbeat_tests);
+    temporalio_macros::cloud_test_module_exclusion!(RequiresLocalServer, metrics_tests);
+    temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, pagination_tests);
+    temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, plugin_tests);
+    temporalio_macros::cloud_test_module_exclusion!(RequiresLocalServer, poll_loop_tests);
+    temporalio_macros::cloud_test_module_exclusion!(RequiresLocalServer, polling_tests);
+    temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, queries_tests);
+    temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, schedule_tests);
+    temporalio_macros::cloud_test_module_exclusion!(
+        RequiresCloudProvisioning,
+        standalone_activity_tests
+    );
+    temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, update_tests);
+    temporalio_macros::cloud_test_module_exclusion!(RequiresCloudProvisioning, visibility_tests);
+    temporalio_macros::cloud_test_module_exclusion!(
+        RequiresCloudProvisioning,
+        worker_heartbeat_tests
+    );
+    temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, worker_tests);
+    temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, worker_versioning_tests);
+    temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, workflow_client_tests);
+    temporalio_macros::cloud_test_module_exclusion!(NeedsCloudAdaptation, workflow_replayer_tests);
     mod workflow_tests;
 
     use crate::common::{
@@ -55,6 +70,7 @@ mod integ_tests {
     use tonic::IntoRequest;
 
     // Create a worker like a bridge would (unwraps aside)
+    #[temporalio_macros::cloud_test_exclusion(NeedsCloudAdaptation)]
     #[tokio::test]
     #[ignore] // Really a compile time check more than anything
     async fn lang_bridge_example() {
