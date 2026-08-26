@@ -16,6 +16,12 @@ use temporalio_common::protos::temporal::api::workflowservice::v1::PollWorkflowT
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+/// The concurrency limit the WFT poll balancer should reserve against: the smaller of the slot
+/// supplier size and the workflow cache size (both bound `acquire_owned`).
+fn poll_balance_limit(slots: Option<usize>, cache: Option<usize>) -> Option<usize> {
+    [slots, cache].into_iter().flatten().min()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn make_wft_poller(
     config: &WorkerConfig,
@@ -43,9 +49,11 @@ pub(crate) fn make_wft_poller(
         &capabilities,
     );
     let wft_poller_shared = if sticky_queue_name.is_some() {
-        Some(Arc::new(WFTPollerShared::new(
-            wft_slots.available_permits(),
-        )))
+        // Balance on the limit `acquire_owned` actually enforces (min of slot supplier and cache
+        // size). Using only the slot supplier lets a small cache starve the non-sticky poller.
+        let balance_limit =
+            poll_balance_limit(wft_slots.available_permits(), wft_slots.max_permits());
+        Some(Arc::new(WFTPollerShared::new(balance_limit)))
     } else {
         None
     };
@@ -265,6 +273,17 @@ mod tests {
     };
     use futures_util::{StreamExt, pin_mut};
     use std::sync::Arc;
+
+    #[test]
+    fn poll_balance_limit_uses_smaller_of_slots_and_cache() {
+        // A small workflow cache must bound the poll balancer, else sticky polls can consume every
+        // shared permit and starve the non-sticky poller that fetches new workflows' first tasks.
+        assert_eq!(poll_balance_limit(Some(40), Some(2)), Some(2));
+        assert_eq!(poll_balance_limit(Some(2), Some(40)), Some(2));
+        assert_eq!(poll_balance_limit(Some(10), None), Some(10));
+        assert_eq!(poll_balance_limit(None, Some(5)), Some(5));
+        assert_eq!(poll_balance_limit(None, None), None);
+    }
 
     #[tokio::test]
     async fn poll_timeouts_do_not_produce_responses() {
