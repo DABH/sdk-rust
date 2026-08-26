@@ -316,15 +316,16 @@ mod tests {
     #[tokio::test]
     async fn small_cache_does_not_starve_nonsticky_poller() {
         use crate::{
+            MetricsContext,
             abstractions::MeteredPermitDealer,
             replay::TestHistoryBuilder,
             test_help::{ResponseType, hist_to_poll_resp, test_worker_cfg},
             worker::{
-                NamespaceCapabilities, PollerBehavior, client::mocks::mock_manual_worker_client,
+                NamespaceCapabilities, PollerBehavior,
+                client::{WorkerClient, mocks::mock_manual_worker_client},
                 tuner::FixedSizeSlotSupplier,
             },
         };
-        use crate::{MetricsContext, worker::client::WorkerClient};
         use futures_util::FutureExt;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use temporalio_common::protos::temporal::api::enums::v1::EventType;
@@ -338,18 +339,20 @@ mod tests {
         // sticky poller ample opportunity to grab every freed permit if nothing is reserved.
         let nonsticky_timeouts = Arc::new(AtomicUsize::new(0));
         let mut client = mock_manual_worker_client();
-        client.expect_poll_workflow_task().returning(move |_po, wfo| {
-            if wfo.sticky_queue_name.is_some() {
-                // Sticky poll never returns -> holds its permit for the test's duration.
-                std::future::pending().boxed()
-            } else if nonsticky_timeouts.fetch_add(1, Ordering::SeqCst) < 20 {
-                // Poll timeout: empty response releases the permit so it must be re-acquired.
-                async { Ok(PollWorkflowTaskQueueResponse::default()) }.boxed()
-            } else {
-                let real_task = real_task.clone();
-                async move { Ok(real_task) }.boxed()
-            }
-        });
+        client
+            .expect_poll_workflow_task()
+            .returning(move |_po, wfo| {
+                if wfo.sticky_queue_name.is_some() {
+                    // Sticky poll never returns -> holds its permit for the test's duration.
+                    std::future::pending().boxed()
+                } else if nonsticky_timeouts.fetch_add(1, Ordering::SeqCst) < 20 {
+                    // Poll timeout: empty response releases the permit so it must be re-acquired.
+                    async { Ok(PollWorkflowTaskQueueResponse::default()) }.boxed()
+                } else {
+                    let real_task = real_task.clone();
+                    async move { Ok(real_task) }.boxed()
+                }
+            });
 
         let wft_slots = MeteredPermitDealer::<WorkflowSlotKind>::new(
             Arc::new(FixedSizeSlotSupplier::new(10)),
