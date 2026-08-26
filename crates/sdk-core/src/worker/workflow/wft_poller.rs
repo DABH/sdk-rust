@@ -16,12 +16,6 @@ use temporalio_common::protos::temporal::api::workflowservice::v1::PollWorkflowT
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-/// The concurrency limit the WFT poll balancer should reserve against: the smaller of the slot
-/// supplier size and the workflow cache size (both bound `acquire_owned`).
-fn poll_balance_limit(slots: Option<usize>, cache: Option<usize>) -> Option<usize> {
-    [slots, cache].into_iter().flatten().min()
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn make_wft_poller(
     config: &WorkerConfig,
@@ -51,8 +45,10 @@ pub(crate) fn make_wft_poller(
     let wft_poller_shared = if sticky_queue_name.is_some() {
         // Balance on the limit `acquire_owned` actually enforces (min of slot supplier and cache
         // size). Using only the slot supplier lets a small cache starve the non-sticky poller.
-        let balance_limit =
-            poll_balance_limit(wft_slots.available_permits(), wft_slots.max_permits());
+        let balance_limit = [wft_slots.available_permits(), wft_slots.max_permits()]
+            .into_iter()
+            .flatten()
+            .min();
         Some(Arc::new(WFTPollerShared::new(balance_limit)))
     } else {
         None
@@ -274,17 +270,6 @@ mod tests {
     use futures_util::{StreamExt, pin_mut};
     use std::sync::Arc;
 
-    #[test]
-    fn poll_balance_limit_uses_smaller_of_slots_and_cache() {
-        // A small workflow cache must bound the poll balancer, else sticky polls can consume every
-        // shared permit and starve the non-sticky poller that fetches new workflows' first tasks.
-        assert_eq!(poll_balance_limit(Some(40), Some(2)), Some(2));
-        assert_eq!(poll_balance_limit(Some(2), Some(40)), Some(2));
-        assert_eq!(poll_balance_limit(Some(10), None), Some(10));
-        assert_eq!(poll_balance_limit(None, Some(5)), Some(5));
-        assert_eq!(poll_balance_limit(None, None), None);
-    }
-
     #[tokio::test]
     async fn poll_timeouts_do_not_produce_responses() {
         let mut mock_poller = mock_poller();
@@ -320,6 +305,84 @@ mod tests {
         pin_mut!(stream);
 
         assert_matches!(stream.next().await, None);
+    }
+
+    /// Cache (`max_permits`) of 2 under a supplier of 10: the balancer must reserve a poll slot
+    /// against the cache, not the supplier, or a saturated sticky poller starves the non-sticky one.
+    /// Sticky long-polls forever (holding permits) while non-sticky repeatedly times out and must
+    /// re-acquire; without the reservation sticky recaptures every freed permit, so non-sticky never
+    /// delivers its eventual real task. (A single fresh-start poll won't reproduce this: a free
+    /// permit is always available at startup.)
+    #[tokio::test]
+    async fn small_cache_does_not_starve_nonsticky_poller() {
+        use crate::{
+            abstractions::MeteredPermitDealer,
+            replay::TestHistoryBuilder,
+            test_help::{ResponseType, hist_to_poll_resp, test_worker_cfg},
+            worker::{
+                NamespaceCapabilities, PollerBehavior, client::mocks::mock_manual_worker_client,
+                tuner::FixedSizeSlotSupplier,
+            },
+        };
+        use crate::{MetricsContext, worker::client::WorkerClient};
+        use futures_util::FutureExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use temporalio_common::protos::temporal::api::enums::v1::EventType;
+
+        let mut t = TestHistoryBuilder::default();
+        t.add_by_type(EventType::WorkflowExecutionStarted);
+        t.add_full_wf_task();
+        let real_task = hist_to_poll_resp(&t, "wf-id", ResponseType::AllHistory).resp;
+
+        // Non-sticky times out (empty response) this many times before its real task, giving the
+        // sticky poller ample opportunity to grab every freed permit if nothing is reserved.
+        let nonsticky_timeouts = Arc::new(AtomicUsize::new(0));
+        let mut client = mock_manual_worker_client();
+        client.expect_poll_workflow_task().returning(move |_po, wfo| {
+            if wfo.sticky_queue_name.is_some() {
+                // Sticky poll never returns -> holds its permit for the test's duration.
+                std::future::pending().boxed()
+            } else if nonsticky_timeouts.fetch_add(1, Ordering::SeqCst) < 20 {
+                // Poll timeout: empty response releases the permit so it must be re-acquired.
+                async { Ok(PollWorkflowTaskQueueResponse::default()) }.boxed()
+            } else {
+                let real_task = real_task.clone();
+                async move { Ok(real_task) }.boxed()
+            }
+        });
+
+        let wft_slots = MeteredPermitDealer::<WorkflowSlotKind>::new(
+            Arc::new(FixedSizeSlotSupplier::new(10)),
+            MetricsContext::no_op(),
+            Some(2),
+            Arc::new(Default::default()),
+            None,
+        );
+        // Poller max > 1 so the sticky poller alone could otherwise claim every permit.
+        let cfg = {
+            let mut cfg = test_worker_cfg().build().unwrap();
+            cfg.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(5_usize));
+            cfg
+        };
+
+        let client: Arc<dyn WorkerClient> = Arc::new(client);
+        let stream = make_wft_poller(
+            &cfg,
+            &Some("sticky-q".to_string()),
+            &client,
+            &MetricsContext::no_op(),
+            &CancellationToken::new(),
+            &wft_slots,
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(NamespaceCapabilities::default()),
+        );
+        pin_mut!(stream);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            .await
+            .expect("non-sticky poll must be delivered; a small cache is starving it")
+            .expect("stream should yield a task");
+        assert!(got.is_ok());
     }
 
     #[tokio::test]
