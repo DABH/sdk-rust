@@ -264,11 +264,21 @@ pub(crate) fn validate_wft(
 mod tests {
     use super::*;
     use crate::{
-        abstractions::tests::fixed_size_permit_dealer, pollers::MockPermittedPollBuffer,
-        test_help::mock_poller, worker::WorkflowSlotKind,
+        abstractions::tests::fixed_size_permit_dealer,
+        pollers::MockPermittedPollBuffer,
+        replay::TestHistoryBuilder,
+        test_help::{ResponseType, hist_to_poll_resp, mock_poller, test_worker_cfg},
+        worker::{
+            PollerBehavior, WorkflowSlotKind, client::mocks::mock_manual_worker_client,
+            tuner::FixedSizeSlotSupplier,
+        },
     };
-    use futures_util::{StreamExt, pin_mut};
-    use std::sync::Arc;
+    use futures_util::{FutureExt, StreamExt, pin_mut};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use temporalio_common::protos::temporal::api::enums::v1::EventType;
 
     #[tokio::test]
     async fn poll_timeouts_do_not_produce_responses() {
@@ -315,21 +325,6 @@ mod tests {
     /// permit is always available at startup.)
     #[tokio::test]
     async fn small_cache_does_not_starve_nonsticky_poller() {
-        use crate::{
-            MetricsContext,
-            abstractions::MeteredPermitDealer,
-            replay::TestHistoryBuilder,
-            test_help::{ResponseType, hist_to_poll_resp, test_worker_cfg},
-            worker::{
-                NamespaceCapabilities, PollerBehavior,
-                client::{WorkerClient, mocks::mock_manual_worker_client},
-                tuner::FixedSizeSlotSupplier,
-            },
-        };
-        use futures_util::FutureExt;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use temporalio_common::protos::temporal::api::enums::v1::EventType;
-
         let mut t = TestHistoryBuilder::default();
         t.add_by_type(EventType::WorkflowExecutionStarted);
         t.add_full_wf_task();
